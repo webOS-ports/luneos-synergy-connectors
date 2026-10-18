@@ -143,6 +143,7 @@ func handleProviders(w http.ResponseWriter, r *http.Request) {
 
 // GET /provider/<id>/search?q=&limit=
 // POST /provider/<id>/play  {trackId}
+// POST /provider/<id>/resolve  {trackId, format?} -> {url}
 func handleProviderRoute(w http.ResponseWriter, r *http.Request) {
 	// path: /provider/<id>/<action>
 	rest := strings.TrimPrefix(r.URL.Path, "/provider/")
@@ -193,6 +194,31 @@ func handleProviderRoute(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]bool{"ok": true})
+	case "resolve":
+		// The URL /play would hand to the daemon's own pipeline, for a client
+		// that plays the stream itself (the QML player, through Qt
+		// Multimedia): direct for most providers, this daemon's /dzstream,
+		// /tidalstream or /applestream proxy for Deezer, Tidal and Apple.
+		// Spotify has none: it plays through librespot (/player/*).
+		var body struct {
+			TrackID string `json:"trackId"`
+			Format  string `json:"format"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.TrackID == "" {
+			httpErr(w, http.StatusBadRequest, "trackId is required")
+			return
+		}
+		url, err := resolveStream(r.Context(), p, body.TrackID, body.Format)
+		if err != nil {
+			httpErr(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if url == "" {
+			httpErr(w, http.StatusConflict, id+" has no stream URL (plays via its own engine)")
+			return
+		}
+		writeJSON(w, map[string]string{"url": url})
 	case "resolveVideo":
 		var body struct {
 			TrackID string `json:"trackId"`
