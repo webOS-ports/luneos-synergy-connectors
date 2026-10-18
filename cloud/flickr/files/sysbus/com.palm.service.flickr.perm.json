@@ -1,8 +1,11 @@
 {
     "com.palm.service.flickr": ["accountsservice.operation", "activity.operation", "systemsettings.query", "time.query"],
     "com.palm.service.accounts": ["synergy-flickr.operation"],
+    "com.palm.app.accounts": ["synergy-flickr.operation"],
+    "com.palm.app.accounts-*": ["synergy-flickr.operation"],
     "com.palm.app.flickr-auth-*": ["synergy-flickr.operation"],
     "com.palm.app.flickr-auth": ["synergy-flickr.operation"],
     "org.webosports.app.photos-*": ["synergy-flickr.operation"],
+    "org.webosports.app.photos": ["synergy-flickr.operation"],
     "com.palm.service.photos": ["synergy-flickr.operation"]
 }

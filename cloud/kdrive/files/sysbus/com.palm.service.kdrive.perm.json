@@ -1,9 +1,13 @@
 {
     "com.palm.service.kdrive": ["accountsservice.operation", "activity.operation", "systemsettings.query", "time.query"],
     "com.palm.service.accounts": ["synergy-kdrive.operation"],
+    "com.palm.app.accounts": ["synergy-kdrive.operation"],
+    "com.palm.app.accounts-*": ["synergy-kdrive.operation"],
     "com.palm.app.kdrive-auth-*": ["synergy-kdrive.operation"],
     "com.palm.app.kdrive-auth": ["synergy-kdrive.operation"],
     "org.webosports.app.documents-*": ["synergy-kdrive.operation"],
+    "org.webosports.app.documents": ["synergy-kdrive.operation"],
     "org.webosports.app.photos-*": ["synergy-kdrive.operation"],
+    "org.webosports.app.photos": ["synergy-kdrive.operation"],
     "com.palm.service.photos": ["synergy-kdrive.operation"]
 }

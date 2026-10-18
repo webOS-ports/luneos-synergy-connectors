@@ -1,9 +1,13 @@
 {
     "com.palm.service.onedrive": ["accountsservice.operation", "activity.operation", "systemsettings.query", "time.query"],
     "com.palm.service.accounts": ["synergy-onedrive.operation"],
+    "com.palm.app.accounts": ["synergy-onedrive.operation"],
+    "com.palm.app.accounts-*": ["synergy-onedrive.operation"],
     "com.palm.app.cloud-auth-*": ["synergy-onedrive.operation"],
     "com.palm.app.cloud-auth": ["synergy-onedrive.operation"],
     "org.webosports.app.documents-*": ["synergy-onedrive.operation"],
+    "org.webosports.app.documents": ["synergy-onedrive.operation"],
     "org.webosports.app.photos-*": ["synergy-onedrive.operation"],
+    "org.webosports.app.photos": ["synergy-onedrive.operation"],
     "com.palm.service.photos": ["synergy-onedrive.operation"]
 }

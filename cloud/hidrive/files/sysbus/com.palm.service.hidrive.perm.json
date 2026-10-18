@@ -1,9 +1,13 @@
 {
     "com.palm.service.hidrive": ["accountsservice.operation", "activity.operation", "systemsettings.query", "time.query"],
     "com.palm.service.accounts": ["synergy-hidrive.operation"],
+    "com.palm.app.accounts": ["synergy-hidrive.operation"],
+    "com.palm.app.accounts-*": ["synergy-hidrive.operation"],
     "com.palm.app.cloud-auth-*": ["synergy-hidrive.operation"],
     "com.palm.app.cloud-auth": ["synergy-hidrive.operation"],
     "org.webosports.app.documents-*": ["synergy-hidrive.operation"],
+    "org.webosports.app.documents": ["synergy-hidrive.operation"],
     "org.webosports.app.photos-*": ["synergy-hidrive.operation"],
+    "org.webosports.app.photos": ["synergy-hidrive.operation"],
     "com.palm.service.photos": ["synergy-hidrive.operation"]
 }

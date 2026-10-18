@@ -1,9 +1,13 @@
 {
     "com.palm.service.boxnet": ["accountsservice.operation", "activity.operation", "systemsettings.query", "time.query"],
     "com.palm.service.accounts": ["synergy-box.operation"],
+    "com.palm.app.accounts": ["synergy-box.operation"],
+    "com.palm.app.accounts-*": ["synergy-box.operation"],
     "com.palm.app.cloud-auth-*": ["synergy-box.operation"],
     "com.palm.app.cloud-auth": ["synergy-box.operation"],
     "org.webosports.app.documents-*": ["synergy-box.operation"],
+    "org.webosports.app.documents": ["synergy-box.operation"],
     "org.webosports.app.photos-*": ["synergy-box.operation"],
+    "org.webosports.app.photos": ["synergy-box.operation"],
     "com.palm.service.photos": ["synergy-box.operation"]
 }

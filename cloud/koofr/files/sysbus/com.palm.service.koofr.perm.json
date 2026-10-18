@@ -1,9 +1,13 @@
 {
     "com.palm.service.koofr": ["accountsservice.operation", "activity.operation", "systemsettings.query", "time.query"],
     "com.palm.service.accounts": ["synergy-koofr.operation"],
+    "com.palm.app.accounts": ["synergy-koofr.operation"],
+    "com.palm.app.accounts-*": ["synergy-koofr.operation"],
     "com.palm.app.cloud-auth-*": ["synergy-koofr.operation"],
     "com.palm.app.cloud-auth": ["synergy-koofr.operation"],
     "org.webosports.app.documents-*": ["synergy-koofr.operation"],
+    "org.webosports.app.documents": ["synergy-koofr.operation"],
     "org.webosports.app.photos-*": ["synergy-koofr.operation"],
+    "org.webosports.app.photos": ["synergy-koofr.operation"],
     "com.palm.service.photos": ["synergy-koofr.operation"]
 }

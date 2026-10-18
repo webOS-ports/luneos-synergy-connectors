@@ -51,12 +51,15 @@ for (const name of connectors()) {
 		for (const c of callers) assert.deepStrictEqual(perm[c], [group], `${c} gets the group`);
 
 		// The Accounts service runs the template's hooks; its sign-in app calls the service
-		const expected = ["com.palm.service.accounts", t.validator.customUI.appId, t.validator.customUI.appId + "-*"];
-		if (caps.includes("DOCUMENTS")) expected.push("org.webosports.app.documents-*");
+		// The sign-in app runs as an iframe inside the Accounts app, so its calls arrive as
+		// com.palm.app.accounts-<pid> (LS_REQUIRES_SECURITY on getAuthorizeUrl otherwise).
+		const expected = ["com.palm.service.accounts", "com.palm.app.accounts", "com.palm.app.accounts-*",
+			t.validator.customUI.appId, t.validator.customUI.appId + "-*"];
+		if (caps.includes("DOCUMENTS")) expected.push("org.webosports.app.documents", "org.webosports.app.documents-*");
 		if (caps.includes("PHOTO.UPLOAD")) {
 			// The Photos app browses it; com.palm.service.photos syncs it (listAlbums, listPhotos,
 			// upload, deletePhoto) for the PHOTO.UPLOAD hooks the template points at it
-			expected.push("org.webosports.app.photos-*", "com.palm.service.photos");
+			expected.push("org.webosports.app.photos", "org.webosports.app.photos-*", "com.palm.service.photos");
 		}
 		assert.deepStrictEqual(callers, expected.sort());
 	});
