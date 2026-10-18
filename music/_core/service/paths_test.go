@@ -45,3 +45,24 @@ func TestConfigPathsOrder(t *testing.T) {
 		t.Fatalf("unexpected order %v", p)
 	}
 }
+
+func TestFindExecutable(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "plain")
+	exe := filepath.Join(dir, "exe")
+	if err := os.WriteFile(plain, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := findExecutable(filepath.Join(dir, "missing"), plain, exe); got != exe {
+		t.Fatalf("got %q, want %q (missing and non-executable are skipped)", got, exe)
+	}
+	if got := findExecutable(dir); got != "" {
+		t.Fatalf("a directory is not an executable, got %q", got)
+	}
+	if got := findExecutable(exe, plain); got != exe {
+		t.Fatalf("first match wins, got %q", got)
+	}
+}

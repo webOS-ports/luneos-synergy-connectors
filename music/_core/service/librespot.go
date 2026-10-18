@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -15,17 +16,21 @@ import (
 // plays through pulse with media.role=music (so Palm's audio policy routes it to
 // the speakers). This exact recipe was validated on-device.
 
-// Binaries, log and cache all live under spotifyDataDir (/media/cryptofs) — NOT
-// /media/internal, which would pin the USB-exported vfat partition. See paths.go.
+// Log and cache live under spotifyDataDir (/media/cryptofs) — NOT /media/internal,
+// which would pin the USB-exported vfat partition. See paths.go. The binary is the
+// image's (/usr/bin/librespot, the librespot recipe) unless one was put in
+// spotifyDataDir, which wins so a hand-built librespot can be tried on one device.
+var librespotCandidates = []string{spotifyDataDir + "/librespot", "/usr/bin/librespot"}
+
 var (
-	librespotBin = spotifyDataDir + "/librespot"
+	librespotBin string
 	librespotLog = spotifyDataDir + "/librespot.log"
 	librespotDir = spotifyDataDir + "/librespot-cache"
 	librespotMu  sync.Mutex
 	librespotUp  bool
 )
 
-// gstDevice: librespot subprocess sink. ffaudioresample -> native 48kHz avoids
+// gstDevice: librespot subprocess sink. audioresample -> native 48kHz avoids
 // pulse's low-quality "palm" resampler; media.role=music -> speakers.
 // CRITICAL: the queue MUST be bounded by BYTES, not time. fdsrc emits raw PCM with
 // no buffer timestamps, so a max-size-time limit can never trigger; with
@@ -58,10 +63,12 @@ func startLibrespot() {
 	if librespotUp {
 		return
 	}
-	if _, err := os.Stat(librespotBin); err != nil {
-		log.Printf("librespot not found at %s; playback disabled", librespotBin)
+	librespotBin = findExecutable(librespotCandidates...)
+	if librespotBin == "" {
+		log.Printf("librespot not found at %s; playback disabled", strings.Join(librespotCandidates, " or "))
 		return
 	}
+	log.Printf("librespot: using %s", librespotBin)
 	librespotUp = true
 	go librespotLoop()
 }

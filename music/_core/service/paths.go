@@ -49,3 +49,14 @@ func readFirstNonEmpty(paths ...string) (string, string) {
 	}
 	return "", ""
 }
+
+// findExecutable returns the first of paths that is a regular file with an
+// execute bit, or "".
+func findExecutable(paths ...string) string {
+	for _, p := range paths {
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0o111 != 0 {
+			return p
+		}
+	}
+	return ""
+}
