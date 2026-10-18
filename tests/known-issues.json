@@ -5,7 +5,7 @@
   "ref": "verified on MST0000022 2026-10-18"
  },
  "live_playback/youtube": {
-  "reason": "googlevideo answers 403 to a full GET and to ranges > ~1 MiB (206 for 1 MiB, 403 for 10 MiB, any User-Agent); streamplayer.go pipes a plain `curl -sL <url>` into gst, so the stream is empty and ends at once. The resolver's 'verified' probe uses Range bytes=0-1 and passes. Needs chunked Range fetching, e.g. a /ytstream proxy like /dzstream.",
-  "ref": "verified on MST0000022 2026-10-18"
+  "reason": "plays about a minute, then ends: the ANDROID_VR audio URLs (itag 140/251) refuse any byte range ending past ~1 MiB (403, also after re-resolving), so /ytstream serves only the first 1 MiB. Needs a client or PO token whose URLs are served in full. Left as is by decision.",
+  "ref": "measured on MST0000022 2026-10-18; music/_core/service/ytstream.go"
  }
 }
