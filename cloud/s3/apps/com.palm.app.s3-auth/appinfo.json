@@ -11,5 +11,6 @@
 	"splashicon": "icon.png",
 	"noWindow": true,
 	"uiRevision": 2,
-	"requiredMemory": 32
+	"requiredMemory": 32,
+	"requiredPermissions": ["accountsservice.management", "accountsservice.operation", "networkconnection.query"]
 }
