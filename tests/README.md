@@ -1,19 +1,19 @@
-# Synergy connector tests on LuneOS
+# Connector tests
 
 Host-side harness that drives a LuneOS phone over adb and checks every
-connector in this repo (7 IM, 12 cloud) plus the 9 music providers of
-`org.webosports.app.music`. Python 3 standard library only. The TouchPad
-harness next door (`tests/test-connectors.sh`, novacom) is unrelated.
+connector in this repository: 7 IM, 12 cloud and 9 music. Python 3 standard
+library only.
 
 ```sh
-tests/luneos/run.py --list                                   # connectors and tests
-tests/luneos/run.py --serial MST0000022                      # L0+L1, everything
-tests/luneos/run.py --serial MST0000022 --family im --level 0,1,2
-tests/luneos/run.py --serial MST0000022 --only dropbox,mega --level 2
-python3 -m unittest discover -s tests/luneos/selftest        # the harness's own tests
+tests/run.py --list                                   # connectors and tests
+tests/run.py --serial MST0000022                      # L0+L1, everything
+tests/run.py --serial MST0000022 --family im --level 0,1,2
+tests/run.py --serial MST0000022 --only dropbox,mega --level 2
+python3 -m unittest discover -s tests/selftest        # the harness's own tests
+node --test tests/unit/*.test.js                     # unit tests of shared connector code
 ```
 
-Reports land in `build-output/luneos/<stamp>/` (`report.txt`, `results.json`,
+Reports land in `build-output/<stamp>/` (`report.txt`, `results.json`,
 `junit.xml`). Exit status is non-zero on any FAIL, ERROR or XPASS.
 
 ## Levels

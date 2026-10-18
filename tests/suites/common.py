@@ -150,14 +150,19 @@ def bus_targets(ctx, conn):
 
     The Accounts service calls these (onEnabled, onDelete, validator.address,
     onCredentialsChanged...). A missing one makes that step fail at runtime
-    with nothing visible in the UI.
+    with nothing visible in the UI. The template checked is the one the
+    Accounts service serves: it loads resources/<locale>/<file> instead of
+    the base file when that exists, so a stale locale copy is caught too.
     """
     _installed(ctx, conn)
+    served = accounts.templates(ctx.dev).get(conn.id)
+    if served is None:
+        raise Skip("not registered; see template_registered")
     bad = []
-    for svc in conn.services():
+    for svc in conn.services(served):
         st = ctx.dev.service_state(svc)
         if st != "up":
-            where = [p for p, u in conn.uris() if "//%s" % svc in u]
+            where = [p for p, u in conn.uris(served) if "//%s" % svc in u]
             bad.append("%s %s (used by %s)" % (svc, st, ", ".join(where[:3])))
     if bad:
         raise Fail("; ".join(bad))

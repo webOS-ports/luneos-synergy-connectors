@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Synergy connector tests for LuneOS, driven from the host over adb.
 
-  tests/luneos/run.py --serial MST0000022 --level 0,1
-  tests/luneos/run.py --serial MST0000022 --family im --only telegram,signal --level 2
-  tests/luneos/run.py --list
+  tests/run.py --serial MST0000022 --level 0,1
+  tests/run.py --serial MST0000022 --family im --only telegram,signal --level 2
+  tests/run.py --list
 
 Levels: 0 install (static checks, no state change)  1 provision (accounts and
 calls with no real credentials, cleaned up)  2 live (real accounts from
@@ -28,8 +28,6 @@ import suites.im  # noqa: E402,F401
 import suites.cloud  # noqa: E402,F401
 import suites.music  # noqa: E402,F401
 
-DEFAULT_MUSIC = os.path.expanduser("~/Documents/GitHub/org.webosports.app.music")
-
 
 def parse_args(argv):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -37,7 +35,6 @@ def parse_args(argv):
     ap.add_argument("--level", default="0,1", help="comma list of levels (default 0,1)")
     ap.add_argument("--family", default="", help="im,cloud,music (default all)")
     ap.add_argument("--only", default="", help="connector keys or template ids")
-    ap.add_argument("--music-repo", default=os.environ.get("SYNERGY_MUSIC_REPO", DEFAULT_MUSIC))
     ap.add_argument("--creds", default=os.path.join(HERE, "creds.local.json"))
     ap.add_argument("--known", default=os.path.join(HERE, "known-issues.json"))
     ap.add_argument("--out", default=None, help="report directory")
@@ -49,8 +46,7 @@ def parse_args(argv):
 
 def main(argv=None):
     a = parse_args(argv)
-    music = a.music_repo if os.path.isdir(a.music_repo) else None
-    conns = manifest.load(music=music)
+    conns = manifest.load()
     conns = manifest.select(conns, [f for f in a.family.split(",") if f], [o for o in a.only.split(",") if o])
     levels = {int(x) for x in a.level.split(",") if x != ""}
 
@@ -65,8 +61,6 @@ def main(argv=None):
     if not a.serial:
         print("--serial (or ANDROID_SERIAL) is required", file=sys.stderr)
         return 2
-    if not music:
-        print("[warn] music repo %s not found; music connectors skipped" % a.music_repo)
 
     creds = {}
     if os.path.exists(a.creds):
@@ -83,7 +77,7 @@ def main(argv=None):
         return 2
 
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out = a.out or os.path.join(manifest.REVIVAL, "build-output", "luneos", stamp)
+    out = a.out or os.path.join(manifest.REPO, "build-output", stamp)
     os.makedirs(out, exist_ok=True)
     ctx = runner.Context(dev, creds, {}, out)
     known = runner.load_known_issues(a.known)

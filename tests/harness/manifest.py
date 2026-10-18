@@ -2,7 +2,8 @@
 
 Everything that an account template already says (template id, capability
 ids, validator app, every palm:// service it calls) is taken from the template
-JSON in the source repos, so the harness cannot drift from the code. Only the
+JSON in this repository (<family>/<connector>/account/), so the harness cannot
+drift from the code. Only the
 facts a template does not carry -- which libpurple plugin implements an IM
 network, how a connector signs in, the music daemon's provider id -- come from
 connectors.json next to this package.
@@ -15,7 +16,7 @@ import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TESTS = os.path.dirname(HERE)
-REVIVAL = os.path.dirname(os.path.dirname(TESTS))
+REPO = os.path.dirname(TESTS)
 
 ACCOUNTS_DIR = "/usr/palm/public/accounts"
 APPS_DIRS = ("/usr/palm/applications", "/media/cryptofs/apps/usr/palm/applications")
@@ -48,25 +49,16 @@ class Connector:
     def device_template(self):
         return "%s/%s/%s.json" % (ACCOUNTS_DIR, self.id, self.id)
 
-    def uris(self):
-        """Every (json-path, uri) in the template that names a bus endpoint."""
-        found = []
+    def uris(self, template=None):
+        """Every (json-path, uri) in the template that names a bus endpoint.
 
-        def walk(node, path):
-            if isinstance(node, dict):
-                for k, v in node.items():
-                    walk(v, path + "." + k)
-            elif isinstance(node, list):
-                for i, v in enumerate(node):
-                    walk(v, "%s[%d]" % (path, i))
-            elif isinstance(node, str) and PALM_URI.match(node):
-                found.append((path.lstrip("."), node))
+        template: another copy to read, such as the one the Accounts service
+        actually serves (which can be a per-locale file, not this one).
+        """
+        return template_uris(self.template if template is None else template)
 
-        walk(self.template, "")
-        return found
-
-    def services(self):
-        return sorted({PALM_URI.match(u).group(1) for _, u in self.uris()})
+    def services(self, template=None):
+        return sorted({PALM_URI.match(u).group(1) for _, u in self.uris(template)})
 
     @property
     def own_service(self):
@@ -94,22 +86,36 @@ class Connector:
         return "<%s %s>" % (self.family, self.id)
 
 
+def template_uris(template):
+    found = []
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, path + "." + k)
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                walk(v, "%s[%d]" % (path, i))
+        elif isinstance(node, str) and PALM_URI.match(node):
+            found.append((path.lstrip("."), node))
+
+    walk(template, "")
+    return found
+
+
 def _load_template(path):
     with open(path) as f:
         t = json.load(f)
     return t[0] if isinstance(t, list) else t
 
 
-def _template_files(revival, music):
-    yield "im", sorted(glob.glob(os.path.join(revival, "messaging/*/account/*/*.json")))
-    cloud = [p for p in glob.glob(os.path.join(revival, "cloud/*/account/**/*.json"), recursive=True)
-             if "/resources/" not in p]
-    yield "cloud", sorted(cloud)
-    if music:
-        yield "music", sorted(glob.glob(os.path.join(music, "deploy/accounts/*/*.json")))
+def _template_files(repo):
+    for family in ("im", "cloud", "music"):
+        paths = glob.glob(os.path.join(repo, family, "*/account/**/*.json"), recursive=True)
+        yield family, sorted(p for p in paths if "/resources/" not in p)
 
 
-def load(revival=REVIVAL, music=None, extras_path=None):
+def load(repo=REPO, extras_path=None):
     """All connectors, ordered by family then key.
 
     Raises ValueError when connectors.json and the templates disagree, so a new
@@ -120,7 +126,7 @@ def load(revival=REVIVAL, music=None, extras_path=None):
         extras = json.load(f)["connectors"]
 
     out, seen = [], set()
-    for family, paths in _template_files(revival, music):
+    for family, paths in _template_files(repo):
         for p in paths:
             t = _load_template(p)
             tid = t.get("templateId")
@@ -135,14 +141,13 @@ def load(revival=REVIVAL, music=None, extras_path=None):
             seen.add(tid)
             out.append(Connector(family, p, t, ex))
 
-    # Connectors without a template (YouTube) or whose repo was not given.
+    # Connectors without a template (YouTube).
     for tid, ex in extras.items():
         if tid in seen:
             continue
-        if ex.get("template", True) and (ex["family"] != "music" or music):
+        if ex.get("template", True):
             raise ValueError("connectors.json lists %s but no template was found" % tid)
-        if ex["family"] == "music" and music and not ex.get("template", True):
-            out.append(Connector("music", None, {"templateId": tid}, ex))
+        out.append(Connector(ex["family"], None, {"templateId": tid}, ex))
 
     order = {"im": 0, "cloud": 1, "music": 2}
     out.sort(key=lambda c: (order[c.family], c.key))
