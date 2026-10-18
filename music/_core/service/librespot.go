@@ -37,9 +37,9 @@ var (
 // jitter cushion — plenty, since the whole track is already cached within ~3s of
 // load (no network underrun risk). pulse does the 44.1->48k rate conversion; a small
 // 0.5s pulse buffer keeps startup preroll short.
-const gstDevice = `gst-launch-0.10 fdsrc fd=0 ! ` +
+const gstDevice = `gst-launch-1.0 fdsrc fd=0 ! ` +
 	`queue max-size-buffers=0 max-size-bytes=176400 max-size-time=0 ! ` +
-	`audio/x-raw-int,rate=44100,channels=2,width=16,depth=16,signed=true,endianness=1234 ! ` +
+	`audio/x-raw,format=S16LE,rate=44100,channels=2,layout=interleaved ! ` +
 	`audioconvert ! ` +
 	`pulsesink stream-properties=s,media.role=music buffer-time=500000 latency-time=50000`
 
@@ -69,7 +69,7 @@ func startLibrespot() {
 func killStaleLibrespot() {
 	// A backend restart orphans the previous librespot; clear it so we don't get
 	// two "webOS" Connect devices.
-	_ = exec.Command("sh", "-c", "for p in $(pidof librespot gst-launch-0.10); do kill -9 $p 2>/dev/null; done").Run()
+	_ = exec.Command("sh", "-c", "for p in $(pidof librespot gst-launch-1.0); do kill -9 $p 2>/dev/null; done").Run()
 	time.Sleep(500 * time.Millisecond)
 }
 

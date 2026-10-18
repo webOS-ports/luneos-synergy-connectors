@@ -52,8 +52,8 @@ func playStreamURL(url string) error {
 	// curl, so playback stays at 1x and runs the full track. (Re-approach BT hiccups
 	// separately, verifying it doesn't break normal playback first.)
 	pipeline := "curl -sL --retry 2 '" + escapeSingle(url) + "' | " +
-		"gst-launch-0.10 fdsrc fd=0 ! decodebin ! audioconvert ! ffaudioresample ! " +
-		"audio/x-raw-int,rate=48000,channels=2,width=16,depth=16,signed=true,endianness=1234 ! " +
+		"gst-launch-1.0 fdsrc fd=0 ! decodebin ! audioconvert ! audioresample ! " +
+		"audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved ! " +
 		"pulsesink stream-properties=s,media.role=music buffer-time=500000 latency-time=50000"
 
 	cmd := exec.Command("sh", "-c", pipeline)
