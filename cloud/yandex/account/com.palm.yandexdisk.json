@@ -29,11 +29,7 @@
 		{
 			"capability": "PHOTO.UPLOAD",
 			"id": "com.palm.yandexdisk.photos",
-			"implementation": "palm://com.palm.service.photos",
-			"onEnabled": "palm://com.palm.service.photos/onEnabled",
-			"onDelete": "palm://com.palm.service.photos/onDelete",
-			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
-			"__comment": "Makes the Yandex Disk account a photo source (and device->cloud upload target). implementation/hooks point at the stock Photos AGGREGATOR (com.palm.service.photos), which discovers PHOTO.UPLOAD accounts and - via the templateId->serviceName fall-through in its Utils.js (see ../photos-integration/) - calls com.palm.service.yandexdisk/listAlbums+listPhotos, then downloads bytes with the curl-patched Sync-Manager. One folder is surfaced as one album: Yandex's own camera-uploads folder (system_folders.photostream) when it exists, else Config.PHOTO_ALBUM_NAME ('Pictures'). Like Dropbox, src_big/src_small are short-lived signed /resources/download hrefs (self-authenticating, so the curl -L fetch needs no auth header)."
+			"__comment": "PHOTO.UPLOAD marks the account as a photo source. The hooks of webOS 3.0.5 (implementation/onEnabled/onDelete/onCredentialsChanged on com.palm.service.photos) are gone: LuneOS has no such aggregator, and the Accounts service would call them on every create, enable and delete. A Photos app finds these accounts by capability and calls the connector service directly (listAlbums, listPhotos, upload, deletePhoto)."
 		}
 	]
 }

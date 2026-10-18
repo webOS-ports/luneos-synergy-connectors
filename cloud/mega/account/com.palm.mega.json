@@ -29,11 +29,7 @@
 		{
 			"capability": "PHOTO.UPLOAD",
 			"id": "com.palm.mega.photos",
-			"implementation": "palm://com.palm.service.photos",
-			"onEnabled": "palm://com.palm.service.photos/onEnabled",
-			"onDelete": "palm://com.palm.service.photos/onDelete",
-			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
-			"__comment": "Makes the MEGA account a photo source (and device->cloud upload target). The stock Photos aggregator (com.palm.service.photos) discovers PHOTO.UPLOAD accounts and - via the templateId->serviceName fall-through in its Utils.js (see ../photos-integration/) - calls com.palm.service.mega/listAlbums+listPhotos. One folder is surfaced as one album: 'Camera Uploads' under the Cloud Drive root. NOTE: Mega is end-to-end encrypted, so listPhotos DOWNLOADS+DECRYPTS each image to a local file and returns a file:// src_big (the aggregator's curl cannot decrypt Mega's ciphertext URLs)."
+			"__comment": "PHOTO.UPLOAD marks the account as a photo source. The hooks of webOS 3.0.5 (implementation/onEnabled/onDelete/onCredentialsChanged on com.palm.service.photos) are gone: LuneOS has no such aggregator, and the Accounts service would call them on every create, enable and delete. A Photos app finds these accounts by capability and calls the connector service directly (listAlbums, listPhotos, upload, deletePhoto)."
 		}
 	]
 }

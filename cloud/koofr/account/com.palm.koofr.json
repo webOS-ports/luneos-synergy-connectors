@@ -29,11 +29,7 @@
 		{
 			"capability": "PHOTO.UPLOAD",
 			"id": "com.palm.koofr.photos",
-			"implementation": "palm://com.palm.service.photos",
-			"onEnabled": "palm://com.palm.service.photos/onEnabled",
-			"onDelete": "palm://com.palm.service.photos/onDelete",
-			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
-			"__comment": "Makes the Koofr account a photo source. The Photos aggregator calls com.palm.service.koofr/listAlbums+listPhotos; one folder ('Camera Uploads' at the mount root) is surfaced as one album. src_big is Koofr's files/download link, fetched by the aggregator's curl."
+			"__comment": "PHOTO.UPLOAD marks the account as a photo source. The hooks of webOS 3.0.5 (implementation/onEnabled/onDelete/onCredentialsChanged on com.palm.service.photos) are gone: LuneOS has no such aggregator, and the Accounts service would call them on every create, enable and delete. A Photos app finds these accounts by capability and calls the connector service directly (listAlbums, listPhotos, upload, deletePhoto)."
 		}
 	]
 }
