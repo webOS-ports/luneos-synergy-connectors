@@ -169,6 +169,17 @@ var MegaApi = (function () {
 			return f;
 		},
 
+		// masterKey(creds) -> a32 master key. Throws MEGA_NO_SESSION when the stored credential
+		// lacks the session id or the master key (a token from another provider, a half-finished
+		// sign-in), instead of failing deep in b64 decoding with a TypeError.
+		masterKey: function (creds) {
+			if (!creds || typeof creds.accessToken !== "string" || typeof creds.mk !== "string" || !creds.mk) {
+				throw { returnValue: false, errorCode: "MEGA_NO_SESSION",
+					errorText: "no MEGA session in the account credentials; sign in again" };
+			}
+			return MC.b64ToA32(creds.mk);
+		},
+
 		// getUser(creds) -> Future<ug result>. Validates the session (fails ESID if expired) and
 		// yields the account handle/email.
 		getUser: function (creds) {
@@ -180,7 +191,7 @@ var MegaApi = (function () {
 		// nodes carry: { h, p, t, name, size, ts, key(a32), aesKeyA32, nonce, metaMac }.
 		fetchNodes: function (creds) {
 			var f = new Future();
-			var master = MC.b64ToA32(creds.mk);
+			var master = this.masterKey(creds);
 			var ff = cmd({ a: "f", c: 1, r: 1 }, creds.accessToken);
 			f.now(this, function () { return ff; });
 			f.then(this, function () {

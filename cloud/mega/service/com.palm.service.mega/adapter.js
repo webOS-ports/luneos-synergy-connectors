@@ -176,7 +176,7 @@ var Adapter = {
 	uploadFile: function (creds, folderId, localPath, name, mimeType, cb) {
 		var self = this, f = new Future();
 		if (!MC._fs) { f.setException({ returnValue: false, errorCode: "NO_FS" }); return f; }
-		var master = MC.b64ToA32(creds.mk);
+		var master = MegaApi.masterKey(creds);
 		var size;
 		try { size = MC._fs.statSync(localPath).size; }
 		catch (e) { f.setException({ returnValue: false, errorCode: "MEGA_LOCAL_STAT_FAILED", detail: String(e) }); return f; }
@@ -316,7 +316,7 @@ var Adapter = {
 	// Create (or find) a folder by name under the Cloud Drive root; returns its handle.
 	ensureAlbumFolder: function (creds, name, cb) {
 		var self = this, f = new Future();
-		var master = MC.b64ToA32(creds.mk);
+		var master = MegaApi.masterKey(creds);
 		var tf = this._fetchTree(creds, cb);
 		f.now(this, function () { return tf; });
 		f.then(this, function () {
