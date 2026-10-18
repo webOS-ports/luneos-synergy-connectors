@@ -175,6 +175,14 @@ func restoreLibrespotToken() bool {
 	return true
 }
 
+// librespotSignedIn reports whether librespot has a token of its own or credentials it cached.
+func librespotSignedIn() bool {
+	librespotAuth.mu.Lock()
+	src := librespotAuth.src
+	librespotAuth.mu.Unlock()
+	return src != nil || fileExists(librespotDir+"/credentials.json")
+}
+
 // freshLibrespotToken is a current access token for librespot, or "" before its sign-in.
 func freshLibrespotToken() string {
 	librespotAuth.mu.Lock()

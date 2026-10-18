@@ -165,3 +165,23 @@ test("polling does not finish the account while the sign-in window is still open
 	assert.strictEqual(checked, 0);
 	assert.strictEqual(popups[0].closed, false);
 });
+
+test("a Web API session without librespot's sign-in does not finish the account", () => {
+	const statuses = [
+		[{ authenticated: true, librespot: false }, false],
+		[{ authenticated: true, librespot: true }, true],
+		[{ authenticated: true }, true], // a backend from before librespot signed in apart
+		[{ authenticated: false, librespot: true }, false],
+	];
+	for (const [status, finishes] of statuses) {
+		const { card } = load({ plugin: false });
+		card.mode = "spotify";
+		let finished = 0, login = 0;
+		card.get = (url, cb) => cb(true, status);
+		card.fetchTokenAndFinish = () => { finished++; };
+		card.startLogin = () => { login++; };
+		card.attemptFinish(true);
+		assert.strictEqual(finished, finishes ? 1 : 0, JSON.stringify(status));
+		assert.strictEqual(login, finishes ? 0 : 1, JSON.stringify(status));
+	}
+});

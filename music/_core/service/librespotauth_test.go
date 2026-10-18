@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/oauth2"
 )
 
 // fakeSpotifyToken stands in for accounts.spotify.com/api/token and records the form it got.
@@ -29,13 +31,14 @@ func fakeSpotifyToken(t *testing.T, form *url.Values) {
 func librespotTestDirs(t *testing.T) (cache string) {
 	t.Helper()
 	dir := t.TempDir()
-	oldPath, oldDir, oldAddr := librespotTokenPath, librespotDir, cfg.addr
+	oldPath, oldDir, oldAddr, oldWeb := librespotTokenPath, librespotDir, cfg.addr, tokenPath
 	librespotTokenPath = filepath.Join(dir, "librespot-token.json")
+	tokenPath = filepath.Join(dir, "spotify-token.json")
 	librespotDir = filepath.Join(dir, "librespot-cache")
 	cfg.addr = "127.0.0.1:8730"
 	librespotAuth.src = nil
 	t.Cleanup(func() {
-		librespotTokenPath, librespotDir, cfg.addr = oldPath, oldDir, oldAddr
+		librespotTokenPath, librespotDir, cfg.addr, tokenPath = oldPath, oldDir, oldAddr, oldWeb
 		librespotAuth.src = nil
 	})
 	if err := os.MkdirAll(librespotDir, 0o700); err != nil {
@@ -147,5 +150,56 @@ func TestLibrespotCallbackRefusals(t *testing.T) {
 	}
 	if form != nil || freshLibrespotToken() != "" || fileExists(librespotTokenPath) {
 		t.Fatal("a refused callback still fetched or stored a token")
+	}
+}
+
+func TestLoginGoesStraightToLibrespotWhenOnlyItIsMissing(t *testing.T) {
+	librespotTestDirs(t)
+	oldID, oldClient := cfg.clientID, sess.client
+	cfg.clientID = "web-api-client"
+	t.Cleanup(func() { cfg.clientID, sess.client = oldID, oldClient })
+
+	login := func() *url.URL {
+		rec := httptest.NewRecorder()
+		handleLoginRedirect(rec, httptest.NewRequest("GET", "/login", nil))
+		u, err := url.Parse(rec.Header().Get("Location"))
+		if rec.Code != http.StatusFound || err != nil {
+			t.Fatalf("/login: %d %v", rec.Code, err)
+		}
+		return u
+	}
+	status := func() map[string]bool {
+		rec := httptest.NewRecorder()
+		handleAuthStatus(rec, httptest.NewRequest("GET", "/auth/status", nil))
+		var m map[string]bool
+		_ = json.Unmarshal(rec.Body.Bytes(), &m)
+		return m
+	}
+
+	// nothing signed in: the Web API sign-in first
+	sess.client = nil
+	if got := login().Query().Get("client_id"); got != "web-api-client" {
+		t.Fatalf("not signed in: /login went to client %q", got)
+	}
+	if s := status(); s["authenticated"] || s["librespot"] {
+		t.Fatalf("status %v", s)
+	}
+
+	// Web API session restored, librespot never signed in: only its step
+	sess.client = clientFromToken(&oauth2.Token{AccessToken: "a", RefreshToken: "r"})
+	if got := login().Query().Get("client_id"); got != librespotClientID {
+		t.Fatalf("Web API only: /login went to client %q, want librespot's", got)
+	}
+	if s := status(); !s["authenticated"] || s["librespot"] {
+		t.Fatalf("status %v", s)
+	}
+
+	// both: a fresh full sign-in, as before
+	setLibrespotToken(&oauth2.Token{AccessToken: "l", RefreshToken: "lr"})
+	if got := login().Query().Get("client_id"); got != "web-api-client" {
+		t.Fatalf("both signed in: /login went to client %q", got)
+	}
+	if s := status(); !s["authenticated"] || !s["librespot"] {
+		t.Fatalf("status %v", s)
 	}
 }

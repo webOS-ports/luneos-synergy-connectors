@@ -345,7 +345,9 @@ enyo.kind({
 	// --- Spotify OAuth ---
 	attemptFinish: function (startLoginIfNeeded) {
 		this.get(BACKEND + "/auth/status", enyo.bind(this, function (ok, j) {
-			if (ok && j && j.authenticated) { this.fetchTokenAndFinish(); }
+			// librespot (playback) signs in apart from the Web API session (search); a backend
+			// that does not report it predates that and plays with the Web API token.
+			if (ok && j && j.authenticated && j.librespot !== false) { this.fetchTokenAndFinish(); }
 			else if (startLoginIfNeeded) { this.startLogin(); }
 			else { this.$.bodyText.setContent("Tap <b>Connect Spotify</b> to sign in."); }
 		}));
