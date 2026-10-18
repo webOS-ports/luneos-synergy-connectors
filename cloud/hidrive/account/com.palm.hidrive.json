@@ -16,8 +16,8 @@
 
 	"__comment2": "com.palm.app.cloud-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists.",
 	"__comment3": "com.palm.service.hidrive is in read+writePermissions so the service can readCredentials(accountId) for file ops and writeCredentials back after a token refresh (HiDrive access tokens expire hourly; the refresh token renews them).",
-	"readPermissions":  ["com.quickoffice.webos", "com.quickoffice.ar", "com.palm.app.cloud-auth", "com.palm.app.hidrive-files", "com.palm.app.photos", "com.palm.service.hidrive", "com.palm.service.photos"],
-	"writePermissions": ["com.palm.app.cloud-auth", "com.palm.app.hidrive-files", "com.palm.app.photos", "com.palm.service.hidrive", "com.palm.service.photos"],
+	"readPermissions":  ["com.palm.app.cloud-auth", "com.palm.service.hidrive", "org.webosports.app.documents", "org.webosports.app.documents-*", "org.webosports.app.photos", "org.webosports.app.photos-*"],
+	"writePermissions": ["com.palm.app.cloud-auth", "com.palm.service.hidrive"],
 
 	"capabilityProviders": [
 		{

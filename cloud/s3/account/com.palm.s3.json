@@ -16,8 +16,8 @@
 
 	"__comment2": "com.palm.app.s3-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists.",
 	"__comment3": "com.palm.service.s3 is in read+writePermissions so the service can readCredentials(accountId) for file ops. S3 keys are static (no refresh), so the service does not normally write back, but the permission is kept for symmetry.",
-	"readPermissions":  ["com.quickoffice.webos", "com.quickoffice.ar", "com.palm.app.s3-auth", "com.palm.app.s3-files", "com.palm.app.photos", "com.palm.service.s3", "com.palm.service.photos"],
-	"writePermissions": ["com.palm.app.s3-auth", "com.palm.app.s3-files", "com.palm.app.photos", "com.palm.service.s3", "com.palm.service.photos"],
+	"readPermissions":  ["com.palm.app.s3-auth", "com.palm.service.s3", "org.webosports.app.documents", "org.webosports.app.documents-*", "org.webosports.app.photos", "org.webosports.app.photos-*"],
+	"writePermissions": ["com.palm.app.s3-auth", "com.palm.service.s3"],
 
 	"capabilityProviders": [
 		{
