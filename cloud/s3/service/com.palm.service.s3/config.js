@@ -45,7 +45,7 @@ var Config = {
 	STATE:         "s3",
 	// S3 has no OAuth webview: its OWN auth app collects endpoint/region/bucket/keys.
 	AUTH_APP_IDS:  ["com.palm.app.s3-auth"],
-	FILE_APP_IDS:  ["com.palm.app.s3-files", "com.quickoffice.webos", "com.quickoffice.ar"]
+	FILE_APP_IDS:  ["org.webosports.app.documents", "org.webosports.app.documents-*"]
 };
 
 if (typeof exports !== "undefined") { exports.Config = Config; }

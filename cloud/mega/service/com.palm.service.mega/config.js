@@ -43,7 +43,7 @@ var Config = {
 	// The credentials-collecting customUI app (email+password form). Mega has no OAuth webview,
 	// so it is its OWN app, NOT the shared com.palm.app.cloud-auth.
 	AUTH_APP_IDS:  ["com.palm.app.mega-auth"],
-	FILE_APP_IDS:  ["com.palm.app.mega-files", "com.quickoffice.webos", "com.quickoffice.ar"]
+	FILE_APP_IDS:  ["org.webosports.app.documents", "org.webosports.app.documents-*"]
 };
 
 if (typeof exports !== "undefined") { exports.Config = Config; }
