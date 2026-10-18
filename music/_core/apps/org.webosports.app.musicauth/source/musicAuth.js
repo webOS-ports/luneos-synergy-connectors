@@ -379,7 +379,12 @@ enyo.kind({
 		this._spotifyPollCount = (this._spotifyPollCount || 0) + 1;
 		// A sign-in window has its own, longer deadline (OAuthWindow), and the user may still be
 		// typing or solving a captcha in it, so the cap only applies to the embedded view.
-		if (this._spotifyPollCount > 60 && !this._oauthWindow) {
+		if (this._oauthWindow) {
+			// /auth/status turns true at /auth/callback, before librespot's sign-in in the same
+			// window; finishing then would close it halfway. Its redirect to /auth/done finishes.
+			return;
+		}
+		if (this._spotifyPollCount > 60) {
 			this.stopPoll();
 			this.teardownWeb();
 			this.busy(false);
@@ -437,7 +442,8 @@ enyo.kind({
 			onRedirect: function (u) {
 				self._oauthWindow = null;
 				self.onWebLoad(null, u);
-				// The backend stores the Spotify session while serving /auth/callback.
+				// The window passes /auth/callback (the Web API session) and librespot's own
+				// sign-in before the backend sends it to /auth/done.
 				if (self.mode === "spotify") { self.attemptFinish(false); }
 				else if (self.mode === "tidal" && !self._tidalExchanging) { self.webWindowFailed("Tidal sign-in was refused."); }
 			},
@@ -447,7 +453,7 @@ enyo.kind({
 	// Where the provider sends the browser once signed in. Apple's page posts its token to the
 	// backend itself, which applePollOnce notices, so its window is only closed from here.
 	redirectPrefix: function () {
-		if (this.mode === "spotify") { return BACKEND + "/auth/callback"; }
+		if (this.mode === "spotify") { return BACKEND + "/auth/done"; }
 		if (this.mode === "tidal") { return "https://tidal.com/login/auth"; }
 		return "about:never";
 	},

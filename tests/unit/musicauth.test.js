@@ -80,7 +80,7 @@ test("no plugin: the Spotify page opens in a window, not the Atlas object", () =
 	assert.strictEqual(card.$.oauthBox.created.length, 0);
 });
 
-test("no plugin: reaching /auth/callback closes the window and checks the session", () => {
+test("no plugin: reaching /auth/done closes the window and checks the session", () => {
 	const { card, popups, tick } = load({ plugin: false });
 	card.mode = "spotify";
 	let checked = 0;
@@ -88,7 +88,12 @@ test("no plugin: reaching /auth/callback closes the window and checks the sessio
 	card.openWeb("http://127.0.0.1:8730/login");
 	tick();
 	assert.strictEqual(checked, 0);
+	// /auth/callback is only halfway: librespot signs in next, in the same window
 	popups[0].location.href = "http://127.0.0.1:8730/auth/callback?code=x&state=y";
+	tick();
+	assert.strictEqual(popups[0].closed, false);
+	assert.strictEqual(checked, 0);
+	popups[0].location.href = "http://127.0.0.1:8730/auth/done";
 	tick();
 	assert.strictEqual(popups[0].closed, true);
 	assert.strictEqual(checked, 1);
@@ -148,4 +153,15 @@ test("the two-minute Spotify poll cap does not close a sign-in window still in u
 	for (let i = 0; i < 70; i++) card.spotifyPollOnce();
 	assert.strictEqual(popups[0].closed, false);
 	assert.notStrictEqual(card.$.errorBox.showing, true);
+});
+
+test("polling does not finish the account while the sign-in window is still open", () => {
+	const { card, popups } = load({ plugin: false });
+	card.mode = "spotify";
+	let checked = 0;
+	card.attemptFinish = () => { checked++; };
+	card.openWeb("http://127.0.0.1:8730/login");
+	card.spotifyPollOnce();
+	assert.strictEqual(checked, 0);
+	assert.strictEqual(popups[0].closed, false);
 });

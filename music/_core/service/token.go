@@ -102,18 +102,6 @@ func clientFromToken(tok *oauth2.Token) *spotify.Client {
 	return spotify.New(oauth2.NewClient(context.Background(), src))
 }
 
-// freshAccessToken returns a current, non-expired access token (refreshing if needed).
-func freshAccessToken() string {
-	if currentTokenSource == nil {
-		return ""
-	}
-	t, err := currentTokenSource.Token()
-	if err != nil || t == nil {
-		return ""
-	}
-	return t.AccessToken
-}
-
 // restoreSession reloads a token at startup. It prefers a webOS Accounts
 // account (the Synergy-style path: the Accounts app owns the login), and falls
 // back to the flat token file for the standalone/dev case.

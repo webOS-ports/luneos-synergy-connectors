@@ -104,13 +104,10 @@ func handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	sess.mu.Lock()
 	sess.client = clientFromToken(tok) // persists the token + auto-saves refreshes
 	sess.mu.Unlock()
-	go selectLibrespotDevice()
-	startLibrespot()
 
-	// simple page the on-device browser lands on after login
-	w.Header().Set("Content-Type", "text/html")
-	_, _ = w.Write([]byte("<html><body style='font-family:sans-serif'>" +
-		"<h2>Spotify connected ✓</h2><p>You can close this and return to the app.</p></body></html>"))
+	// librespot signs in separately, in the same window (librespotauth.go); its callback
+	// starts it and ends on /auth/done.
+	http.Redirect(w, r, librespotAuthURL(), http.StatusFound)
 }
 
 // GET /auth/status -> {authenticated: bool}

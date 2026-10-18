@@ -103,6 +103,7 @@ var sess = &session{}
 
 // config holds the OAuth app identity (see auth.go).
 type config struct {
+	addr        string
 	clientID    string
 	redirectURL string
 }
@@ -119,6 +120,7 @@ func main() {
 	flag.Parse()
 	tokenPath = *tokenFile
 	sess.librespotName = *librespotName
+	cfg.addr = *addr
 	cfg.clientID = *clientID
 	cfg.redirectURL = *redirect
 	clientIDFrom := "-client-id"
@@ -165,8 +167,10 @@ func main() {
 		registerProvider(&appleProvider{})
 	}
 
-	restoreSession() // reload a persisted token, if any, so login survives restarts
-	loadYtToken()    // reload a persisted YouTube OAuth token, if any
+	restoreLibrespotToken() // before restoreSession, which starts librespot
+	restoreSession()        // reload a persisted token, if any, so login survives restarts
+	serveLibrespotOAuth()   // end of librespot's sign-in (librespotauth.go)
+	loadYtToken()           // reload a persisted YouTube OAuth token, if any
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/login", handleLoginRedirect) // short URL to type in the browser
@@ -196,6 +200,7 @@ func main() {
 	mux.HandleFunc("/dzauth/login", withCORS(handleDeezerAuthLogin))         // Deezer email+password -> ARL
 	mux.HandleFunc("/auth/login", withCORS(handleAuthLogin))
 	mux.HandleFunc("/auth/callback", handleAuthCallback) // browser redirect target (no CORS)
+	mux.HandleFunc("/auth/done", handleAuthDone)         // where the sign-in window ends up
 	mux.HandleFunc("/auth/status", withCORS(handleAuthStatus))
 	mux.HandleFunc("/auth/token", withCORS(handleAuthToken)) // for the Accounts validator app
 	mux.HandleFunc("/me", withCORS(handleMe))                // Spotify profile (account label)
