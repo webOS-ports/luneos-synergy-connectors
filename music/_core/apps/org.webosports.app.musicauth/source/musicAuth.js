@@ -351,8 +351,20 @@ enyo.kind({
 		this.busy(true);
 		this.showError("");
 		this._spotifyPollCount = 0;
-		this.openWeb(BACKEND + "/login");
-		this.startPollFn("spotifyPollOnce", 2000);
+		// Ask the backend first: without a Spotify client id it answers 412 here, and
+		// the /login page that would say so does not render in every web view, which
+		// left the card waiting on /auth/status for the full two-minute cap.
+		this.get(BACKEND + "/auth/login", enyo.bind(this, function (ok, j) {
+			if (!ok) {
+				this.busy(false);
+				this.showError("Spotify can't be signed in to on this device yet: " +
+					((j && j.error) || "the music backend is not answering") +
+					". The Spotify client id goes in /media/cryptofs/spotify-webos/spotify-client-id.");
+				return;
+			}
+			this.openWeb(BACKEND + "/login");
+			this.startPollFn("spotifyPollOnce", 2000);
+		}));
 	},
 	// Cap how long we'll silently spin: past ~2 minutes of not-yet-authenticated,
 	// surface an error instead of leaving the sign-in button spinning forever with
