@@ -75,6 +75,15 @@ func handleLoginRedirect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no client id; start the service with -client-id", http.StatusPreconditionFailed)
 		return
 	}
+	// Signed in to the Web API already (restored at start-up) but librespot never was: only
+	// its own sign-in is missing.
+	sess.mu.RLock()
+	webAPI := sess.client != nil
+	sess.mu.RUnlock()
+	if webAPI && !librespotSignedIn() {
+		http.Redirect(w, r, librespotAuthURL(), http.StatusFound)
+		return
+	}
 	verifier := oauth2.GenerateVerifier()
 	state := oauth2.GenerateVerifier()
 	pkce.mu.Lock()
@@ -104,21 +113,20 @@ func handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	sess.mu.Lock()
 	sess.client = clientFromToken(tok) // persists the token + auto-saves refreshes
 	sess.mu.Unlock()
-	go selectLibrespotDevice()
-	startLibrespot()
 
-	// simple page the on-device browser lands on after login
-	w.Header().Set("Content-Type", "text/html")
-	_, _ = w.Write([]byte("<html><body style='font-family:sans-serif'>" +
-		"<h2>Spotify connected ✓</h2><p>You can close this and return to the app.</p></body></html>"))
+	// librespot signs in separately, in the same window (librespotauth.go); its callback
+	// starts it and ends on /auth/done.
+	http.Redirect(w, r, librespotAuthURL(), http.StatusFound)
 }
 
-// GET /auth/status -> {authenticated: bool}
+// GET /auth/status -> {authenticated: bool, librespot: bool}
+// authenticated is the Web API session (search, browse); librespot is whether playback has
+// signed in too (librespotauth.go).
 func handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	sess.mu.RLock()
 	ok := sess.client != nil
 	sess.mu.RUnlock()
-	writeJSON(w, map[string]bool{"authenticated": ok})
+	writeJSON(w, map[string]bool{"authenticated": ok, "librespot": librespotSignedIn()})
 }
 
 // handleAuthToken returns the current OAuth token in the account-credential

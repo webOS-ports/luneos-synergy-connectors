@@ -28,6 +28,7 @@ var (
 	librespotDir = spotifyDataDir + "/librespot-cache"
 	librespotMu  sync.Mutex
 	librespotUp  bool
+	librespotCur *exec.Cmd // the running librespot, for restartLibrespot
 )
 
 // gstDevice: librespot subprocess sink. audioresample -> native 48kHz avoids
@@ -83,7 +84,14 @@ func killStaleLibrespot() {
 func librespotLoop() {
 	killStaleLibrespot()
 	for {
-		tok := freshAccessToken()
+		// librespot's own token (librespotauth.go), not the Web API one: Connect refuses that.
+		tok := freshLibrespotToken()
+		if tok == "" && !fileExists(librespotDir+"/credentials.json") {
+			// Not signed in yet; handleLibrespotCallback restarts the loop's librespot, and
+			// until then there is nothing to log in with.
+			time.Sleep(5 * time.Second)
+			continue
+		}
 		args := []string{
 			"--name", sess.librespotName,
 			"--backend", "subprocess",
@@ -111,10 +119,34 @@ func librespotLoop() {
 			time.Sleep(10 * time.Second)
 			continue
 		}
+		librespotMu.Lock()
+		librespotCur = cmd
+		librespotMu.Unlock()
 		// once it registers, (re)select it as the playback device
 		go func() { time.Sleep(6 * time.Second); selectLibrespotDevice() }()
 		_ = cmd.Wait()
+		librespotMu.Lock()
+		librespotCur = nil
+		librespotMu.Unlock()
 		log.Printf("librespot: exited; restarting in 5s")
 		time.Sleep(5 * time.Second)
 	}
+}
+
+// restartLibrespot makes the loop start librespot again, with the token it has now, or starts
+// the loop if it is not running.
+func restartLibrespot() {
+	librespotMu.Lock()
+	cur := librespotCur
+	librespotMu.Unlock()
+	if cur != nil && cur.Process != nil {
+		_ = cur.Process.Kill()
+	}
+	startLibrespot()
+	go func() { time.Sleep(6 * time.Second); selectLibrespotDevice() }()
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
