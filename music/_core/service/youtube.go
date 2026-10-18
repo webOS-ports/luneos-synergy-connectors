@@ -19,7 +19,8 @@ import (
 // talk to YouTube's InnerTube API DIRECTLY from the Go backend (self-contained, no
 // middleman) — search via the WEB client, and resolve a direct audio stream URL via
 // mobile/VR clients that return UN-ciphered URLs (no signature descrambling needed).
-// The URL is then played by the shared gst stream player (curl | decodebin), which
+// The URL is then played by the shared gst stream player (curl | decodebin) through
+// the local /ytstream proxy (googlevideo only serves <= 1 MiB ranges), which
 // decodes AAC (itag 140, ffdec_aac) or Opus (itag 251, opusdec) — both present on
 // the device. This establishes the stream-URL connector pattern.
 type youtubeProvider struct{}
@@ -196,17 +197,25 @@ func innertubePost(ctx context.Context, host, endpoint string, cl itClient, body
 	return out, nil
 }
 
-// StreamURL resolves a direct audio URL for a videoId, preferring AAC (itag 140)
-// then Opus (itag 251/250/249) — both decodable on-device.
+// StreamURL resolves an audio stream for a videoId, preferring AAC (itag 140)
+// then Opus (itag 251/250/249) — both decodable on-device. What it returns is the
+// local /ytstream proxy, not the googlevideo URL itself: googlevideo answers a plain
+// GET with 403 and serves the file only in <= 1 MiB ranges (see ytstream.go). The
+// URL is resolved here all the same, so a track that cannot play fails the /play call
+// and the format badge is set; the proxy picks the resolved URL up from its cache.
 func (y *youtubeProvider) StreamURL(ctx context.Context, trackID string) (string, error) {
-	return y.streamURL(ctx, trackID, "", "audio")
+	return y.StreamURLFormat(ctx, trackID, "")
 }
 
 // StreamURLFormat resolves preferring a specific format label (e.g. "OPUS 160") for the
 // tap-to-switch selector; falls back to the default preference if that format isn't
-// available. Implements the optional formatSelector capability (see provider.go).
+// available. Implements the optional formatSelector capability (see provider.go). The
+// label rides along in the proxy URL, so a re-resolve in the proxy keeps the format.
 func (y *youtubeProvider) StreamURLFormat(ctx context.Context, trackID, prefFormat string) (string, error) {
-	return y.streamURL(ctx, trackID, prefFormat, "audio")
+	if _, err := ytResolveDirect(ctx, trackID, prefFormat); err != nil {
+		return "", err
+	}
+	return ytProxyURL(trackID, prefFormat), nil
 }
 
 // StreamURLVideo resolves a direct PROGRESSIVE video URL for a videoId — a single
@@ -456,31 +465,42 @@ func ytFmtLabel(itag int, mime string) string {
 	return "AUDIO"
 }
 
-// ytProbePlayable does a tiny ranged GET to verify a resolved googlevideo URL is
-// actually served (2xx) rather than a 403 bot-check / expired / throttled response the
-// player API didn't surface. Cheap (one byte) and short-timeout so it can't stall track
-// start for long. Returns true only on 200/206.
+// ytProbePlayable checks that a resolved googlevideo URL is actually served rather than
+// refused (403 bot-check / expired / throttled) in a way the player API didn't surface.
+//
+// It sends exactly the request the /ytstream proxy starts with -- the first ytChunkSize
+// range, same client and headers -- and requires a 206 with a Content-Range carrying the
+// total length, which the proxy needs. A probe of bytes=0-1 is not enough: googlevideo
+// decides on the request shape (it refuses a plain GET and ranges over 1 MiB, accepts
+// small ones), so a tiny probe passed for URLs that the old curl-the-URL player could
+// not play. Since the proxy only ever issues ranges of at most ytChunkSize, a pass here
+// means the proxy's requests are of a shape the server accepts. Only the first bytes are
+// read; the rest of the response is dropped with the connection. Short timeout so it
+// can't stall track start for long.
 func ytProbePlayable(ctx context.Context, u string) bool {
 	cctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(cctx, "GET", u, nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("Range", "bytes=0-1")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
-	resp, err := itHTTP.Do(req)
+	resp, err := ytRangeGet(cctx, ytStreamHTTP, u, 0, ytChunkSize-1)
 	if err != nil {
 		log.Printf("youtube probe: %v", err)
 		return false
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8))
-	if resp.StatusCode == 200 || resp.StatusCode == 206 {
-		return true
+	if resp.StatusCode != http.StatusPartialContent {
+		log.Printf("youtube probe: HTTP %d", resp.StatusCode)
+		return false
 	}
-	log.Printf("youtube probe: HTTP %d", resp.StatusCode)
-	return false
+	first, _, total, ok := parseContentRange(resp.Header.Get("Content-Range"))
+	if !ok || first != 0 || total <= 0 {
+		log.Printf("youtube probe: unusable Content-Range %q", resp.Header.Get("Content-Range"))
+		return false
+	}
+	var b [8]byte
+	if _, err := io.ReadFull(resp.Body, b[:]); err != nil && total >= int64(len(b)) {
+		log.Printf("youtube probe: read: %v", err)
+		return false
+	}
+	return true
 }
 
 // Search queries YouTube (WEB client, video filter) and returns normalised tracks.

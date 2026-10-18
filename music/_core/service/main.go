@@ -175,6 +175,7 @@ func main() {
 	mux.HandleFunc("/stream/status", withCORS(handleStreamStatus))
 	mux.HandleFunc("/stream/switchformat", withCORS(handleStreamSwitchFormat))
 	mux.HandleFunc("/dzstream", handleDzStream)                              // Deezer descrambling stream proxy (no CORS; gst/curl only)
+	mux.HandleFunc("/ytstream", handleYtStream)                              // YouTube 1 MiB-range chunking proxy (no CORS; gst/curl only)
 	mux.HandleFunc("/ytauth/start", withCORS(handleYtAuthStart))             // begin device-code login
 	mux.HandleFunc("/ytauth/poll", withCORS(handleYtAuthPoll))               // poll for authorisation
 	mux.HandleFunc("/ytauth/status", withCORS(handleYtAuthStatus))           // is YouTube signed in?
