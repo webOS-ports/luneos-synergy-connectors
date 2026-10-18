@@ -6,6 +6,7 @@ takes every network down. Kinds and field names are from
 imlibpurpleservice inc/IMDefines.h and inc/IMMessage.h.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -78,16 +79,38 @@ def transport_starts(ctx, conn):
         raise Fail("%s answered, then exited within 5 s" % TRANSPORT_EXE)
 
 
+PHONE_APP = "org.webosports.app.phone"
+SERVICES_D = "/usr/share/luna-service2/services.d"
+
+
 @test(0, ("im",))
 def call_service(ctx, conn):
-    """A PHONE capability's call service exists (calls bridged into Phone)."""
+    """The PHONE capability's call service is reachable by the Phone app.
+
+    The plugin registers com.palm.<net>.call inside the transport; ls-hubd
+    only routes to it when a services.d file lists the name, and the Phone
+    app needs the imlibpurple-call.operation grant (im/_core/README.md).
+    """
     phone = [c for c in conn.capabilities if c.get("capability") == "PHONE"]
     if not phone:
         raise Skip("no PHONE capability")
     svc = phone[0]["implementation"].split("//", 1)[1].strip("/")
-    st = ctx.dev.service_state(svc)
-    if st != "up":
-        raise Fail("%s %s" % (svc, st))
+    if not ctx.dev.exists("%s/%s.service" % (SERVICES_D, svc)):
+        raise Fail("%s not listed in %s (ls-hubd will refuse it)" % (svc, SERVICES_D))
+    if ctx.dev.service_state(TRANSPORT, timeout_ms=15000) != "up":
+        raise Fail("transport not up; see transport_starts")
+    r = ctx.dev.luna("luna://%s/callStateQuery" % svc, {}, app_id=PHONE_APP, timeout_ms=10000)
+    text = json.dumps(r) if r is not None else ""
+    if r is None:
+        raise Fail("%s/callStateQuery: no reply" % svc)
+    if "Permission denied" in text or "not allowed" in text.lower():
+        raise Fail("ACG refuses %s calling %s: %s" % (PHONE_APP, svc, text[:200]))
+    if "does not exist" in text or "not running" in text.lower():
+        raise Skip("%s listed but not registered yet (registers when %s logs in; see L2)"
+                   % (svc, conn.name))
+    if not r.get("returnValue", True):
+        raise Fail("%s/callStateQuery: %s" % (svc, text[:200]))
+    ctx.note("callStateQuery answered as %s" % PHONE_APP)
 
 
 # -- L1 ----------------------------------------------------------------------
