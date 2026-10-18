@@ -25,9 +25,12 @@ function mlog(s) {
 }
 
 // Route enyo.BasicWebView to the Atlas/WPE engine (once, at load) — the same patch
-// spotifyView.js uses so the embedded WebView actually renders on this device.
+// spotifyView.js uses so the embedded WebView actually renders on legacy webOS. LuneOS has no
+// NPAPI plugin to re-point and hosts the sign-in page in a window.open()ed WAM window instead —
+// see oauthWindow.js and openWindow() below.
 (function () {
 	function patch() {
+		if (window.OAuthWindow && !window.OAuthWindow.hasPluginWebView()) { return true; }
 		if (!(window.enyo && enyo.BasicWebView && enyo.BasicWebView.prototype)) { return false; }
 		if (enyo.BasicWebView.prototype.__atlasPatched) { return true; }
 		enyo.BasicWebView.prototype.__atlasPatched = true;
@@ -320,7 +323,7 @@ enyo.kind({
 	// spinning forever with no feedback.
 	applePollOnce: function () {
 		this._applePollCount = (this._applePollCount || 0) + 1;
-		if (this._applePollCount > 60) {
+		if (this._applePollCount > 60 && !this._oauthWindow) {
 			this.stopPoll();
 			this.teardownWeb();
 			this.$.codeBox.setShowing(true);
@@ -374,7 +377,9 @@ enyo.kind({
 	// going to succeed").
 	spotifyPollOnce: function () {
 		this._spotifyPollCount = (this._spotifyPollCount || 0) + 1;
-		if (this._spotifyPollCount > 60) {
+		// A sign-in window has its own, longer deadline (OAuthWindow), and the user may still be
+		// typing or solving a captcha in it, so the cap only applies to the embedded view.
+		if (this._spotifyPollCount > 60 && !this._oauthWindow) {
 			this.stopPoll();
 			this.teardownWeb();
 			this.busy(false);
@@ -386,6 +391,12 @@ enyo.kind({
 
 	// --- embedded Atlas/WPE WebView (same lifecycle as spotifyView.js) ---
 	openWeb: function (url) {
+		// No NPAPI plugin (LuneOS): the <object> below never paints and has no openURL, so the
+		// sign-in page goes in its own WAM window, as in cloud-auth.
+		if (window.OAuthWindow && !window.OAuthWindow.hasPluginWebView()) {
+			this.openWindow(url);
+			return;
+		}
 		if (this.$.kbButton) { this.$.kbButton.setShowing(true); }
 		this._webUrl = url;
 		this._webLoaded = false;
@@ -414,6 +425,50 @@ enyo.kind({
 		try { this.$.oauthWeb.callBrowserAdapter("openURL", ["atlas-simple:" + this._webUrl]); }
 		catch (e) { this._webLoaded = false; mlog("openURL failed: " + e); }
 	},
+	openWindow: function (url) {
+		if (this._oauthWindow) { this._oauthWindow.close(); }
+		this.webStatus("Sign in in the window that just opened. You'll be returned here automatically.");
+		var self = this;
+		this._oauthWindow = window.OAuthWindow.open({
+			url: url,
+			name: "musicSignIn",
+			redirectPrefix: this.redirectPrefix(),
+			timeoutMs: 240000,
+			onRedirect: function (u) {
+				self._oauthWindow = null;
+				self.onWebLoad(null, u);
+				// The backend stores the Spotify session while serving /auth/callback.
+				if (self.mode === "spotify") { self.attemptFinish(false); }
+				else if (self.mode === "tidal" && !self._tidalExchanging) { self.webWindowFailed("Tidal sign-in was refused."); }
+			},
+			onError: function (msg) { self._oauthWindow = null; self.webWindowFailed(msg); }
+		});
+	},
+	// Where the provider sends the browser once signed in. Apple's page posts its token to the
+	// backend itself, which applePollOnce notices, so its window is only closed from here.
+	redirectPrefix: function () {
+		if (this.mode === "spotify") { return BACKEND + "/auth/callback"; }
+		if (this.mode === "tidal") { return "https://tidal.com/login/auth"; }
+		return "about:never";
+	},
+	webStatus: function (msg) {
+		if (this.mode === "spotify") { this.$.bodyText.setContent(msg); return; }
+		this.$.codeBox.setShowing(true);
+		this.$.codeWrap.setShowing(false);
+		this.$.codeStatus.setContent(msg);
+	},
+	webWindowFailed: function (msg) {
+		if (this.done) { return; }
+		this.stopPoll();
+		if (this.mode === "spotify") {
+			this.busy(false);
+			this.$.bodyText.setContent("Tap <b>Connect Spotify</b> to sign in.");
+			this.showError(msg);
+			return;
+		}
+		this.webStatus(msg);
+		this.$.codeRetry.setShowing(true);
+	},
 	webNav: function (s, u) { this.onWebLoad(s, u); },
 	webTitleNav: function (s, t, u) { this.onWebLoad(s, u); },
 	webError: function () { mlog("webview engine error"); },
@@ -429,6 +484,7 @@ enyo.kind({
 		return true; // do not bubble / take focus
 	},
 	teardownWeb: function () {
+		if (this._oauthWindow) { this._oauthWindow.close(); this._oauthWindow = null; }
 		if (this._webTimer) { window.clearTimeout(this._webTimer); this._webTimer = null; }
 		if (this.$.kbButton) { this.$.kbButton.setShowing(false); }
 		try { if (window.PalmSystem) { PalmSystem.keyboardHide(); PalmSystem.setManualKeyboardEnabled(false); } } catch (e) {}
@@ -481,6 +537,7 @@ enyo.kind({
 		if (this.done) { return; }
 		this.done = true;
 		this.stopPoll();
+		if (this._oauthWindow) { this._oauthWindow.close(); this._oauthWindow = null; }
 		mlog("sendResult: " + JSON.stringify(result));
 		try { this.$.crossAppResult.sendResult(result); } catch (e) { mlog("sendResult threw: " + e); }
 	},
