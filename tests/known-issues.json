@@ -1,0 +1,11 @@
+{
+ "__comment": "Known, tracked defects: test-id (name/connector, name/*, */connector) -> {reason, ref}. A listed failure reports XFAIL; a listed test that passes reports XPASS so the entry gets removed.",
+ "anonymous_search/jamendo": {
+  "reason": "the built-in demo client_id is over Jamendo's usage limit: the API answers status=success, results_count=0, warnings='Usage limits are exceeded'; jamendo.go ignores headers.warnings so the provider silently returns no tracks. Needs a user client id in /media/cryptofs/spotify-webos/jamendo-clientid (and jamendo.go should surface the warning as an error).",
+  "ref": "verified on MST0000022 2026-10-18"
+ },
+ "live_playback/youtube": {
+  "reason": "googlevideo answers 403 to a full GET and to ranges > ~1 MiB (206 for 1 MiB, 403 for 10 MiB, any User-Agent); streamplayer.go pipes a plain `curl -sL <url>` into gst, so the stream is empty and ends at once. The resolver's 'verified' probe uses Range bytes=0-1 and passes. Needs chunked Range fetching, e.g. a /ytstream proxy like /dzstream.",
+  "ref": "verified on MST0000022 2026-10-18"
+ }
+}

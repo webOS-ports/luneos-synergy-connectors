@@ -1,0 +1,10 @@
+{
+    "role": {
+        "exeName": "/usr/bin/imlibpurpletransport",
+        "type": "regular",
+        "allowedNames": ["com.palm.telegram.call"]
+    },
+    "permissions": [
+        { "service": "com.palm.telegram.call", "inbound": ["*"], "outbound": ["*"] }
+    ]
+}

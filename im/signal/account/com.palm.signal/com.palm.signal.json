@@ -1,0 +1,89 @@
+[{
+    "templateId": "com.palm.signal",
+    "loc_name": "Signal",
+    "icon": {
+        "loc_32x32": "images/signal-32x32.png",
+        "loc_48x48": "images/signal-48x48.png"
+    },
+    "validator": {
+        "customUI": {
+            "appId": "com.palm.app.signal",
+            "name": "validator.html"
+        }
+    },
+    "loc_usernameLabel": "PHONE NUMBER",
+    "readPermissions": [
+        "com.palm.imlibpurple",
+        "com.palm.app.messaging",
+        "org.webosports.app.messaging",
+        "com.palm.app.contacts",
+        "com.palm.service.contacts",
+        "com.palm.service.contacts.linker",
+        "com.palm.app.signal"
+    ],
+    "writePermissions": [
+        "com.palm.app.contacts",
+        "com.palm.service.contacts",
+        "com.palm.service.contacts.linker",
+        "com.palm.app.messaging",
+        "org.webosports.app.messaging",
+        "com.palm.app.signal"
+    ],
+    "capabilityProviders": [
+        {
+            "capability": "MESSAGING",
+            "capabilitySubtype": "IM",
+            "id": "com.palm.signal.im",
+            "alwaysOn": true,
+            "loc_shortName": "Signal",
+            "icon": {
+                "loc_32x32": "images/signal-32x32.png",
+                "loc_48x48": "images/signal-48x48.png",
+                "splitter": "images/signal-32x32.png"
+            },
+            "implementation": "palm://com.palm.imlibpurple/",
+            "onEnabled": "palm://com.palm.imlibpurple/onEnabled",
+            "onDelete": "palm://com.palm.imlibpurple/onDelete",
+            "serviceName": "type_signal",
+            "dbkinds": {
+                "immessage": "com.palm.immessage.libpurple:1",
+                "imcommand": "com.palm.imcommand.libpurple:1"
+            },
+            "invites": {
+                "supportsCustomMessage": false
+            },
+            "groupChat": {
+                "supported": true,
+                "topicsSupported": true,
+                "invitesSupportMessages": false
+            },
+            "chatWithNonBuddies": true
+        },
+        {
+            "capability": "CONTACTS",
+            "id": "com.palm.signal.contacts",
+            "alwaysOn": true,
+            "implementation": "palm://com.palm.imlibpurple/",
+            "sync": "palm://com.palm.imlibpurple/sync",
+            "readOnlyData": true,
+            "db_kinds": {
+                "contact": "com.palm.contact.libpurple:1"
+            }
+        },
+        {
+            "capability": "PHONE",
+            "id": "com.palm.signal.call",
+            "loc_shortName": "Signal",
+            "alwaysOn": true,
+            "implementation": "palm://com.palm.signal.call/",
+            "serviceName": "type_signal",
+            "wanAllowed": true,
+            "wifiAllowed": true,
+            "pausePrompt": false,
+            "pauseCode": [],
+            "waitCode": [],
+            "keyHoldMappings": [],
+            "videoFormat": "both"
+        }
+    ]
+}]

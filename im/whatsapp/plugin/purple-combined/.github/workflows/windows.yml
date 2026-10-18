@@ -1,0 +1,64 @@
+name: Windows
+on:
+  push:
+    branches: [whatsmeow]
+  pull_request:
+    branches: [whatsmeow]
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - uses: actions/setup-go@v6
+      with:
+        go-version: '1.26.0' # I want latest, but I need to select some arbitrary version for installing the 32bit variant, see https://github.com/actions/setup-go/issues/347#issuecomment-1699466025
+        architecture: x32
+
+    - name: Install x86 GCC
+      run: C:\msys64\usr\bin\pacman.exe --sync --needed --noconfirm mingw-w64-i686-gcc mingw-w64-i686-gcc
+
+    - name: Add x86 GCC to PATH
+      shell: pwsh
+      run: echo "C:\msys64\mingw32\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    - name: vcpkg
+      uses: johnwason/vcpkg-action@v6
+      with:
+        pkgs: opusfile
+        triplet: 'x86-mingw-static'
+        token: ${{ github.token }}
+
+    - name: Configure
+      run: cmake -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" -DCMAKE_BUILD_TYPE=Debug -DVCPKG_TARGET_TRIPLET=x86-mingw-static -DVCPKG_MANIFEST_MODE=OFF -S . -B build -G "MSYS Makefiles"
+
+    - name: Build
+      run: cmake --build build
+
+    - name: Copy Binary with Debug Symbols
+      run: cp build/glue/libwhatsmeow.dll libwhatsmeow-debug.dll
+    
+    - name: Strip Debug Symbols
+      run: |
+        strip --strip-all build/glue/libwhatsmeow.dll
+        cp build/glue/libwhatsmeow.dll libwhatsmeow.dll
+
+    - name: Prepare Release Info
+      run: |
+        $COMMIT_DATE = (git log -1 --date=format:'%Y%m%d' --format='%ad')
+        echo "COMMIT_DATE=$COMMIT_DATE" | Out-File -FilePath $Env:GITHUB_ENV -Append
+
+     # go list -m -f '{{.Version}}' go.mau.fi/whatsmeow | cut -d- -f 2
+    
+    - name: Create Nightly Release
+      #if: contains(github.ref, 'tags/v')
+      uses: ncipollo/release-action@v1
+      with:
+        artifacts: libwhatsmeow-debug.dll,libwhatsmeow.dll
+        tag: nightly-${{ env.COMMIT_DATE }}
+        name: Nightly ${{ env.COMMIT_DATE }}
+        allowUpdates: true
+        artifactErrorsFailBuild: true

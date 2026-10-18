@@ -1,0 +1,59 @@
+name: Linux ARM64
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  pull_request:
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install deps
+        run: |
+          sudo apt update
+          sudo apt install -y libglib2.0-dev libjson-glib-dev libprotobuf-c-dev protobuf-c-compiler gettext
+          # We only need these to build, not to run.  Skip the dependency check.
+          sudo apt download libpurple0t64 libpurple-dev
+          sudo dpkg --force-depends -i libpurple0t64*.deb libpurple-dev*.deb
+
+      - name: make
+        run: |
+          make
+          file libgooglechat.so
+          mv libgooglechat.so libgooglechat_arm64.so
+
+      - name: archive
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with: 
+            name: plugin 
+            path: libgooglechat_arm64.so
+
+      - name: Set date
+        id: date
+        run: echo "DATE=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      - name: release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && !env.ACT
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: libgooglechat_arm64.so
+          tag: daily-${{ steps.date.outputs.DATE }}
+          name: Daily ${{ steps.date.outputs.DATE }}
+          allowUpdates: true
+          makeLatest: true
+
+      - name: attest
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && !env.ACT
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: libgooglechat_arm64.so

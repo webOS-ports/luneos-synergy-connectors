@@ -1,0 +1,191 @@
+package main
+
+/*
+#include "opusreader.h"
+*/
+import "C"
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
+)
+
+// based on https://github.com/tulir/whatsmeow/blob/main/mdtest/main.go
+func (handler *Handler) send_file(who string, filename string) string {
+	isGroup := false // TODO: there is a gowhatsapp_chat_send_file, respect the group chat.
+	recipient, err := parseJID(who)
+	if err != nil {
+		return fmt.Sprintf("%#v", err)
+	}
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return fmt.Sprintf("Failed to open %s: %v", filename, err)
+	}
+	err = handler.send_file_bytes(recipient, isGroup, data, filename)
+	if err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+func (handler *Handler) send_file_bytes(recipient types.JID, isGroup bool, data []byte, filename string) error {
+	var err error = nil
+	var msg *waE2E.Message = nil
+	mimetype := http.DetectContentType(data)
+	handler.log.Infof("Attachment mime type is %s.", mimetype)
+	// TODO: redundant implementation in send_link_message. merge.
+	switch mimetype {
+	case "image/jpeg":
+		msg, err = handler.send_file_image(data, mimetype)
+	case "image/webp":
+		// A .webp picked from the compose attachment picker is a sticker in WhatsApp's world (not a
+		// regular Image message) - the same distinction real WhatsApp clients make purely by format.
+		msg, err = handler.send_file_sticker(data, mimetype)
+	case "application/ogg", "audio/ogg":
+		opusfile_info := C.opusfile_get_info(C.CBytes(data), C.size_t(len(data)))
+		seconds := int64(opusfile_info.length_seconds)
+		handler.log.Infof("Opus length is %d seconds.", seconds)
+		if seconds >= 0 {
+			msg, err = handler.send_file_audio(data, "audio/ogg; codecs=opus", uint32(seconds), opusfile_info.waveform)
+		} else {
+			purple_display_system_message(handler.account, recipient.ToNonAD().String(), isGroup, fmt.Sprintf("An ogg audio file was provided, but it was invalid due to %v. Sending file as document...", err))
+			err = nil // reset error for retrying to send as document
+		}
+	case "video/mp4":
+		err = check_mp4(data)
+		if err == nil {
+			msg, err = handler.send_file_video(data, "video/mp4")
+		} else {
+			purple_display_system_message(handler.account, recipient.ToNonAD().String(), isGroup, fmt.Sprintf("%s Sending file as document...", err))
+			err = nil // reset error for retrying to send as document
+		}
+	default:
+		// generic other file. nothing special to do here.
+	}
+	if msg == nil && err == nil {
+		basename := filepath.Base(filename)
+		basename = strings.TrimSuffix(basename, filepath.Ext(basename))
+		// WhatsApp server seems to add extention, remove it here.
+		msg, err = handler.send_file_document(data, mimetype, basename)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to upload file: %v", err)
+	}
+	send_response, err := handler.client.SendMessage(context.Background(), recipient, msg)
+	if err != nil {
+		return fmt.Errorf("error sending file: %v", err)
+	}
+	handler.add_to_cache(msg, send_response.ID, recipient, send_response.Sender, send_response.Sender, true, isGroup, send_response.Timestamp)
+	// webOS outbox-id: make this app-sent file reactable (react-to-your-own-message).
+	purple_handle_outbox_id(handler.account, send_response.ID, filepath.Base(filename))
+	return nil
+}
+
+func (handler *Handler) send_file_image(data []byte, mimetype string) (*waE2E.Message, error) {
+	uploaded, err := handler.client.Upload(context.Background(), data, whatsmeow.MediaImage)
+	if err != nil {
+		return nil, err
+	}
+	msg := &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		URL:           proto.String(uploaded.URL),
+		DirectPath:    proto.String(uploaded.DirectPath),
+		MediaKey:      uploaded.MediaKey,
+		Mimetype:      proto.String(mimetype),
+		FileEncSHA256: uploaded.FileEncSHA256,
+		FileSHA256:    uploaded.FileSHA256,
+		FileLength:    proto.Uint64(uint64(len(data))),
+	}}
+	return msg, nil
+}
+
+// send_file_sticker uploads a .webp as a sticker (the "WhatsApp Image Keys" media bucket - whatsmeow
+// has no separate media type for a single sticker send, only for sticker PACKS). Width/Height are
+// hardcoded to WhatsApp's standard 512x512 sticker canvas rather than parsed from the webp, which
+// is good enough for the server/receiving clients to render it - stock clients always send square
+// stickers on that canvas anyway.
+func (handler *Handler) send_file_sticker(data []byte, mimetype string) (*waE2E.Message, error) {
+	uploaded, err := handler.client.Upload(context.Background(), data, whatsmeow.MediaImage)
+	if err != nil {
+		return nil, err
+	}
+	msg := &waE2E.Message{StickerMessage: &waE2E.StickerMessage{
+		URL:           proto.String(uploaded.URL),
+		DirectPath:    proto.String(uploaded.DirectPath),
+		MediaKey:      uploaded.MediaKey,
+		Mimetype:      proto.String(mimetype),
+		FileEncSHA256: uploaded.FileEncSHA256,
+		FileSHA256:    uploaded.FileSHA256,
+		FileLength:    proto.Uint64(uint64(len(data))),
+		Width:         proto.Uint32(512),
+		Height:        proto.Uint32(512),
+	}}
+	return msg, nil
+}
+
+func (handler *Handler) send_file_audio(data []byte, mimetype string, seconds uint32, c_waveform [C.WAVEFORM_SAMPLES_COUNT]C.char) (*waE2E.Message, error) {
+	uploaded, err := handler.client.Upload(context.Background(), data, whatsmeow.MediaAudio)
+	if err != nil {
+		return nil, err
+	}
+	waveform := make([]byte, C.WAVEFORM_SAMPLES_COUNT)
+	for i := range c_waveform {
+		waveform[i] = byte(c_waveform[i]) // convert while copying
+	}
+	msg := &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
+		URL:           proto.String(uploaded.URL),
+		DirectPath:    proto.String(uploaded.DirectPath),
+		MediaKey:      uploaded.MediaKey,
+		Mimetype:      proto.String(mimetype),
+		FileEncSHA256: uploaded.FileEncSHA256,
+		FileSHA256:    uploaded.FileSHA256,
+		FileLength:    proto.Uint64(uint64(len(data))),
+		Seconds:       proto.Uint32(seconds),
+		PTT:           proto.Bool(true),
+		Waveform:      waveform,
+	}}
+	return msg, nil
+}
+
+func (handler *Handler) send_file_video(data []byte, mimetype string) (*waE2E.Message, error) {
+	uploaded, err := handler.client.Upload(context.Background(), data, whatsmeow.MediaVideo)
+	if err != nil {
+		return nil, err
+	}
+	msg := &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
+		URL:           proto.String(uploaded.URL),
+		DirectPath:    proto.String(uploaded.DirectPath),
+		MediaKey:      uploaded.MediaKey,
+		Mimetype:      proto.String(mimetype),
+		FileEncSHA256: uploaded.FileEncSHA256,
+		FileSHA256:    uploaded.FileSHA256,
+		FileLength:    proto.Uint64(uint64(len(data))),
+	}}
+	return msg, nil
+}
+
+func (handler *Handler) send_file_document(data []byte, mimetype string, filename string) (*waE2E.Message, error) {
+	uploaded, err := handler.client.Upload(context.Background(), data, whatsmeow.MediaDocument)
+	if err != nil {
+		return nil, err
+	}
+	msg := &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+		Title:         proto.String(filename),
+		URL:           proto.String(uploaded.URL),
+		DirectPath:    proto.String(uploaded.DirectPath),
+		MediaKey:      uploaded.MediaKey,
+		Mimetype:      proto.String(mimetype),
+		FileEncSHA256: uploaded.FileEncSHA256,
+		FileSHA256:    uploaded.FileSHA256,
+		FileLength:    proto.Uint64(uint64(len(data))),
+	}}
+	return msg, nil
+}

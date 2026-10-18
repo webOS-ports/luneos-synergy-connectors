@@ -1,0 +1,20 @@
+[
+	{ "library": { "name": "foundations",     "version": "1.0" } },
+	{ "library": { "name": "foundations.xml", "version": "1.0" } },
+	{ "library": { "name": "mojoservice",     "version": "1.0" } },
+	{ "library": { "name": "globalization",   "version": "1.0" } },
+	{ "source": "./config.js" },
+	{ "source": "./acl.js" },
+	{ "source": "./httpcurl.js" },
+	{ "source": "./oauth1.js" },
+	{ "source": "./flickrapi.js" },
+	{ "source": "./creds.js" },
+	{ "source": "./flickr_service.js" },
+	{ "source": "commands/getAuthorizeUrl_command.js" },
+	{ "source": "commands/exchangeCode_command.js" },
+	{ "source": "commands/checkCredentials_command.js" },
+	{ "source": "commands/downloadFile_command.js" },
+	{ "source": "commands/photolib.js" },
+	{ "source": "commands/listAlbums_command.js" },
+	{ "source": "commands/listPhotos_command.js" }
+]

@@ -1,0 +1,22 @@
+{
+	"description": "Flickr Service - OAuth 1.0a / REST photo source",
+	"commandTimeout": 30,
+	"activityTimeout": 30,
+	"engine": "node",
+	"services": [
+		{
+			"name": "com.palm.service.flickr",
+			"description": "Flickr Service",
+			"assistant": "FlickrService",
+			"globalized": true,
+			"commands": [
+				{ "name": "getAuthorizeUrl",  "assistant": "GetAuthorizeUrlCommandAssistant",  "public": true },
+				{ "name": "exchangeCode",     "assistant": "ExchangeCodeCommandAssistant",     "public": true },
+				{ "name": "checkCredentials", "assistant": "CheckCredentialsCommandAssistant", "public": true },
+				{ "name": "downloadFile",     "assistant": "DownloadFileCommandAssistant",     "public": true },
+				{ "name": "listAlbums",       "assistant": "ListAlbumsCommandAssistant",       "public": true, "commandTimeout": 300 },
+				{ "name": "listPhotos",       "assistant": "ListPhotosCommandAssistant",       "public": true, "commandTimeout": 300 }
+			]
+		}
+	]
+}

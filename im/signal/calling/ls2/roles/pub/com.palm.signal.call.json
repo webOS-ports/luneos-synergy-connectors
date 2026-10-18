@@ -1,0 +1,10 @@
+{
+    "role": {
+        "exeName": "/usr/bin/imlibpurpletransport",
+        "type": "regular",
+        "allowedNames": ["com.palm.signal.call"]
+    },
+    "permissions": [
+        { "service": "com.palm.signal.call", "inbound": ["*"], "outbound": ["*"] }
+    ]
+}

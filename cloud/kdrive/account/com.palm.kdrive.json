@@ -1,0 +1,39 @@
+{
+	"templateId": "com.palm.kdrive",
+	"loc_name": "kDrive",
+	"loc_usernameLabel": "EMAIL ADDRESS",
+	"icon": {
+		"loc_32x32": "images/kdrive-32x32.png",
+		"loc_48x48": "images/kdrive-48x48.png"
+	},
+
+	"__comment": "kDrive (Infomaniak) is TOKEN-based: the customUI app com.palm.app.kdrive-auth takes a personal API token (Drive scope) and calls verifyToken, which validates it and auto-discovers account_id + drive_id, returning credentials.common = {accessToken, accountId, driveId}. OAuth was ruled out - Infomaniak OAuth/OIDC only grants identity scopes and rejects `drive` (invalid_scope). validator.address points at verifyToken; the app derives the service URI from it. DOCUMENTS-only (no PHOTO.UPLOAD provider).",
+	"validator": {
+		"customUI": { "appId": "com.palm.app.kdrive-auth", "name": "oauth.html" },
+		"address":  "palm://com.palm.service.kdrive/verifyToken"
+	},
+	"onCredentialsChanged": "palm://com.palm.service.kdrive/checkCredentials",
+
+	"__comment2": "com.palm.app.kdrive-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists (accounts/handlers/create.js -> Utils.hasPermission).",
+	"__comment3": "com.palm.service.kdrive is in read+writePermissions so the service can readCredentials(accountId) for file ops and writeCredentials back after an OAuth token refresh. Token-mode credentials are long-lived (no refresh).",
+	"readPermissions":  ["com.quickoffice.webos", "com.quickoffice.ar", "com.palm.app.kdrive-auth", "com.palm.app.kdrive-files", "com.palm.app.photos", "com.palm.service.kdrive", "com.palm.service.photos"],
+	"writePermissions": ["com.palm.app.kdrive-auth", "com.palm.app.kdrive-files", "com.palm.app.photos", "com.palm.service.kdrive", "com.palm.service.photos"],
+
+	"capabilityProviders": [
+		{
+			"capability": "DOCUMENTS",
+			"id": "com.palm.kdrive.documents",
+			"implementation": "palm://com.palm.service.kdrive/",
+			"__comment": "The file-picker app (and the QuickOffice reroute) consume listFolder/downloadFile/uploadFile. kDrive is numeric-ID based (adapter stringifies ids for consumers); the drive-root id is 1 but is non-writable - the adapter resolves it to the private-space folder."
+		},
+		{
+			"capability": "PHOTO.UPLOAD",
+			"id": "com.palm.kdrive.photos",
+			"implementation": "palm://com.palm.service.photos",
+			"onEnabled": "palm://com.palm.service.photos/onEnabled",
+			"onDelete": "palm://com.palm.service.photos/onDelete",
+			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
+			"__comment": "Makes the kDrive account a photo source. implementation/hooks point at the stock Photos AGGREGATOR (com.palm.service.photos), which discovers PHOTO.UPLOAD accounts and (via the templateId->serviceName switch in its Utils.js - see ../photos-integration/) calls com.palm.service.kdrive/listAlbums+listPhotos, then downloads bytes with the curl-patched Sync-Manager. One kDrive folder (Config.PHOTO_ALBUM_NAME, default 'Pictures', under the private-space root) is surfaced as one album; src_big/src_small carry ?access_token= (kDrive has no unauthenticated pre-signed links), so the curl -L fetch needs no auth header."
+		}
+	]
+}

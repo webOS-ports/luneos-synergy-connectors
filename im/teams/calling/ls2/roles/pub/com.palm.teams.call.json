@@ -1,0 +1,10 @@
+{
+    "role": {
+        "exeName": "/usr/bin/imlibpurpletransport",
+        "type": "regular",
+        "allowedNames": ["com.palm.teams.call"]
+    },
+    "permissions": [
+        { "service": "com.palm.teams.call", "inbound": ["*"], "outbound": ["*"] }
+    ]
+}

@@ -1,0 +1,6 @@
+# transient cross-build trees (reproduced by build-libdave-arm.sh)
+src-build/
+# built ARM probe binary (reproduce with probe/build-probe.sh)
+logs/dave_probe
+# built ARM voice client (reproduce with build-discord-voice.sh)
+logs/discord-voice

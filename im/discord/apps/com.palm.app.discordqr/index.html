@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Discord QR</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #2b2d31; color: #fff;
+               font-family: Prelude, Helvetica, sans-serif; text-align: center; overflow: hidden; }
+  #wrap { display: -webkit-box; -webkit-box-orient: vertical; -webkit-box-align: center;
+          -webkit-box-pack: center; height: 100%; }
+  h1 { font-size: 26px; margin: 10px 0 2px; font-weight: 300; }
+  p  { font-size: 17px; margin: 4px 28px; opacity: 0.85; line-height: 1.4; }
+  .hint { opacity: 0.55; font-size: 14px; }
+  #qrbox { background: #fff; padding: 14px; border-radius: 10px; display: inline-block; margin: 10px 0; }
+  #qr { display: block; width: 58vmin; height: 58vmin; -ms-interpolation-mode: nearest-neighbor; }
+  #close { margin-top: 14px; padding: 11px 34px; background: #5865F2; border: 0;
+           border-radius: 7px; color: #fff; font-size: 17px; }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <h1>Sign in to Discord</h1>
+    <p>On your phone, open <b>Discord</b> &rarr; <b>Settings &rarr; Scan QR Code</b>, then point it at this screen.</p>
+    <div id="qrbox"><img id="qr" src="" alt="QR"></div>
+    <p class="hint">The code expires after about 2 minutes. Leave this open until sign-in completes.</p>
+    <button id="close" onclick="closeApp()">Done</button>
+  </div>
+  <script>
+    var imgPath = "/media/internal/discord-qr.png";
+    function readParams() {
+      try {
+        if (window.PalmSystem && PalmSystem.launchParams) {
+          var p = JSON.parse(PalmSystem.launchParams);
+          if (p && p.image) { imgPath = p.image; }
+        }
+      } catch (e) {}
+    }
+    function refresh() {
+      // cache-bust so a freshly written / refreshed QR always shows
+      document.getElementById("qr").src = "file://" + imgPath + "?t=" + (new Date().getTime());
+    }
+    function closeApp() {
+      try { if (window.PalmSystem) { PalmSystem.deactivate(); } window.close(); } catch (e) {}
+    }
+    readParams();
+    refresh();
+    setInterval(refresh, 3000);
+    // A new login attempt relaunches us with fresh params -> reload the new QR.
+    document.addEventListener("webOSRelaunch", function () { readParams(); refresh(); }, false);
+    if (window.PalmSystem && PalmSystem.stageReady) { PalmSystem.stageReady(); }
+  </script>
+</body>
+</html>

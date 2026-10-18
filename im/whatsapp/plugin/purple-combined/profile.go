@@ -1,0 +1,134 @@
+package main
+
+/*
+#include "constants.h"
+*/
+import "C"
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/types"
+)
+
+type ProfilePictureRequest struct {
+	jid          types.JID // JID of the contact whos profile picture is being requested
+	picture_date string    // age of profile picture currently being displayed (may be "" in case of no picture)
+	picture_id   string    // id of profile picture currently being displayed (may be "" in case of no picture)
+}
+
+func (handler *Handler) request_profile_picture(jid types.JID, picture_date string, picture_id string) {
+	// webOS: default PREVIEW (fetch avatars) when unset -- see presence.c gowhatsapp_request_profile_picture.
+	setting := purple_get_string(handler.account, C.GOWHATSAPP_ICONS_OPTION, C.GOWHATSAPP_ICONS_CHOICE_PREVIEW)
+	if setting != C.GoString(C.GOWHATSAPP_ICONS_CHOICE_NO) {
+		select {
+		case handler.pictureRequests <- ProfilePictureRequest{jid: jid, picture_date: picture_date, picture_id: picture_id}:
+			// do nothing
+		default:
+			handler.log.Warnf("Unable to request profile picture: Channel is full.")
+		}
+	}
+}
+
+/*
+ * Background worker for downloading contact profile pictures
+ */
+func (handler *Handler) profile_picture_downloader() {
+	if handler.httpClient != nil {
+		// there already is a httpClient on this connection
+		// do not start another downloader
+		// TODO: protect against concurrent invocation
+		return
+	}
+	handler.httpClient = &http.Client{}
+	log := handler.log.Sub("Profile")
+	emptyRequest := ProfilePictureRequest{}
+	for pdr := range handler.pictureRequests {
+		if pdr == emptyRequest {
+			// an emptyRequest may be put into the queue to signal clean exit
+			log.Infof("WhatsApp session disconnected. Profile picture downloader is shutting down.")
+			return
+		}
+		if handler.httpClient == nil {
+			log.Infof("Profile picture downloader has been removed.")
+			return
+		}
+		if handler.client == nil && !handler.client.IsConnected() {
+			// drop requests while not connected to WhatsApp
+			continue
+		}
+		// check the settings for whether the user wants small previews or big original pictures
+		// NOTE: apart from PREVIEW, there is not only ORIGINAL, but also NO.
+		// NO is not accounted for here since in that case, this function should not even be executed.
+		setting := purple_get_string(handler.account, C.GOWHATSAPP_ICONS_OPTION, C.GOWHATSAPP_ICONS_CHOICE_PREVIEW)
+		want_preview := setting == C.GoString(C.GOWHATSAPP_ICONS_CHOICE_PREVIEW)
+		ppi, _ := handler.client.GetProfilePictureInfo(
+			context.TODO(),
+			pdr.jid, &whatsmeow.GetProfilePictureParams{
+				Preview:     want_preview,
+				ExistingID:  pdr.picture_id,
+				IsCommunity: false, // TODO: find out if we do or do not want this
+			},
+		)
+		if ppi == nil {
+			// no (updated) picture available for this contact
+			continue
+		}
+		req, err := http.NewRequest("GET", ppi.URL, nil)
+		if err != nil {
+			log.Warnf("Unable to construct request for profile pictore for %s: %#v", pdr.jid.ToNonAD().String(), err)
+			continue
+		}
+		if pdr.picture_date != "" {
+			// include date of local picture in request
+			// NOTE: this should no longer be necessary since we include the ExistingID in GetProfilePictureParams now
+			req.Header.Add("If-Modified-Since", pdr.picture_date)
+		}
+		resp, err := handler.httpClient.Do(req)
+		if err != nil {
+			log.Warnf("Error downloading profile picture for %s: %#v", pdr.jid.ToNonAD().String(), err)
+			continue
+		}
+		if resp.StatusCode == 304 { // not modified
+			continue
+		}
+		var b bytes.Buffer
+		_, err = io.Copy(&b, resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Warnf("Error while transferring profile picture for %s: %#v", pdr.jid.ToNonAD().String(), err)
+			continue
+		}
+		purple_set_profile_picture(handler.account, pdr.jid.ToNonAD().String(), b.Bytes(), resp.Header.Get("Last-Modified"), ppi.ID)
+	}
+}
+
+func (handler *Handler) lidToPn(jid types.JID, application_context string) types.JID {
+	if jid.Server == types.HiddenUserServer {
+		pnJid, err := handler.client.Store.LIDs.GetPNForLID(context.TODO(), jid)
+		if err == nil {
+			//handler.log.Infof("Looked up LID \"%s\" -> \"%s\" for %s.", jid.ToNonAD().String(), pnJid.ToNonAD().String(), application_context)
+			if !pnJid.IsEmpty() {
+				jid = pnJid
+			}
+		} else {
+			handler.log.Warnf("Error while looking up LID \"%s\" for %s: %v", jid.ToNonAD().String(), application_context, err)
+		}
+	}
+	return jid
+}
+
+func (handler *Handler) groupChatParticipantsLidToPn(participants []types.GroupParticipant, application_context string) []types.GroupParticipant {
+	for pi, participant := range participants {
+		jid := handler.lidToPn(participant.JID, application_context)
+		if jid.Server == types.HiddenUserServer && !participant.PhoneNumber.IsEmpty() {
+			// when the group chat participant is anonymized, we sometimes still get their actual JID in the PhoneNumber field
+			jid = participant.PhoneNumber
+		}
+		participants[pi].JID = jid
+	}
+	return participants
+}

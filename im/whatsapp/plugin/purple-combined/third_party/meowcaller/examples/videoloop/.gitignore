@@ -1,0 +1,8 @@
+# the `go build` binary for this example (named after the dir)
+/videoloop
+/received.h264
+/diag/
+/caller.db
+/callee.db
+/qr-caller.png
+/qr-callee.png

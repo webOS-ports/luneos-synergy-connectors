@@ -1,0 +1,812 @@
+/*
+ * signal_media.c - Signal 1:1 call MEDIA ENGINE for webOS (HP TouchPad), answerer side.
+ *
+ * Reuses the exact audio recipe proven for the Telegram port: GStreamer 1.20.7 on-device, capture
+ * from ALSA "voipsource" / play to "voip" (the PulseAudio pvoip/pvoipsource PCMs under the phone
+ * scenario), Opus over RTP. The one thing Signal does differently from Telegram/WhatsApp: media is
+ * ICE (libnice) + *manual-keyed* AEAD_AES_256_GCM SRTP whose master keys come from an X25519 DH
+ * (srtp_kdf.c), NOT DTLS. So we drive srtpenc/srtpdec with keys we set ourselves.
+ *
+ *   RX: nicesrc -> srtpdec(offer_key||offer_salt via request-key) -> rtpopusdepay -> opusdec -> alsasink device=voip
+ *   TX: alsasrc device=voipsource -> opusenc -> rtpopuspay -> srtpenc(answer_key||answer_salt) -> nicesink
+ *
+ * Both nicesrc and nicesink bind the SAME NiceAgent stream/component (RTP send+recv on one 5-tuple,
+ * rtcp-mux). We are the CALLEE: DECRYPT the caller with offer_key/salt, ENCRYPT ours with answer_key/salt.
+ *
+ * Build + loopback self-test: see build-signal-media.sh and README.md. This file compiles to both a
+ * standalone test binary (main() -> --loopback / --selftest) and, via -DSIGNAL_MEDIA_NO_MAIN, an
+ * object the presage bridge links against for the signal_media_* API.
+ *
+ * NOTE (unverified on device tonight): every ICE/pipeline caps detail below is reasoned-out, not yet
+ * run against a live Signal call. The loopback self-test is the only end-to-end-verifiable piece and
+ * it deliberately avoids ICE + ALSA so it can pass on any GStreamer host. TODOs are marked inline.
+ */
+
+#include <gst/gst.h>
+#include <nice/agent.h>
+#include <glib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+
+#include "srtp_kdf.h"
+#include "signal_media.h"
+
+/* ------------------------------------------------------------------ tunables / constants ------- */
+
+/* Opus RTP is always 48 kHz. Payload type: RingRTC's opus PT (Signal). Left configurable; the peer
+ * dictates it in a real call - TODO: parse it from the offer instead of hard-coding. Loopback uses
+ * the same PT on both ends so its value doesn't matter there. */
+#define SIGNAL_OPUS_PT        102
+#define SIGNAL_OPUS_CLOCKRATE 48000
+#define SIGNAL_OPUS_CHANNELS  1
+
+#define SRTP_CIPHER_GCM256    "aes-256-gcm"
+#define SRTP_AUTH_NULL        "null"   /* GCM is AEAD -> no separate SRTP auth transform */
+
+/* ------------------------------------------------------------------ engine state --------------- */
+
+typedef struct {
+    GMainContext   *ctx;        /* private context the agent + bus watch live on */
+    GMainLoop      *loop;
+    GThread        *thread;
+
+    NiceAgent      *agent;
+    guint           stream_id;
+    guint           component;  /* 1 = RTP (rtcp-mux) */
+
+    GstElement     *pipeline;
+
+    signal_srtp_keys keys;      /* offer_* = decrypt caller, answer_* = encrypt us */
+    GstBuffer      *rx_master;  /* the master we hand srtpdec on request-key (44B) */
+    /* Role. As the ANSWERER (callee, default) we DECRYPT the caller with offer_key and ENCRYPT
+     * ours with answer_key. As the CALLER (outgoing) it is the mirror image: DECRYPT the answerer
+     * with answer_key, ENCRYPT ours with offer_key. Both peers derive the identical offer/answer
+     * keys from the same X25519 DH; only which one is RX vs TX flips. */
+    gboolean        is_caller;
+
+    signal_media_candidate_cb cand_cb;
+    void           *cand_user;
+    signal_media_audiod_cb    audiod_cb;
+    void           *audiod_user;
+
+    gboolean        audiod_on;
+    gboolean        running;
+} SignalMedia;
+
+static SignalMedia g_sm;         /* single active call (the device rings one at a time) */
+
+/* STUN/TURN relays for the nice agent, populated from RELAY lines (Signal's /v2/calling/relays,
+ * fetched by the presage bridge) BEFORE the START line. Kept out of SignalMedia because
+ * signal_media_start() memsets g_sm; build_ice() applies these to the agent before it gathers, so
+ * we get srflx/relay candidates instead of host-only (which never traverse NAT to a remote peer). */
+#define SM_MAX_TURN 8
+typedef struct {
+    char          host[64];
+    int           port;
+    char          user[128];
+    char          pass[256];
+    NiceRelayType type;
+} SmTurn;
+static char   g_stun_host[64];
+static int    g_stun_port;
+static SmTurn g_turn[SM_MAX_TURN];
+static int    g_n_turn;
+static gsize       g_inited = 0; /* gst_init once */
+
+/* ------------------------------------------------------------------ small helpers -------------- */
+
+static GstBuffer *master_key_buffer(const unsigned char *key32, const unsigned char *salt12)
+{
+    GstBuffer *buf = gst_buffer_new_and_alloc(SIGNAL_SRTP_MASTER_SIZE);
+    GstMapInfo map;
+    if (!gst_buffer_map(buf, &map, GST_MAP_WRITE)) { gst_buffer_unref(buf); return NULL; }
+    memcpy(map.data,                       key32,  SIGNAL_SRTP_KEY_SIZE);
+    memcpy(map.data + SIGNAL_SRTP_KEY_SIZE, salt12, SIGNAL_SRTP_SALT_SIZE);
+    gst_buffer_unmap(buf, &map);
+    return buf;
+}
+
+static GstElement *mk(const char *factory, const char *name)
+{
+    GstElement *e = gst_element_factory_make(factory, name);
+    if (!e) g_printerr("signal_media: missing GStreamer element '%s' (need its plugin on device)\n", factory);
+    return e;
+}
+
+/* srtpenc/srtpdec want AEAD_AES_256_GCM on both RTP and RTCP, no extra auth transform.
+ * NOTE: rtp-cipher/rtp-auth/rtcp-cipher/rtcp-auth are GEnum properties. g_object_set() varargs
+ * read a GEnum as an *integer*, so passing the string nick "aes-256-gcm" reinterprets the char*
+ * pointer as an int and silently keeps the default (AES-128-ICM, 30-byte key) -> srtpenc then
+ * rejects our 44-byte GCM master key ("Master key size is wrong"). Use gst_util_set_object_arg(),
+ * which parses the string nick against the enum, for those four properties. "key" is a boxed
+ * GstBuffer and is set the normal way. */
+static void configure_srtpenc(GstElement *enc, GstBuffer *master)
+{
+    g_object_set(enc, "key", master, NULL);
+    gst_util_set_object_arg(G_OBJECT(enc), "rtp-cipher",  SRTP_CIPHER_GCM256);
+    gst_util_set_object_arg(G_OBJECT(enc), "rtp-auth",    SRTP_AUTH_NULL);
+    gst_util_set_object_arg(G_OBJECT(enc), "rtcp-cipher", SRTP_CIPHER_GCM256);
+    gst_util_set_object_arg(G_OBJECT(enc), "rtcp-auth",   SRTP_AUTH_NULL);
+}
+
+/* srtpdec has no static key property: it fires "request-key" per SSRC and we return the caps
+ * describing the master key + cipher/auth. Single stream -> same key for every SSRC. */
+static GstCaps *on_srtpdec_request_key(GstElement *dec, guint ssrc, gpointer user)
+{
+    (void)dec;
+    SignalMedia *sm = (SignalMedia *)user;
+    /* srtpdec only asks for a key once it SEES an SRTP packet for that SSRC -> inbound media from
+     * the peer is actually arriving (ICE connected + the peer is sending). Key milestone. */
+    g_message("signal_media: srtpdec request-key for ssrc %u (inbound SRTP arriving)", ssrc);
+    if (!sm->rx_master) return NULL;
+    GstCaps *caps = gst_caps_new_simple("application/x-srtp",
+                                        "srtp-cipher",  G_TYPE_STRING, SRTP_CIPHER_GCM256,
+                                        "srtp-auth",    G_TYPE_STRING, SRTP_AUTH_NULL,
+                                        "srtcp-cipher", G_TYPE_STRING, SRTP_CIPHER_GCM256,
+                                        "srtcp-auth",   G_TYPE_STRING, SRTP_AUTH_NULL,
+                                        NULL);
+    /* gst_caps_set_simple takes ownership of neither the caps ref-count nor the buffer; ref buffer. */
+    gst_caps_set_simple(caps, "srtp-key", GST_TYPE_BUFFER, gst_buffer_ref(sm->rx_master), NULL);
+    return caps;
+}
+
+/* The RTP caps that describe the inner Opus stream (needed so rtpopusdepay/srtpdec agree). */
+static GstCaps *opus_rtp_caps(void)
+{
+    return gst_caps_new_simple("application/x-rtp",
+                               "media",         G_TYPE_STRING, "audio",
+                               "clock-rate",    G_TYPE_INT,    SIGNAL_OPUS_CLOCKRATE,
+                               "encoding-name", G_TYPE_STRING, "OPUS",
+                               "payload",       G_TYPE_INT,    SIGNAL_OPUS_PT,
+                               NULL);
+}
+
+/* ------------------------------------------------------------------ bus watch ------------------ */
+
+static gboolean on_bus(GstBus *bus, GstMessage *msg, gpointer user)
+{
+    (void)bus;
+    SignalMedia *sm = (SignalMedia *)user;
+    switch (GST_MESSAGE_TYPE(msg)) {
+        case GST_MESSAGE_ERROR: {
+            GError *err = NULL; gchar *dbg = NULL;
+            gst_message_parse_error(msg, &err, &dbg);
+            g_printerr("signal_media: pipeline ERROR from %s: %s (%s)\n",
+                       GST_OBJECT_NAME(msg->src), err ? err->message : "?", dbg ? dbg : "");
+            if (err) g_error_free(err);
+            g_free(dbg);
+            break;
+        }
+        case GST_MESSAGE_STATE_CHANGED:
+            if (GST_MESSAGE_SRC(msg) == GST_OBJECT(sm->pipeline)) {
+                GstState olds, news;
+                gst_message_parse_state_changed(msg, &olds, &news, NULL);
+                if (news == GST_STATE_PLAYING && !sm->audiod_on) {
+                    g_message("signal_media: pipeline PLAYING (audio TX/RX up, audiod notified)");
+                    sm->audiod_on = TRUE;
+                    if (sm->audiod_cb) sm->audiod_cb(1, sm->audiod_user);  /* tell audiod: voip call up */
+                }
+            }
+            break;
+        default: break;
+    }
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------ ICE (libnice) -------------- */
+
+static void on_nice_candidate(NiceAgent *agent, NiceCandidate *cand, gpointer user)
+{
+    SignalMedia *sm = (SignalMedia *)user;
+    if (!sm->cand_cb) return;
+    gchar *sdp = nice_agent_generate_local_candidate_sdp(agent, cand);
+    if (sdp) {
+        /* libnice emits the SDP attribute form "a=candidate:...", but Signal's IceCandidate opaque
+         * carries the bare "candidate:..." line (verified vs a real capture). Strip the "a=". */
+        const char *bare = (strncmp(sdp, "a=", 2) == 0) ? sdp + 2 : sdp;
+        g_message("signal_media: LOCAL candidate -> %s", bare);
+        sm->cand_cb(bare, sm->cand_user);   /* bridge -> Signal IceUpdate */
+        g_free(sdp);
+    }
+}
+
+static void on_nice_gathering_done(NiceAgent *agent, guint stream_id, gpointer user)
+{
+    (void)agent; (void)stream_id; (void)user;
+    g_message("signal_media: ICE local candidate gathering done");
+}
+
+static void on_nice_state(NiceAgent *agent, guint stream_id, guint component_id,
+                          guint state, gpointer user)
+{
+    (void)user;
+    g_message("signal_media: ICE component state -> %s", nice_component_state_to_string(state));
+    /* On CONNECTED/READY, log the nominated pair so we can confirm which candidates actually paired
+     * (host/srflx/relay) - the difference between "gathered candidates" and "media can flow". */
+    if (state == NICE_COMPONENT_STATE_CONNECTED || state == NICE_COMPONENT_STATE_READY) {
+        NiceCandidate *lc = NULL, *rc = NULL;
+        if (nice_agent_get_selected_pair(agent, stream_id, component_id, &lc, &rc) && lc && rc) {
+            gchar *ls = nice_agent_generate_local_candidate_sdp(agent, lc);
+            gchar *rs = nice_agent_generate_local_candidate_sdp(agent, rc);
+            g_message("signal_media: ICE SELECTED PAIR local[%s] remote[%s]",
+                      ls ? ls : "?", rs ? rs : "?");
+            g_free(ls); g_free(rs);
+        }
+    }
+    /* On NICE_COMPONENT_STATE_FAILED the bridge should hang the call up; surfaced via the log. */
+}
+
+/* Build the NiceAgent, one stream / one RTP component, our + remote credentials, start gathering. */
+static gboolean build_ice(SignalMedia *sm, const char *our_ufrag, const char *our_pwd,
+                          const char *remote_ufrag, const char *remote_pwd)
+{
+    /* RFC5245 full ICE, controlled role is set implicitly (we are the answerer). Using the private
+     * context so all agent signals fire on our media thread. */
+    sm->agent = nice_agent_new(sm->ctx, NICE_COMPATIBILITY_RFC5245);
+    if (!sm->agent) { g_printerr("signal_media: nice_agent_new failed\n"); return FALSE; }
+
+    /* ICE role: the CALLER (offerer) is CONTROLLING, the answerer is CONTROLLED. Getting this
+     * wrong (both controlled) causes an ICE role conflict so the pair never nominates -> no media. */
+    g_object_set(sm->agent, "controlling-mode", sm->is_caller ? TRUE : FALSE, NULL);
+    g_message("signal_media: role=%s controlling-mode=%d",
+              sm->is_caller ? "CALLER" : "ANSWERER", sm->is_caller ? 1 : 0);
+
+    /* STUN (agent-global): gathers server-reflexive (srflx) candidates so we learn our public
+     * ip:port behind NAT. Signal feeds this via a RELAY line before START. Set before gathering. */
+    if (g_stun_port) {
+        g_object_set(sm->agent, "stun-server", g_stun_host,
+                     "stun-server-port", (guint)g_stun_port, NULL);
+        g_message("signal_media: STUN server %s:%d", g_stun_host, g_stun_port);
+    }
+
+    sm->component = 1;
+    sm->stream_id = nice_agent_add_stream(sm->agent, 1 /* rtcp-mux -> single component */);
+    if (!sm->stream_id) { g_printerr("signal_media: add_stream failed\n"); return FALSE; }
+
+    /* TURN relays (per component): Signal RELAYS all calls for IP privacy, so relay candidates are
+     * how the two peers actually reach each other. Must be set after add_stream, before gather. */
+    for (int i = 0; i < g_n_turn; i++) {
+        SmTurn *t = &g_turn[i];
+        if (nice_agent_set_relay_info(sm->agent, sm->stream_id, sm->component,
+                                      t->host, (guint)t->port,
+                                      t->user, t->pass, t->type))
+            g_message("signal_media: TURN relay %s:%d type=%d", t->host, t->port, (int)t->type);
+        else
+            g_printerr("signal_media: set_relay_info failed for %s:%d\n", t->host, t->port);
+    }
+
+    if (our_ufrag && our_pwd)
+        nice_agent_set_local_credentials(sm->agent, sm->stream_id, our_ufrag, our_pwd);
+    if (remote_ufrag && remote_pwd)
+        nice_agent_set_remote_credentials(sm->agent, sm->stream_id, remote_ufrag, remote_pwd);
+
+    g_signal_connect(sm->agent, "new-candidate-full",       G_CALLBACK(on_nice_candidate),      sm);
+    g_signal_connect(sm->agent, "candidate-gathering-done", G_CALLBACK(on_nice_gathering_done), sm);
+    g_signal_connect(sm->agent, "component-state-changed",  G_CALLBACK(on_nice_state),          sm);
+
+    if (!nice_agent_gather_candidates(sm->agent, sm->stream_id)) {
+        g_printerr("signal_media: gather_candidates failed\n");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------ pipeline ------------------- */
+
+static gboolean build_pipeline(SignalMedia *sm)
+{
+    sm->pipeline = gst_pipeline_new("signal-call");
+
+    /* -------- RX: nicesrc -> srtpdec -> rtpopusdepay -> opusdec -> alsasink device=voip -------- */
+    GstElement *nsrc   = mk("nicesrc",       "rx-nicesrc");
+    GstElement *rxcaps = mk("capsfilter",    "rx-srtpcaps");   /* label bytes as x-srtp for srtpdec */
+    GstElement *sdec   = mk("srtpdec",       "rx-srtpdec");
+    GstElement *rxrtp  = mk("capsfilter",    "rx-rtpcaps");    /* describe the inner Opus RTP stream */
+    GstElement *depay  = mk("rtpopusdepay",  "rx-depay");
+    GstElement *odec   = mk("opusdec",       "rx-opusdec");
+    GstElement *aconv  = mk("audioconvert",  "rx-aconv");
+    GstElement *asink  = mk("alsasink",      "rx-alsasink");
+
+    /* -------- TX: alsasrc device=voipsource -> opusenc -> rtpopuspay -> srtpenc -> nicesink ----- */
+    GstElement *asrc   = mk("alsasrc",       "tx-alsasrc");
+    GstElement *txconv = mk("audioconvert",  "tx-aconv");
+    GstElement *txre   = mk("audioresample", "tx-ares");
+    GstElement *txcaps = mk("capsfilter",    "tx-rawcaps");    /* force 48k/mono for opusenc */
+    GstElement *oenc   = mk("opusenc",       "tx-opusenc");
+    GstElement *pay    = mk("rtpopuspay",    "tx-pay");
+    GstElement *senc   = mk("srtpenc",       "tx-srtpenc");
+    GstElement *nsink  = mk("nicesink",      "tx-nicesink");
+
+    if (!nsrc || !rxcaps || !sdec || !rxrtp || !depay || !odec || !aconv || !asink ||
+        !asrc || !txconv || !txre || !txcaps || !oenc || !pay || !senc || !nsink) {
+        if (sm->pipeline) { gst_object_unref(sm->pipeline); sm->pipeline = NULL; }
+        return FALSE;
+    }
+
+    /* nice binding: BOTH ends of the RTP flow share the one agent stream/component. */
+    g_object_set(nsrc,  "agent", sm->agent, "stream", sm->stream_id, "component", sm->component, NULL);
+    g_object_set(nsink, "agent", sm->agent, "stream", sm->stream_id, "component", sm->component, NULL);
+
+    /* RX caps + keys */
+    { GstCaps *c = gst_caps_new_empty_simple("application/x-srtp");
+      g_object_set(rxcaps, "caps", c, NULL); gst_caps_unref(c); }
+    g_signal_connect(sdec, "request-key", G_CALLBACK(on_srtpdec_request_key), sm);
+    { GstCaps *c = opus_rtp_caps(); g_object_set(rxrtp, "caps", c, NULL); gst_caps_unref(c); }
+    g_object_set(asink, "device", "voip", "sync", FALSE, NULL);
+
+    /* TX caps + keys */
+    { GstCaps *c = gst_caps_new_simple("audio/x-raw",
+                                       "format",   G_TYPE_STRING, "S16LE",
+                                       "rate",     G_TYPE_INT,    SIGNAL_OPUS_CLOCKRATE,
+                                       "channels", G_TYPE_INT,    SIGNAL_OPUS_CHANNELS, NULL);
+      g_object_set(txcaps, "caps", c, NULL); gst_caps_unref(c); }
+    g_object_set(asrc, "device", "voipsource", NULL);
+    g_object_set(pay,  "pt", SIGNAL_OPUS_PT, NULL);
+    /* TX (encrypt our stream): answerer uses answer_key, caller uses offer_key. */
+    { GstBuffer *tx_master = sm->is_caller
+          ? master_key_buffer(sm->keys.offer_key,  sm->keys.offer_salt)
+          : master_key_buffer(sm->keys.answer_key, sm->keys.answer_salt);
+      configure_srtpenc(senc, tx_master);
+      gst_buffer_unref(tx_master); /* srtpenc took its own ref via g_object_set */ }
+
+    gst_bin_add_many(GST_BIN(sm->pipeline),
+                     nsrc, rxcaps, sdec, rxrtp, depay, odec, aconv, asink,
+                     asrc, txconv, txre, txcaps, oenc, pay, senc, nsink, NULL);
+
+    if (!gst_element_link_many(nsrc, rxcaps, sdec, rxrtp, depay, odec, aconv, asink, NULL)) {
+        g_printerr("signal_media: RX link failed\n"); return FALSE;
+    }
+    if (!gst_element_link_many(asrc, txconv, txre, txcaps, oenc, pay, senc, nsink, NULL)) {
+        g_printerr("signal_media: TX link failed\n"); return FALSE;
+    }
+
+    GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(sm->pipeline));
+    GSource *src = gst_bus_create_watch(bus);
+    g_source_set_callback(src, (GSourceFunc)on_bus, sm, NULL);
+    g_source_attach(src, sm->ctx);   /* watch fires on the media thread */
+    g_source_unref(src);
+    gst_object_unref(bus);
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------ media thread --------------- */
+
+static gpointer media_thread(gpointer data)
+{
+    SignalMedia *sm = (SignalMedia *)data;
+    g_main_context_push_thread_default(sm->ctx);
+    g_main_loop_run(sm->loop);
+    g_main_context_pop_thread_default(sm->ctx);
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ public API ----------------- */
+
+int signal_media_init(int *argc, char ***argv)
+{
+    if (g_once_init_enter(&g_inited)) {
+        gst_init(argc, argv);
+        g_once_init_leave(&g_inited, 1);
+    }
+    return 0;
+}
+
+int signal_media_start(const unsigned char local_priv[32],
+                       const unsigned char remote_pub[32],
+                       const unsigned char *caller_id, size_t caller_id_len,
+                       const unsigned char *callee_id, size_t callee_id_len,
+                       const char *our_ufrag, const char *our_pwd,
+                       const char *remote_ufrag, const char *remote_pwd,
+                       int is_caller,
+                       signal_media_candidate_cb cand_cb, void *user,
+                       signal_media_audiod_cb audiod_cb, void *aud_user)
+{
+    signal_media_init(NULL, NULL);
+
+    memset(&g_sm, 0, sizeof g_sm);
+    g_sm.is_caller = is_caller ? TRUE : FALSE;
+    g_sm.cand_cb = cand_cb; g_sm.cand_user = user;
+    g_sm.audiod_cb = audiod_cb; g_sm.audiod_user = aud_user;
+
+    if (signal_negotiate_srtp_keys(local_priv, remote_pub, caller_id, caller_id_len,
+                                   callee_id, callee_id_len, &g_sm.keys) != 0) {
+        g_printerr("signal_media: SRTP key derivation failed (non-contributory / bad key?)\n");
+        return -1;
+    }
+    /* RX (decrypt the peer): answerer uses offer_key, caller uses answer_key. */
+    g_sm.rx_master = g_sm.is_caller
+        ? master_key_buffer(g_sm.keys.answer_key, g_sm.keys.answer_salt)
+        : master_key_buffer(g_sm.keys.offer_key,  g_sm.keys.offer_salt);
+
+    g_sm.ctx  = g_main_context_new();
+    g_sm.loop = g_main_loop_new(g_sm.ctx, FALSE);
+
+    if (!build_ice(&g_sm, our_ufrag, our_pwd, remote_ufrag, remote_pwd)) return -1;
+    if (!build_pipeline(&g_sm)) return -1;
+
+    if (gst_element_set_state(g_sm.pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+        g_printerr("signal_media: failed to set PLAYING\n");
+        return -1;
+    }
+
+    g_sm.running = TRUE;
+    g_sm.thread = g_thread_new("signal-media", media_thread, &g_sm);
+    return 0;
+}
+
+int signal_media_add_remote_candidate(const char *sdp_candidate)
+{
+    if (!g_sm.agent || !sdp_candidate) return -1;
+    /* Peer candidates arrive bare ("candidate:...") from the Signal opaque; libnice's parser wants
+     * the SDP attribute form "a=candidate:...". Prepend "a=" if it isn't already there. */
+    gchar *attr = (strncmp(sdp_candidate, "a=", 2) == 0)
+                      ? g_strdup(sdp_candidate)
+                      : g_strconcat("a=", sdp_candidate, NULL);
+    NiceCandidate *c = nice_agent_parse_remote_candidate_sdp(g_sm.agent, g_sm.stream_id, attr);
+    g_free(attr);
+    if (!c) { g_printerr("signal_media: could not parse remote candidate: %s\n", sdp_candidate); return -1; }
+    GSList *list = g_slist_append(NULL, c);
+    int added = nice_agent_set_remote_candidates(g_sm.agent, g_sm.stream_id, g_sm.component, list);
+    g_slist_free(list);
+    nice_candidate_free(c);
+    g_message("signal_media: REMOTE candidate (added=%d) -> %s", added, sdp_candidate);
+    return added > 0 ? 0 : -1;
+}
+
+void signal_media_stop(void)
+{
+    if (!g_sm.running) return;
+    g_sm.running = FALSE;
+
+    if (g_sm.pipeline) gst_element_set_state(g_sm.pipeline, GST_STATE_NULL);
+    if (g_sm.audiod_on && g_sm.audiod_cb) g_sm.audiod_cb(0, g_sm.audiod_user);
+    g_sm.audiod_on = FALSE;
+
+    if (g_sm.loop) g_main_loop_quit(g_sm.loop);
+    if (g_sm.thread) { g_thread_join(g_sm.thread); g_sm.thread = NULL; }
+
+    if (g_sm.pipeline) { gst_object_unref(g_sm.pipeline); g_sm.pipeline = NULL; }
+    if (g_sm.agent)    { g_object_unref(g_sm.agent);      g_sm.agent = NULL; }
+    if (g_sm.rx_master){ gst_buffer_unref(g_sm.rx_master); g_sm.rx_master = NULL; }
+    if (g_sm.loop)     { g_main_loop_unref(g_sm.loop);    g_sm.loop = NULL; }
+    if (g_sm.ctx)      { g_main_context_unref(g_sm.ctx);  g_sm.ctx = NULL; }
+}
+
+/* ------------------------------------------------------------------ loopback self-test --------- */
+/*
+ * audiotestsrc -> audioconvert -> audioresample -> [48k/mono] -> opusenc -> rtpopuspay
+ *   -> srtpenc(master) -> srtpdec(same master via request-key) -> rtpopusdepay -> opusdec -> fakesink
+ * A pad probe on opusdec's src pad counts decoded frames; PASS once we clear the threshold.
+ * No ICE, no ALSA, no device: this is the piece we can reason about fully tonight.
+ */
+typedef struct {
+    GMainLoop *loop;
+    GstBuffer *master;
+    guint      decoded;
+    gboolean   ok;
+    gboolean   errored;
+} LoopbackCtx;
+
+#define LOOPBACK_NEED_FRAMES 25   /* ~0.5 s of 20 ms Opus frames */
+
+static GstCaps *loopback_request_key(GstElement *dec, guint ssrc, gpointer user)
+{
+    (void)dec; (void)ssrc;
+    LoopbackCtx *lc = (LoopbackCtx *)user;
+    GstCaps *caps = gst_caps_new_simple("application/x-srtp",
+                                        "srtp-cipher",  G_TYPE_STRING, SRTP_CIPHER_GCM256,
+                                        "srtp-auth",    G_TYPE_STRING, SRTP_AUTH_NULL,
+                                        "srtcp-cipher", G_TYPE_STRING, SRTP_CIPHER_GCM256,
+                                        "srtcp-auth",   G_TYPE_STRING, SRTP_AUTH_NULL,
+                                        NULL);
+    gst_caps_set_simple(caps, "srtp-key", GST_TYPE_BUFFER, gst_buffer_ref(lc->master), NULL);
+    return caps;
+}
+
+static GstPadProbeReturn loopback_count(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    (void)pad; (void)info;
+    LoopbackCtx *lc = (LoopbackCtx *)user;
+    if (++lc->decoded >= LOOPBACK_NEED_FRAMES && !lc->ok) {
+        lc->ok = TRUE;
+        g_main_loop_quit(lc->loop);
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+static gboolean loopback_bus(GstBus *bus, GstMessage *msg, gpointer user)
+{
+    (void)bus;
+    LoopbackCtx *lc = (LoopbackCtx *)user;
+    if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+        GError *err = NULL; gchar *dbg = NULL;
+        gst_message_parse_error(msg, &err, &dbg);
+        g_printerr("[loopback] ERROR from %s: %s (%s)\n", GST_OBJECT_NAME(msg->src),
+                   err ? err->message : "?", dbg ? dbg : "");
+        if (err) g_error_free(err);
+        g_free(dbg);
+        lc->errored = TRUE;
+        g_main_loop_quit(lc->loop);
+    }
+    return TRUE;
+}
+
+static gboolean loopback_timeout(gpointer user)
+{
+    LoopbackCtx *lc = (LoopbackCtx *)user;
+    g_main_loop_quit(lc->loop);
+    return G_SOURCE_REMOVE;
+}
+
+int signal_media_loopback_selftest(void)
+{
+    signal_media_init(NULL, NULL);
+
+    /* Real 44-byte AEAD_AES_256_GCM master from the KDF, using the same fixed vector as
+     * srtp_kdf.py's demo so a human can eyeball the key against the reference if needed. We use the
+     * answer_* key for both directions here - loopback only needs a valid GCM key. */
+    unsigned char priv[32], remote_pub[32], cid[33], eid[33];
+    for (int i = 0; i < 32; i++) priv[i] = (unsigned char)(i + 1);
+    static const unsigned char alan_pub[32] = {
+        0x36,0x4f,0xb3,0xe8,0xd7,0x1d,0x17,0xb6,0x56,0xac,0xa4,0x98,0xca,0x2c,0x4e,0x9f,
+        0xfa,0xcf,0xab,0x68,0xb6,0xa7,0x25,0x55,0x07,0xa8,0xca,0x1d,0x58,0x63,0x73,0x61 };
+    memcpy(remote_pub, alan_pub, 32);
+    cid[0] = 0x05; memset(cid + 1, 0xAA, 32);
+    eid[0] = 0x05; memset(eid + 1, 0xBB, 32);
+
+    signal_srtp_keys keys;
+    if (signal_negotiate_srtp_keys(priv, remote_pub, cid, 33, eid, 33, &keys) != 0) {
+        g_printerr("[loopback] FAIL: key derivation failed\n");
+        return 2;
+    }
+
+    LoopbackCtx lc; memset(&lc, 0, sizeof lc);
+    lc.master = master_key_buffer(keys.answer_key, keys.answer_salt);
+    lc.loop   = g_main_loop_new(NULL, FALSE);
+
+    GstElement *pipe = gst_pipeline_new("loopback");
+    GstElement *src   = mk("audiotestsrc",  "lt-src");
+    GstElement *conv  = mk("audioconvert",  "lt-conv");
+    GstElement *res   = mk("audioresample", "lt-res");
+    GstElement *caps  = mk("capsfilter",    "lt-caps");
+    GstElement *oenc  = mk("opusenc",       "lt-opusenc");
+    GstElement *pay   = mk("rtpopuspay",    "lt-pay");
+    GstElement *senc  = mk("srtpenc",       "lt-srtpenc");
+    GstElement *sdec  = mk("srtpdec",       "lt-srtpdec");
+    GstElement *rxc   = mk("capsfilter",    "lt-rxcaps");
+    GstElement *depay = mk("rtpopusdepay",  "lt-depay");
+    GstElement *odec  = mk("opusdec",       "lt-opusdec");
+    GstElement *sink  = mk("fakesink",      "lt-sink");
+
+    if (!pipe || !src || !conv || !res || !caps || !oenc || !pay || !senc || !sdec ||
+        !rxc || !depay || !odec || !sink) {
+        g_printerr("[loopback] FAIL: missing GStreamer element(s) - is the plugin path set?\n");
+        return 3;
+    }
+
+    g_object_set(src, "is-live", TRUE, "wave", 0 /* sine */, "num-buffers", 400, NULL);
+    { GstCaps *c = gst_caps_new_simple("audio/x-raw",
+                                       "format",   G_TYPE_STRING, "S16LE",
+                                       "rate",     G_TYPE_INT,    SIGNAL_OPUS_CLOCKRATE,
+                                       "channels", G_TYPE_INT,    SIGNAL_OPUS_CHANNELS, NULL);
+      g_object_set(caps, "caps", c, NULL); gst_caps_unref(c); }
+    g_object_set(pay, "pt", SIGNAL_OPUS_PT, NULL);
+    configure_srtpenc(senc, lc.master);
+    g_signal_connect(sdec, "request-key", G_CALLBACK(loopback_request_key), &lc);
+    { GstCaps *c = opus_rtp_caps(); g_object_set(rxc, "caps", c, NULL); gst_caps_unref(c); }
+    g_object_set(sink, "sync", FALSE, "async", FALSE, NULL);
+
+    gst_bin_add_many(GST_BIN(pipe), src, conv, res, caps, oenc, pay, senc, sdec, rxc, depay, odec, sink, NULL);
+    if (!gst_element_link_many(src, conv, res, caps, oenc, pay, senc, NULL) ||
+        !gst_element_link_many(senc, sdec, NULL) ||
+        !gst_element_link_many(sdec, rxc, depay, odec, sink, NULL)) {
+        g_printerr("[loopback] FAIL: could not link pipeline (caps mismatch?)\n");
+        return 4;
+    }
+
+    GstPad *p = gst_element_get_static_pad(odec, "src");
+    gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, loopback_count, &lc, NULL);
+    gst_object_unref(p);
+
+    GstBus *bus = gst_element_get_bus(pipe);
+    gst_bus_add_watch(bus, loopback_bus, &lc);
+    gst_object_unref(bus);
+
+    g_timeout_add_seconds(10, loopback_timeout, &lc);
+
+    g_print("[loopback] starting SRTP(AEAD_AES_256_GCM)+RTP+Opus round-trip...\n");
+    if (gst_element_set_state(pipe, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+        g_printerr("[loopback] FAIL: could not set PLAYING\n");
+        gst_object_unref(pipe);
+        return 5;
+    }
+    g_main_loop_run(lc.loop);
+    gst_element_set_state(pipe, GST_STATE_NULL);
+
+    int rc = (lc.ok && !lc.errored) ? 0 : 1;
+    g_print("[loopback] decoded %u Opus frames through SRTP-GCM -> %s\n",
+            lc.decoded, rc == 0 ? "PASS" : "FAIL");
+
+    gst_object_unref(pipe);
+    gst_buffer_unref(lc.master);
+    g_main_loop_unref(lc.loop);
+    return rc;
+}
+
+/* ------------------------------------------------------------------ standalone main ------------ */
+#ifndef SIGNAL_MEDIA_NO_MAIN
+
+/* --answer IPC driver: the separate-process contract the presage bridge speaks (see RUNTIME_STATUS).
+ * presage spawns `signal_media --answer`, then talks a line protocol over the pipes:
+ *
+ *   presage -> us (stdin):
+ *     START <priv_hex64> <pub_hex64> <callerid_hex> <calleeid_hex> <ourufrag> <ourpwd> <remufrag> <rempwd>
+ *     RCAND <candidate:... sdp line>      (peer IceUpdate, may repeat / trickle)
+ *     STOP
+ *   us -> presage (stdout, line-buffered):
+ *     CAND <candidate:... sdp line>       (our local candidate to send as an IceUpdate)
+ *     AUDIOD <0|1>                        (bridge should drive audiod scenario)
+ *     READY                               (engine started ok)
+ *     ERR <msg>                           (fatal; we exit non-zero)
+ *
+ * Keys/ids are lowercase hex. ufrag/pwd are single whitespace-free tokens (ICE creds never contain
+ * spaces). Our callbacks fire from the engine's GMainContext thread, so stdout writes take a lock. */
+static GMutex g_out_lock;
+
+static void emit(const char *fmt, ...)
+{
+    va_list ap; va_start(ap, fmt);
+    g_mutex_lock(&g_out_lock);
+    vfprintf(stdout, fmt, ap);
+    fflush(stdout);
+    g_mutex_unlock(&g_out_lock);
+    va_end(ap);
+}
+
+static void ipc_candidate_cb(const char *sdp, void *user) { (void)user; emit("CAND %s\n", sdp); }
+static void ipc_audiod_cb(int active, void *user)         { (void)user; emit("AUDIOD %d\n", active ? 1 : 0); }
+
+/* hex -> bytes; returns byte count, or -1 on bad/odd input. out must hold len(hex)/2 bytes. */
+static int unhex(const char *h, unsigned char *out, size_t out_max)
+{
+    size_t n = strlen(h);
+    if (n % 2) return -1;
+    if (n / 2 > out_max) return -1;
+    for (size_t i = 0; i < n; i += 2) {
+        int hi = g_ascii_xdigit_value(h[i]), lo = g_ascii_xdigit_value(h[i + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i / 2] = (unsigned char)((hi << 4) | lo);
+    }
+    return (int)(n / 2);
+}
+
+/* Derive + emit our X25519 public key from a hex private key ("PUB <pub_hex>"); returns 0 on ok.
+ * Used by the CALLER's two-phase flow to get its public key BEFORE the Answer arrives (so it can be
+ * put in the outgoing Offer) and by the START path (so the Answer's key matches the SRTP keys). */
+static int emit_pubkey_from_priv_hex(const char *ph)
+{
+    unsigned char priv[32], ourpub[32];
+    if (unhex(ph, priv, sizeof priv) != 32) { emit("ERR bad-key-hex\n"); return -1; }
+    if (signal_x25519_public_from_private(priv, ourpub) != 0) { emit("ERR pubkey-derive-failed\n"); return -1; }
+    char hexp[65];
+    for (int k = 0; k < 32; k++) g_snprintf(hexp + k * 2, 3, "%02x", ourpub[k]);
+    emit("PUB %s\n", hexp);
+    return 0;
+}
+
+static int run_ipc(int is_caller)
+{
+    char line[8192];
+    int started = 0;
+    unsigned char priv[32], pub[32], caller_id[64], callee_id[64];
+    int caller_len = 0, callee_len = 0;
+
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    g_mutex_init(&g_out_lock);
+
+    while (fgets(line, sizeof line, stdin)) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+        if (line[0] == '\0') continue;
+
+        if (strncmp(line, "PREPARE ", 8) == 0) {
+            /* Caller phase 1: just report our public key so the bridge can send the Offer. No media
+             * yet - the answerer's key + ICE creds arrive later in START. */
+            emit_pubkey_from_priv_hex(line + 8);
+        } else if (strncmp(line, "RELAY ", 6) == 0) {
+            /* STUN/TURN config, sent before START:  RELAY stun <host> <port>
+             *                                       RELAY turn <ip> <port> <user> <pass> <transport> */
+            char *sp = NULL;
+            char *kind = strtok_r(line + 6, " ", &sp);
+            char *host = strtok_r(NULL, " ", &sp);
+            char *ports = strtok_r(NULL, " ", &sp);
+            if (kind && host && ports) {
+                int port = atoi(ports);
+                if (strcmp(kind, "stun") == 0) {
+                    snprintf(g_stun_host, sizeof g_stun_host, "%s", host);
+                    g_stun_port = port;
+                } else if (strcmp(kind, "turn") == 0 && g_n_turn < SM_MAX_TURN) {
+                    char *user = strtok_r(NULL, " ", &sp);
+                    char *pass = strtok_r(NULL, " ", &sp);
+                    char *tr   = strtok_r(NULL, " ", &sp);
+                    SmTurn *t = &g_turn[g_n_turn++];
+                    snprintf(t->host, sizeof t->host, "%s", host);
+                    t->port = port;
+                    snprintf(t->user, sizeof t->user, "%s", user ? user : "");
+                    snprintf(t->pass, sizeof t->pass, "%s", pass ? pass : "");
+                    t->type = (tr && strcmp(tr, "tcp") == 0) ? NICE_RELAY_TYPE_TURN_TCP
+                            : (tr && strcmp(tr, "tls") == 0) ? NICE_RELAY_TYPE_TURN_TLS
+                            :                                  NICE_RELAY_TYPE_TURN_UDP;
+                }
+            }
+        } else if (strncmp(line, "START ", 6) == 0) {
+            if (started) { emit("ERR already-started\n"); continue; }
+            /* Tokenise the 8 START fields. strtok is fine: no field contains whitespace. */
+            char *sp = NULL;
+            char *ph  = strtok_r(line + 6, " ", &sp);
+            char *pubh= strtok_r(NULL, " ", &sp);
+            char *cah = strtok_r(NULL, " ", &sp);
+            char *ceh = strtok_r(NULL, " ", &sp);
+            char *ouf = strtok_r(NULL, " ", &sp);
+            char *opw = strtok_r(NULL, " ", &sp);
+            char *ruf = strtok_r(NULL, " ", &sp);
+            char *rpw = strtok_r(NULL, " ", &sp);
+            if (!ph || !pubh || !cah || !ceh || !ouf || !opw || !ruf || !rpw) {
+                emit("ERR start-missing-fields\n"); continue;
+            }
+            if (unhex(ph, priv, sizeof priv) != 32 || unhex(pubh, pub, sizeof pub) != 32) {
+                emit("ERR bad-key-hex\n"); continue;
+            }
+            caller_len = unhex(cah, caller_id, sizeof caller_id);
+            callee_len = unhex(ceh, callee_id, sizeof callee_id);
+            if (caller_len < 0 || callee_len < 0) { emit("ERR bad-id-hex\n"); continue; }
+
+            /* Report OUR X25519 public key (derived from priv via the SAME OpenSSL primitive that
+             * does the DH) so the bridge puts a public key in the Answer that is guaranteed
+             * consistent with the SRTP keys this engine will derive. The CALLER already reported it
+             * in PREPARE (and put it in the Offer), so only the answerer emits it here. */
+            if (!is_caller) { emit_pubkey_from_priv_hex(ph); }
+
+            int rc = signal_media_start(priv, pub,
+                                        caller_id, (size_t)caller_len,
+                                        callee_id, (size_t)callee_len,
+                                        ouf, opw, ruf, rpw,
+                                        is_caller,
+                                        ipc_candidate_cb, NULL, ipc_audiod_cb, NULL);
+            if (rc != 0) { emit("ERR start-failed\n"); return 1; }
+            started = 1;
+            emit("READY\n");
+        } else if (strncmp(line, "RCAND ", 6) == 0) {
+            if (!started) { emit("ERR rcand-before-start\n"); continue; }
+            signal_media_add_remote_candidate(line + 6);
+        } else if (strcmp(line, "STOP") == 0) {
+            break;
+        } else {
+            emit("ERR unknown-cmd\n");
+        }
+    }
+    if (started) signal_media_stop();
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    signal_media_init(&argc, &argv);
+    if (argc >= 2 && (strcmp(argv[1], "--loopback") == 0 || strcmp(argv[1], "--selftest") == 0)) {
+        int rc = signal_media_loopback_selftest();
+        return rc;
+    }
+    if (argc >= 2 && strcmp(argv[1], "--answer") == 0) {
+        return run_ipc(0);   /* answerer: RX=offer_key, TX=answer_key */
+    }
+    if (argc >= 2 && strcmp(argv[1], "--caller") == 0) {
+        return run_ipc(1);   /* caller (outgoing): RX=answer_key, TX=offer_key */
+    }
+    g_print("Signal call media engine (webOS).\n");
+    g_print("  %s --loopback   run the SRTP-GCM+RTP+Opus loopback self-test\n", argv[0]);
+    g_print("  %s --answer     drive a live INCOMING call over the stdin/stdout IPC (presage bridge)\n", argv[0]);
+    g_print("  %s --caller     drive a live OUTGOING call over the stdin/stdout IPC (presage bridge)\n", argv[0]);
+    return 0;
+}
+#endif

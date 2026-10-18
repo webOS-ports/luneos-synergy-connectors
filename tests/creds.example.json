@@ -1,0 +1,20 @@
+{
+  "__comment": "Copy to creds.local.json (gitignored) and fill in. Only connectors listed here run their L2 tests; the rest SKIP. 'account: existing' reuses an account already signed in on the device (needed for QR / 2FA / OAuth networks); the harness never deletes those. Cloud 'credentials' are the credentials.common object a real sign-in stored. 'peer' is who IM tests message - an echo bot or a second account you control; 'echo: true' makes the test wait for the reply.",
+
+  "telegram":   {"account": "existing", "peer": "@your_echo_bot", "echo": true},
+  "whatsapp":   {"account": "existing", "peer": "31600000000@s.whatsapp.net"},
+  "signal":     {"account": "existing", "peer": "+31600000000"},
+  "teams":      {"account": "existing", "peer": "8:live:someone"},
+  "facebook":   {"account": "create", "username": "you@example.org", "password": "SECRET", "peer": "100000000000000"},
+  "discord":    {"account": "create", "username": "you@example.org", "password": "SECRET", "peer": "000000000000000000"},
+  "googlechat": {"account": "existing", "peer": "users/000000000000000000000"},
+
+  "dropbox":  {"account": "existing", "folder": ""},
+  "kdrive":   {"credentials": {"common": {"accessToken": "SECRET"}}},
+  "s3":       {"credentials": {"common": {"endpoint": "https://s3.eu-central-1.amazonaws.com", "region": "eu-central-1", "bucket": "luneos-harness", "accessKeyId": "AKIA...", "secretAccessKey": "SECRET", "pathStyle": true}}},
+
+  "qobuz":    {"email": "you@example.org", "password": "SECRET"},
+  "deezer":   {"arl": "SECRET"},
+  "spotify":  {"account": "existing"},
+  "soundcloud": {"query": "field recording"}
+}

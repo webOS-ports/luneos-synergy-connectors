@@ -1,0 +1,41 @@
+[
+    {
+        "templateId": "org.webosports.app.music.soundcloud",
+        "loc_name": "SoundCloud",
+        "icon": {
+            "loc_32x32": "images/soundcloud-32x32.png",
+            "loc_48x48": "images/soundcloud-48x48.png"
+        },
+        "validator": {
+            "customUI": {
+                "appId": "org.webosports.app.musicauth",
+                "name": "validator.html"
+            }
+        },
+        "loc_usernameLabel": "SOUNDCLOUD",
+        "readPermissions": [
+            "org.webosports.app.music.service",
+            "org.webosports.app.music",
+            "org.webosports.app.musicauth"
+        ],
+        "writePermissions": [
+            "org.webosports.app.music.service",
+            "org.webosports.app.music",
+            "org.webosports.app.musicauth"
+        ],
+        "capabilityProviders": [
+            {
+                "capability": "Music",
+                "capabilitySubtype": "STREAMING",
+                "id": "org.webosports.app.music.soundcloud.streaming",
+                "alwaysOn": true,
+                "loc_shortName": "SoundCloud",
+                "icon": {
+                    "loc_32x32": "images/soundcloud-32x32.png",
+                    "loc_48x48": "images/soundcloud-48x48.png",
+                    "splitter": "images/soundcloud-32x32.png"
+                }
+            }
+        ]
+    }
+]

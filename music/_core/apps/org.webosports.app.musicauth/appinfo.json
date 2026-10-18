@@ -1,0 +1,15 @@
+{
+	"id": "org.webosports.app.musicauth",
+	"version": "0.9.2",
+	"vendor": "WebOS Ports",
+	"type": "web",
+	"main": "validator.html",
+	"title": "Music Account",
+	"visible": false,
+	"icon": "icon.png",
+	"splashicon": "icon.png",
+	"noWindow": true,
+	"uiRevision": 2,
+	"requiredMemory": 32,
+	"requiredPermissions": ["accountsservice.management", "accountsservice.operation", "networkconnection.query"]
+}

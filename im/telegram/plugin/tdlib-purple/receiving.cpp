@@ -1,0 +1,1255 @@
+#include "receiving.h"
+#include "client-utils.h"
+#include "format.h"
+#include "purple-info.h"
+#include "file-transfer.h"
+#include "sticker.h"
+#include "config.h"
+#include "call.h"
+#include <algorithm>
+
+enum {
+    HISTORY_MESSAGES_ABSOLUTE_LIMIT = 10000
+};
+
+std::string makeNoticeWithSender(const td::td_api::chat &chat, const TgMessageInfo &message,
+                                 const char *noticeText, PurpleAccount *account)
+{
+    std::string prefix = getSenderDisplayName(chat, message, account);
+    if (!prefix.empty())
+        prefix += ": ";
+    return prefix + noticeText;
+}
+
+std::string getMessageText(const td::td_api::formattedText &text)
+{
+    char *newText = purple_markup_escape_text(text.text_.c_str(), text.text_.size());
+    std::string result(newText);
+    g_free(newText);
+    return result;
+}
+
+std::string makeInlineImageText(int imgstoreId)
+{
+    return "\n<img id=\"" + std::to_string(imgstoreId) + "\">";
+}
+
+static PurpleMessageFlags getNotificationFlags(PurpleMessageFlags extraFlags)
+{
+    unsigned flags = (extraFlags & PURPLE_MESSAGE_ERROR) | (extraFlags & PURPLE_MESSAGE_NO_LOG);
+    if (flags == 0)
+        flags = PURPLE_MESSAGE_SYSTEM;
+
+    return (PurpleMessageFlags)flags;
+}
+
+void sendConversationReadReceipts(TdAccountData &account, PurpleConversation *conv)
+{
+    if (!conversationHasFocus(conv))
+        return;
+    ChatId chatId;
+    PurpleConversationType convType = purple_conversation_get_type(conv);
+    const char            *convName = purple_conversation_get_name(conv);
+
+    if (convType == PURPLE_CONV_TYPE_IM) {
+        UserId       privateChatUserId = purpleBuddyNameToUserId(convName);
+        SecretChatId secretChatId      = purpleBuddyNameToSecretChatId(convName);
+        const td::td_api::chat *tdlibChat = nullptr;
+
+        if (privateChatUserId.valid())
+            tdlibChat = account.getPrivateChatByUserId(privateChatUserId);
+        else if (secretChatId.valid())
+            tdlibChat = account.getChatBySecretChat(secretChatId);
+
+        if (tdlibChat)
+            chatId = getId(*tdlibChat);
+    } else if (convType == PURPLE_CONV_TYPE_CHAT)
+        chatId = getTdlibChatId(convName);
+
+    std::vector<ReadReceipt> receipts;
+    account.extractPendingReadReceipts(chatId, receipts);
+
+    if (!receipts.empty()) {
+        purple_debug_misc(config::pluginId, "Sending %zu read receipts for chat %" G_GINT64_FORMAT "\n",
+                          receipts.size(), chatId.value());
+        td::td_api::object_ptr<td::td_api::viewMessages> viewMessagesReq = td::td_api::make_object<td::td_api::viewMessages>();
+        viewMessagesReq->chat_id_ = chatId.value();
+        viewMessagesReq->force_read_ = true; // no idea what "closed chats" are at this point
+        viewMessagesReq->message_ids_.resize(receipts.size());
+        for (size_t i = 0; i < receipts.size(); i++)
+            viewMessagesReq->message_ids_[i] = receipts[i].messageId.value();
+        account.transceiver.sendQuery(std::move(viewMessagesReq), nullptr);
+    }
+}
+
+// webOS replies: stash the quoted-original (text/from/id) on a conv, mirroring the webos-msg-id stash,
+// so the transport writes it onto the message row and the Messaging UI renders an inline quote card
+// instead of the "<b>&gt; ... wrote:</b>" HTML we used to fold into the body. No-op if not a reply.
+static void stashQuote(PurpleConversation *conv, const char *quotedId, const char *quotedText, const char *quotedFrom)
+{
+    if (conv == NULL || quotedText == NULL || *quotedText == '\0') return;
+    purple_conversation_set_data(conv, "webos-quoted-text", g_strdup(quotedText));
+    if (quotedFrom && *quotedFrom) purple_conversation_set_data(conv, "webos-quoted-from", g_strdup(quotedFrom));
+    if (quotedId && *quotedId) purple_conversation_set_data(conv, "webos-quoted-id", g_strdup(quotedId));
+}
+
+void showMessageTextIm(TdAccountData &account, const char *purpleUserName, const char *text,
+                       const char *notification, time_t timestamp, PurpleMessageFlags flags,
+                       const char *serviceMessageId,
+                       const char *quotedId, const char *quotedText, const char *quotedFrom)
+{
+    PurpleConversation *conv = NULL;
+
+    if (text) {
+        if (flags & PURPLE_MESSAGE_SEND) {
+            // serv_got_im seems to work for messages sent from another client, but not for
+            // echoed messages from this client. Therefore, this (code snippet from facebook plugin).
+            conv = getImConversation(account.purpleAccount, purpleUserName);
+            // webOS reactions: stash this carbon's id so the transport (incoming_message_cb, which sees
+            // this write with PURPLE_MESSAGE_REMOTE_SEND) stores it as the Outbox row's serviceMessageId.
+            if (serviceMessageId && *serviceMessageId) {
+                purple_conversation_set_data(conv, "webos-msg-id", g_strdup(serviceMessageId));
+            }
+            stashQuote(conv, quotedId, quotedText, quotedFrom);
+            purple_conv_im_write(purple_conversation_get_im_data(conv),
+                                 purple_account_get_name_for_display(account.purpleAccount),
+                                 text, flags, timestamp);
+        } else {
+            // webOS reactions: stash this message's id on the conv BEFORE serv_got_im so the transport
+            // stores it as serviceMessageId (read in incoming_message_cb); a later reaction update
+            // targets it by "<chatId>:<messageId>". Same conv is used for the reply-quote stash.
+            if ((serviceMessageId && *serviceMessageId) || (quotedText && *quotedText)) {
+                conv = getImConversation(account.purpleAccount, purpleUserName);
+                if (serviceMessageId && *serviceMessageId)
+                    purple_conversation_set_data(conv, "webos-msg-id", g_strdup(serviceMessageId));
+                stashQuote(conv, quotedId, quotedText, quotedFrom);
+            }
+            serv_got_im(purple_account_get_connection(account.purpleAccount), purpleUserName, text,
+                        flags, timestamp);
+            conv = getImConversation(account.purpleAccount, purpleUserName);
+        }
+    }
+
+    if (notification) {
+        if (conv == NULL)
+            conv = getImConversation(account.purpleAccount, purpleUserName);
+        purple_conv_im_write(purple_conversation_get_im_data(conv), purpleUserName, notification,
+                             getNotificationFlags(flags), timestamp);
+    }
+
+    // TODO: sending all pending read receipts for the chat is technically not quite right,
+    // because maybe a message is being shown while others are waiting for some asynchronous
+    // response before they can be displayed. But who cares.
+    if (conv != NULL)
+        sendConversationReadReceipts(account, conv);
+}
+
+static void showMessageTextChat(TdAccountData &account, const td::td_api::chat &chat,
+                                const TgMessageInfo &message, const char *text,
+                                const char *notification, PurpleMessageFlags flags,
+                                const char *serviceMessageId = NULL,
+                                const char *quotedId = NULL, const char *quotedText = NULL, const char *quotedFrom = NULL)
+{
+    // Again, doing what facebook plugin does
+    int purpleId = account.getPurpleChatId(getId(chat));
+    PurpleConvChat *conv = getChatConversation(account, chat, purpleId);
+
+    if (text) {
+        if (flags & PURPLE_MESSAGE_SEND) {
+            if (conv)
+                purple_conv_chat_write(conv, purple_account_get_name_for_display(account.purpleAccount),
+                                       text, flags, message.timestamp);
+        } else {
+            if (purpleId != 0) {
+                // webOS: smuggle the sender's routable id + display name through the single `who` slot
+                // as "id<userId>\x1f<Display Name>". The webOS transport splits on \x1f -> from.addr =
+                // the id (so the app can open a 1:1 with the sender), from.name = the display name.
+                // Other libpurple UIs just see the combined string. No id -> plain display name.
+                std::string who = message.incomingGroupchatSender.empty() ? "someone" : message.incomingGroupchatSender;
+                if (!message.incomingGroupchatSenderId.empty())
+                    who = message.incomingGroupchatSenderId + "\x1f" + who;
+                // webOS reactions: stash this message's id on the chat conv BEFORE serv_got_chat_in so
+                // the transport stores it as serviceMessageId; a later reaction update targets it.
+                if ((serviceMessageId && *serviceMessageId) || (quotedText && *quotedText)) {
+                    PurpleConversation *baseConv = conv ? purple_conv_chat_get_conversation(conv) : NULL;
+                    if (baseConv) {
+                        if (serviceMessageId && *serviceMessageId)
+                            purple_conversation_set_data(baseConv, "webos-msg-id", g_strdup(serviceMessageId));
+                        stashQuote(baseConv, quotedId, quotedText, quotedFrom);
+                    }
+                }
+                serv_got_chat_in(purple_account_get_connection(account.purpleAccount), purpleId,
+                                 who.c_str(), flags, text, message.timestamp);
+            }
+        }
+    }
+
+    if (notification) {
+        if (conv)
+            // Protocol plugins mostly use who="" for such messages, but this currently causes problems
+            // with Spectrum. Use some non-empty string. Pidgin will ignore the who parameter for
+            // notification messages.
+            purple_conv_chat_write(conv, " ", notification, getNotificationFlags(flags), message.timestamp);
+    }
+
+    // TODO: sending all pending read receipts for the chat is technically not quite right,
+    // because maybe a message is being shown while others are waiting for some asynchronous
+    // response before they can be displayed. But who cares.
+    PurpleConversation *baseConv = conv ? purple_conv_chat_get_conversation(conv) : NULL;
+    if (baseConv != NULL)
+        sendConversationReadReceipts(account, baseConv);
+}
+
+// webOS replies: extract the quoted-original's author name + text (single-lined) as structured data,
+// instead of formatting them into "<b>&gt; ... wrote:</b>" HTML. Used to stash webos-quoted-* so the
+// Messaging UI renders an inline quote card above the reply.
+static void extractQuotedMessage(const td::td_api::message *message, TdAccountData &account,
+                                 std::string &outName, std::string &outText)
+{
+    const td::td_api::user *originalAuthor = nullptr;
+    if (message)
+        originalAuthor = account.getUser(getSenderUserId(*message));
+
+    std::string originalName;
+    if (originalAuthor)
+        originalName = account.getDisplayName(*originalAuthor);
+    else {
+        // message == NULL means it could not be fetched, or took too long to fetch
+        // TRANSLATOR: In-line placeholder if the original author of a quote is unknown. Is at the beginning of the line if and only if you make it so, see "<b>&bt {} wrote:"...
+        originalName = _("Unknown user");
+    }
+
+    std::string text;
+    if (!message || !message->content_) {
+        // TRANSLATOR: In-chat placeholder when something unknown is being replied to.
+        text = _("[message unavailable]");
+    } else switch (message->content_->get_id()) {
+        case td::td_api::messageText::ID: {
+            const td::td_api::messageText &messageText = static_cast<const td::td_api::messageText &>(*message->content_);
+            if (messageText.text_)
+                text = getMessageText(*messageText.text_);
+            else
+                text = "";
+            break;
+        }
+        case td::td_api::messagePhoto::ID: {
+            const td::td_api::messagePhoto &photo = static_cast<const td::td_api::messagePhoto &>(*message->content_);
+            // TRANSLATOR: In-line placeholder when a photo is being replied to.
+            text = _("[photo]");
+            if (photo.caption_)
+                text += " " + photo.caption_->text_;
+            break;
+        }
+        case td::td_api::messageDocument::ID: {
+            const td::td_api::messageDocument &document = static_cast<const td::td_api::messageDocument &>(*message->content_);
+            if (document.document_) {
+                // TRANSLATOR: In-line placeholder when a file is being replied to. Arguments will be the file name and MIME type (e.g. "application/gzip")
+                text = formatMessage(_("[file: {0} ({1})]"), {document.document_->file_name_,
+                                                           document.document_->mime_type_});
+            } else {
+                // Not supposed to be possible, but just in case
+                text = "[file]";
+            }
+            if (document.caption_)
+                text += " " + document.caption_->text_;
+            break;
+        }
+        case td::td_api::messageVideo::ID: {
+            const td::td_api::messageVideo &video = static_cast<const td::td_api::messageVideo &>(*message->content_);
+            if (video.video_) {
+                // TRANSLATOR: In-line placeholder when a video is being replied to. Argument will be the file name.
+                text = formatMessage(_("[video: {}]"), video.video_->file_name_);
+            } else {
+                // Not supposed to be possible, but just in case
+                text = "[video]";
+            }
+            if (video.caption_)
+                text += " " + video.caption_->text_;
+            break;
+        }
+        case td::td_api::messageSticker::ID:
+            // TRANSLATOR: In-line placeholder when a sticker is being replied to.
+            text = _("[sticker]");
+            break;
+        case td::td_api::messageAnimatedEmoji::ID: {
+            const td::td_api::messageAnimatedEmoji &animatedEmoji =
+                static_cast<const td::td_api::messageAnimatedEmoji &>(*message->content_);
+            text = animatedEmoji.emoji_;
+			break;
+        }
+        default:
+            text = '[' + getUnsupportedMessageDescription(*message->content_) + ']';
+            break;
+    }
+
+    for (unsigned i = 0; i < text.size(); i++)
+        if (text[i] == '\n') text[i] = ' ';
+
+    outName = originalName;
+    outText = text;
+}
+
+void showMessageText(TdAccountData &account, const td::td_api::chat &chat, const TgMessageInfo &message,
+                     const char *text, const char *notification, uint32_t extraFlags)
+{
+    PurpleMessageFlags directionFlag = message.outgoing ? PURPLE_MESSAGE_SEND : PURPLE_MESSAGE_RECV;
+    PurpleMessageFlags flags = (PurpleMessageFlags) (extraFlags | directionFlag);
+    if (message.outgoing && !message.sentLocally)
+        flags = (PurpleMessageFlags) (flags | PURPLE_MESSAGE_REMOTE_SEND);
+
+    std::string newText;
+    // webOS replies: capture the quoted-original as structured data (stashed on the conv by the show*
+    // functions -> transport -> immessage -> an inline quote card) instead of folding "> ... wrote:"
+    // HTML into the body. quotedId == the original's serviceMessageId key so the UI can look it up.
+    std::string quotedName, quotedText, quotedId;
+    if (message.repliedMessageId.valid()) {
+        extractQuotedMessage(message.repliedMessage.get(), account, quotedName, quotedText);
+        quotedId = std::to_string(getId(chat).value()) + ":" + std::to_string(message.repliedMessageId.value());
+    }
+    if (text) {
+        if (!message.forwardedFrom.empty()) {
+            // TRANSLATOR: In-chat notification of forward. Argument will be a username. Please preserve the HTML.
+            newText += formatMessage(_("<b>Forwarded from {}:</b>"), message.forwardedFrom);
+        }
+        if (!newText.empty())
+            newText += "\n";
+        newText += text;
+    }
+    if (!newText.empty())
+        text = newText.c_str();
+
+    // webOS reactions: a stable per-message key the transport stores as serviceMessageId. Telegram
+    // message ids are unique only within a chat, so scope it with the chat id: "<chatId>:<messageId>".
+    // A later updateMessageInteractionInfo emits reactions targeting this same key. Stash it for
+    // incoming messages AND for carbons of messages we sent from another client (outgoing but not
+    // sentLocally) - the transport stores those as Outbox rows, so reactions can attach to them too.
+    // Local echoes (sentLocally) are stored by the app's own send path, so we skip them.
+    std::string serviceMessageId;
+    if (message.id.valid() && (!message.outgoing || !message.sentLocally))
+        serviceMessageId = std::to_string(getId(chat).value()) + ":" + std::to_string(message.id.value());
+    const char *svcMsgId = serviceMessageId.empty() ? NULL : serviceMessageId.c_str();
+    const char *qId   = quotedId.empty()   ? NULL : quotedId.c_str();
+    const char *qText = quotedText.empty() ? NULL : quotedText.c_str();
+    const char *qFrom = quotedName.empty() ? NULL : quotedName.c_str();
+
+    const td::td_api::user *privateUser = account.getUserByPrivateChat(chat);
+    if (privateUser) {
+        std::string userName = getPurpleBuddyName(*privateUser);
+
+        // If there is no buddy in the buddy list, libpurple won't be able to translate buddy name
+        // to alias, so use display name instead of idXXXXXXXXX
+        if (!purple_find_buddy(account.purpleAccount, userName.c_str()))
+            userName = account.getDisplayName(*privateUser);
+        showMessageTextIm(account, userName.c_str(), text, notification, message.timestamp, flags, svcMsgId, qId, qText, qFrom);
+    }
+
+    SecretChatId secretChatId = getSecretChatId(chat);
+    if (secretChatId.valid()) {
+        std::string userName = getSecretChatBuddyName(secretChatId);
+        showMessageTextIm(account, userName.c_str(), text, notification, message.timestamp, flags, svcMsgId, qId, qText, qFrom);
+    }
+
+    if (getBasicGroupId(chat).valid() || getSupergroupId(chat).valid())
+        showMessageTextChat(account, chat, message, text, notification, flags, svcMsgId, qId, qText, qFrom);
+}
+
+// webOS reactions: turn a message's aggregated reaction summary into the "count<SP>emoji\n..." set
+// the transport expects and emit it. See showReactions() declaration in receiving.h.
+void showReactions(TdAccountData &account, int64_t chatId, int64_t messageId,
+                   const td::td_api::messageInteractionInfo *info)
+{
+    std::string serialized;
+    if (info && info->reactions_) {
+        for (const auto &r : info->reactions_->reactions_) {
+            if (!r || !r->type_ || r->total_count_ <= 0)
+                continue;
+            // Only unicode emoji reactions map to something we can render; skip custom (sticker) emoji.
+            if (r->type_->get_id() != td::td_api::reactionTypeEmoji::ID)
+                continue;
+            const auto &emojiType = static_cast<const td::td_api::reactionTypeEmoji &>(*r->type_);
+            if (emojiType.emoji_.empty())
+                continue;
+            serialized += std::to_string(r->total_count_) + " " + emojiType.emoji_ + "\n";
+        }
+    }
+
+    // Target key must match the serviceMessageId stashed when the message was shown.
+    std::string targetId = std::to_string(chatId) + ":" + std::to_string(messageId);
+    purple_signal_emit(purple_conversations_get_handle(), "webos-im-reaction-set",
+                       account.purpleAccount, targetId.c_str(), serialized.c_str(), (const char *)NULL);
+}
+
+void showChatNotification(TdAccountData &account, const td::td_api::chat &chat,
+                          const char *notification, time_t timestamp, PurpleMessageFlags extraFlags)
+{
+    TgMessageInfo messageInfo;
+    messageInfo.type = TgMessageInfo::Type::Other;
+    messageInfo.timestamp = timestamp;
+    messageInfo.outgoing = true;
+    showMessageText(account, chat, messageInfo, NULL, notification, extraFlags);
+}
+
+void showChatNotification(TdAccountData &account, const td::td_api::chat &chat,
+                          const char *notification, PurpleMessageFlags extraFlags)
+{
+    showChatNotification(account, chat, notification,
+                         (extraFlags & PURPLE_MESSAGE_NO_LOG) ? 0 : time(NULL), extraFlags);
+}
+
+static void showDownloadedImage(const td::td_api::chat &chat, TgMessageInfo &message,
+                                const std::string &filePath, const char *caption,
+                                TdAccountData &account)
+{
+    std::string  text;
+    std::string  notice;
+    gchar       *data   = NULL;
+    size_t       len    = 0;
+
+    if (g_file_get_contents (filePath.c_str(), &data, &len, NULL)) {
+        int id = purple_imgstore_add_with_id (data, len, NULL);
+        text = makeInlineImageText(id);
+    } else if (filePath.find('"') == std::string::npos)
+        text = "<img src=\"file://" + filePath + "\">";
+    else {
+        // Unlikely error, not worth translating
+        notice = makeNoticeWithSender(chat, message, "Cannot show photo: file path contains quotes",
+                                      account.purpleAccount);
+    }
+
+    if (caption && *caption) {
+        if (!text.empty())
+            text += "\n";
+        text += caption;
+    }
+
+    showMessageText(account, chat, message, text.empty() ? NULL : text.c_str(),
+                    notice.empty() ? NULL : notice.c_str(), PURPLE_MESSAGE_IMAGES);
+}
+
+bool isStickerAnimated(const std::string &filePath)
+{
+    return (filePath.size() >= 4) && !strcmp(filePath.c_str() + filePath.size() - 4, ".tgs");
+}
+
+bool shouldConvertAnimatedSticker(const TgMessageInfo &message, const PurpleAccount *purpleAccount)
+{
+#ifndef NoLottie
+    return !message.outgoing &&
+           purple_account_get_bool(purpleAccount, AccountOptions::AnimatedStickers,
+                                   AccountOptions::AnimatedStickersDefault);
+#else
+    return false;
+#endif
+}
+
+static void showDownloadedSticker(const td::td_api::chat &chat, TgMessageInfo &message,
+                                  const std::string &filePath,
+                                  const std::string &fileDescription,
+                                  td::td_api::object_ptr<td::td_api::file> thumbnail,
+                                  TdTransceiver &transceiver, TdAccountData &account)
+{
+    if (isStickerAnimated(filePath)) {
+        if (shouldConvertAnimatedSticker(message, account.purpleAccount)) {
+            // TRANSLATOR: In-chat status update
+            std::string notice = makeNoticeWithSender(chat, message, _("Converting sticker"),
+                                                      account.purpleAccount);
+            showMessageText(account, chat, message, NULL, notice.c_str());
+            StickerConversionThread *thread;
+            thread = new StickerConversionThread(account.purpleAccount, filePath, getId(chat),
+                                                 std::move(message));
+            thread->startThread();
+        } else if (thumbnail) {
+            // Avoid message like "Downloading sticker thumbnail...
+            // Also ignore size limits, but only determined testers and crazy people would notice.
+            if (thumbnail->local_ && thumbnail->local_->is_downloading_completed_)
+                showDownloadedSticker(chat, message, thumbnail->local_->path_,
+                                      fileDescription, nullptr, transceiver, account);
+            else
+                downloadFileInline(thumbnail->id_, getId(chat), message, fileDescription, nullptr,
+                                   transceiver, account);
+        } else {
+            showGenericFileInline(chat, message, filePath, NULL, fileDescription, account);
+        }
+    } else {
+        showWebpSticker(chat, message, filePath, fileDescription, account);
+    }
+}
+
+void showGenericFileInline(const td::td_api::chat &chat, const TgMessageInfo &message,
+                           const std::string &filePath, const char *caption,
+                           const std::string &fileDescription, TdAccountData &account)
+{
+    if (filePath.find('"') != std::string::npos) {
+        std::string notice = makeNoticeWithSender(chat, message, "Cannot show file: path contains quotes",
+                                                    account.purpleAccount);
+        showMessageText(account, chat, message, caption, notice.c_str());
+    } else {
+        std::string text = "<a href=\"file://" + filePath + "\">" + fileDescription + "</a>";
+        if (caption && *caption) {
+            text += "\n";
+            text += caption;
+        }
+        showMessageText(account, chat, message, text.c_str(), NULL);
+    }
+}
+
+void showDownloadedFileInline(ChatId chatId, TgMessageInfo &message,
+                              const std::string &filePath, const char *caption,
+                              const std::string &fileDescription,
+                              td::td_api::object_ptr<td::td_api::file> thumbnail,
+                              TdTransceiver &transceiver, TdAccountData &account)
+{
+    const td::td_api::chat *chat = account.getChat(chatId);
+    if (!chat) return;
+
+    switch (message.type) {
+    case TgMessageInfo::Type::Photo:
+        showDownloadedImage(*chat, message, filePath, caption, account);
+        break;
+    case TgMessageInfo::Type::Sticker:
+        showDownloadedSticker(*chat, message, filePath, fileDescription, std::move(thumbnail),
+                              transceiver, account);
+        break;
+    case TgMessageInfo::Type::Other:
+        showGenericFileInline(*chat, message, filePath, caption, fileDescription, account);
+        break;
+    }
+}
+
+static void showTextMessage(const td::td_api::chat &chat, const TgMessageInfo &message,
+                            const td::td_api::messageText &text, TdAccountData &account)
+{
+    if (text.text_) {
+        std::string displayText = getMessageText(*text.text_);
+        showMessageText(account, chat, message, displayText.c_str(), NULL);
+    }
+}
+
+struct InlineDownloadInfo {
+    int32_t         fileId;
+    ChatId          chatId;
+    TgMessageInfo   message;
+    std::string     fileDescription;
+    TdTransceiver  *transceiver;
+    TdAccountData  *account;
+};
+
+static void startInlineDownload(void *user_data)
+{
+    std::unique_ptr<InlineDownloadInfo> info(static_cast<InlineDownloadInfo *>(user_data));
+    downloadFileInline(info->fileId, info->chatId, info->message, info->fileDescription,
+                       nullptr, *info->transceiver, *info->account);
+}
+
+static void ignoreInlineDownload(InlineDownloadInfo *info)
+{
+    delete info;
+}
+
+static void requestInlineDownload(const char *sender, const td::td_api::file &file,
+                                  const std::string &fileDesc, const td::td_api::chat &chat,
+                                  TgMessageInfo &message, TdTransceiver &transceiver, TdAccountData &account)
+{
+    // TRANSLATOR: Download dialog, primary content, argument will be a username.
+    std::string question = formatMessage(_("Download file from {}?"),
+                                         getSenderDisplayName(chat, message, account.purpleAccount));
+    unsigned    size     = getFileSize(file);
+    // This dialog is used for files larger than the limit, so size should be non-zero
+    char *      sizeStr  = purple_str_size_to_units(size);
+    // TRANSLATOR: Download dialog, placeholder chat title, in the sentence "posted in a private chat".
+    std::string chatName = isPrivateChat(chat) ? _("a private chat") : chat.title_;
+    // TRANSLATOR: Download dialog, secondary content. Arguments will be file description (text), chat name (text), and a file size (text!)
+    std::string fileInfo = formatMessage(_("{0} posted in {1}, size: {2}"), {fileDesc,
+                                         chatName, std::string(sizeStr)});
+    g_free(sizeStr);
+
+    InlineDownloadInfo *info = new InlineDownloadInfo;
+    info->fileId = file.id_;
+    info->chatId = getId(chat);
+    info->message = std::move(message);
+    info->fileDescription = fileDesc;
+    info->transceiver = &transceiver;
+    info->account = &account;
+
+    // TRANSLATOR: Download dialog, title
+    purple_request_action(purple_account_get_connection(account.purpleAccount), _("Download"), question.c_str(),
+                          fileInfo.c_str(), 0, account.purpleAccount, NULL, NULL,
+                          // TRANSLATOR: Download dialog, alternative is "_No"
+                          info, 2, _("_Yes"), startInlineDownload,
+                          // TRANSLATOR: Download dialog, alternative is "_Yes"
+                          _("_No"), ignoreInlineDownload);
+}
+
+static void showFileInline(const td::td_api::chat &chat, IncomingMessage &fullMessage,
+                           const td::td_api::file &file, const char *caption,
+                           const std::string &fileDesc,
+                           TdTransceiver &transceiver, TdAccountData &account)
+{
+    std::string notice;
+    bool        askDownload  = false;
+    bool        autoDownload = false;
+    unsigned    fileSize     = getFileSizeKb(file);
+
+    if (caption && (*caption == '\0'))
+        caption = NULL;
+
+    if (file.local_ && file.local_->is_downloading_completed_) {
+        autoDownload = true;
+        notice.clear();
+    } else if (isSizeWithinLimit(fileSize, fullMessage.inlineFileSizeLimit)) {
+        // Sticker with a caption is not a thing but just in case it was: don't skip "Downloading..."
+        // notification for such hypothetical object because it will also include caption
+        if ( !((fullMessage.messageInfo.type == TgMessageInfo::Type::Sticker) && !caption) &&
+             !fullMessage.inlineDownloadComplete )
+        {
+            // TRANSLATOR: In-chat notification, appears after a colon (':'). Argument is a file *type*, not a filename.
+            notice = formatMessage(_("Downloading {}"), std::string(fileDesc));
+        }
+        autoDownload = true;
+    } else if (!ignoreBigDownloads(account.purpleAccount)) {
+        // TRANSLATOR: In-chat notification, appears after a colon (':'). Argument is a file *type*, not a filename.
+        notice = formatMessage(_("Requesting {} download"), std::string(fileDesc));
+        askDownload = true;
+    } else {
+        char *fileSizeStr = purple_str_size_to_units(fileSize); // File size above limit, so it's non-zero
+        // TRANSLATOR: In-chat notification, appears after a colon (':'). Arguments are a file *type*, not a filename; second argument is a file size with unit.
+        notice = formatMessage(_("Ignoring {0} download ({1})"), {std::string(fileDesc), std::string(fileSizeStr)});
+        g_free(fileSizeStr);
+    }
+
+    
+    if (!notice.empty())
+        notice = makeNoticeWithSender(chat, fullMessage.messageInfo, notice.c_str(),
+                                      account.purpleAccount);
+
+    // Notice means file isn't downloaded yet or is ignored. Either way, show caption as well.
+    if (!notice.empty())
+        showMessageText(account, chat, fullMessage.messageInfo, caption, notice.c_str());
+
+    if (autoDownload || askDownload) {
+        if (fullMessage.animatedStickerConverted) {
+            if (fullMessage.animatedStickerConvertSuccess) {
+                std::string text = makeInlineImageText(fullMessage.animatedStickerImageId);
+                showMessageText(account, chat, fullMessage.messageInfo, text.c_str(), NULL, PURPLE_MESSAGE_IMAGES);
+            }
+        } else if (file.local_ && file.local_->is_downloading_completed_)
+            showDownloadedFileInline(getId(chat), fullMessage.messageInfo, file.local_->path_,
+                                     caption, fileDesc, std::move(fullMessage.thumbnail), transceiver, account);
+        else if (autoDownload && fullMessage.inlineDownloadComplete)
+            showDownloadedFileInline(getId(chat), fullMessage.messageInfo, fullMessage.inlineDownloadedFilePath,
+                                     caption, fileDesc, std::move(fullMessage.thumbnail), transceiver, account);
+        else if (autoDownload) {
+            // When download takes too long, message will leave PendingMessageQueue and be "shown".
+            // However, nothing more should be done at that point except keep waiting for the download.
+            if (!fullMessage.inlineDownloadTimeout) {
+                purple_debug_misc(config::pluginId, "Downloading %s (file id %d)\n", fileDesc.c_str(),
+                                (int)file.id_);
+                downloadFileInline(file.id_, getId(chat), fullMessage.messageInfo, fileDesc,
+                                std::move(fullMessage.thumbnail), transceiver, account);
+            }
+        } else if (askDownload) {
+            std::string sender = getSenderDisplayName(chat, fullMessage.messageInfo,
+                                                      account.purpleAccount);
+            requestInlineDownload(sender.c_str(), file, fileDesc, chat, fullMessage.messageInfo,
+                                  transceiver, account);
+        }
+    }
+
+}
+
+static void showPhotoMessage(const td::td_api::chat &chat, IncomingMessage &fullMessage,
+                             const td::td_api::file *photoSize, const std::string &caption,
+                             TdTransceiver &transceiver, TdAccountData &account)
+{
+    const char *captionCstr = !caption.empty() ? caption.c_str() : nullptr;
+
+    if (photoSize) {
+        // TRANSLATOR: File-type, used to describe what is being downloaded, in sentences like "Downloading photo" or "Ignoring photo download".
+        showFileInline(chat, fullMessage, *photoSize, captionCstr, _("photo"),
+                       transceiver, account);
+    } else {
+        // Unlikely message not worth translating
+        std::string notice = makeNoticeWithSender(chat, fullMessage.messageInfo, "Faulty image",
+                                                  account.purpleAccount);
+        showMessageText(account, chat, fullMessage.messageInfo, captionCstr, notice.c_str());
+    }
+}
+
+static void showFileMessage(const td::td_api::chat &chat, IncomingMessage &fullMessage,
+                            const td::td_api::file* file,
+                            const std::string &caption,
+                            const std::string &fileDescription,
+                            const std::string &fileName,
+                            TdTransceiver &transceiver, TdAccountData &account)
+{
+    const char *captionStr = !caption.empty() ? caption.c_str() : NULL;
+    if (!file) {
+        // Unlikely message not worth translating
+        std::string notice = formatMessage("Faulty file: {}", fileDescription);
+        notice = makeNoticeWithSender(chat, fullMessage.messageInfo, notice.c_str(),
+                                      account.purpleAccount);
+        showMessageText(account, chat, fullMessage.messageInfo, captionStr, notice.c_str());
+    } else {
+        if ( !fullMessage.standardDownloadConfigured || !chat.type_ ||
+             ((chat.type_->get_id() != td::td_api::chatTypePrivate::ID) &&
+              (chat.type_->get_id() != td::td_api::chatTypeSecret::ID)) )
+        {
+            showFileInline(chat, fullMessage, *file, captionStr, fileDescription,
+                           transceiver, account);
+        } else
+            requestStandardDownload(getId(chat), fullMessage.messageInfo, fileName, *file,
+                                    transceiver, account);
+    }
+}
+
+static void showStickerMessage(const td::td_api::chat &chat, IncomingMessage &fullMessage,
+                               td::td_api::messageSticker &stickerContent, 
+                               TdTransceiver &transceiver, TdAccountData &account)
+{
+    if (!stickerContent.sticker_) return;
+    td::td_api::sticker &sticker = *stickerContent.sticker_;
+
+    if (sticker.sticker_)
+        // TRANSLATOR: File-type, used to describe what is being downloaded, in sentences like "Downloading photo" or "Ignoring photo download".
+        showFileInline(chat, fullMessage, *sticker.sticker_, NULL, _("sticker"),
+                       transceiver, account);
+}
+
+void showMessage(const td::td_api::chat &chat, IncomingMessage &fullMessage,
+                TdTransceiver &transceiver, TdAccountData &account)
+{
+    if (!fullMessage.message) return;
+    td::td_api::message &message = *fullMessage.message;
+
+    if (!message.content_)
+        return;
+    purple_debug_misc(config::pluginId, "Displaying message %" G_GINT64_FORMAT "\n", message.id_);
+
+    TgMessageInfo &messageInfo = fullMessage.messageInfo;
+    messageInfo.repliedMessage = std::move(fullMessage.repliedMessage);
+
+    // webOS tdlib-1.8.x: message.ttl_ -> message.self_destruct_type_ (MessageSelfDestructType)
+    if (message.self_destruct_type_) {
+        // TRANSLATOR: In-chat warning message
+        const char *text   = _("Received self-destructing message, not displayed due to lack of support");
+        std::string notice = makeNoticeWithSender(chat, messageInfo, text, account.purpleAccount);
+        showMessageText(account, chat, messageInfo, NULL, notice.c_str());
+        return;
+    }
+
+    FileInfo fileInfo;
+    getFileFromMessage(fullMessage, fileInfo);
+    if (fileInfo.secret) {
+        // TRANSLATOR: In-chat warning message
+        std::string notice = formatMessage("Ignoring secret file ({})", fileInfo.description);
+        notice = makeNoticeWithSender(chat, messageInfo, notice.c_str(), account.purpleAccount);
+        showMessageText(account, chat, messageInfo, !fileInfo.caption.empty() ? fileInfo.caption.c_str() : nullptr,
+                        notice.c_str());
+        return;
+    }
+
+    switch (message.content_->get_id()) {
+        case td::td_api::messageText::ID:
+            showTextMessage(chat, messageInfo, static_cast<const td::td_api::messageText &>(*message.content_),
+                            account);
+            break;
+        case td::td_api::messagePhoto::ID:
+            showPhotoMessage(chat, fullMessage, fileInfo.file, fileInfo.caption, transceiver, account);
+            break;
+        case td::td_api::messageDocument::ID:
+        case td::td_api::messageVideo::ID:
+        case td::td_api::messageAnimation::ID:
+        case td::td_api::messageAudio::ID:
+        case td::td_api::messageVoiceNote::ID:
+        case td::td_api::messageVideoNote::ID:
+            showFileMessage(chat, fullMessage, fileInfo.file, fileInfo.caption, fileInfo.description,
+                            fileInfo.name, transceiver, account);
+            break;
+        case td::td_api::messageSticker::ID:
+            showStickerMessage(chat, fullMessage, static_cast<td::td_api::messageSticker &>(*message.content_),
+                               transceiver, account);
+            break;
+        case td::td_api::messageChatChangeTitle::ID: {
+            const auto &titleChange = static_cast<const td::td_api::messageChatChangeTitle &>(*message.content_);
+            // TRANSLATOR: In-chat status update, arguments are chat names.
+            std::string notice = formatMessage(_("{0} changed group name to {1}"),
+                                               {getSenderDisplayName(chat, messageInfo, account.purpleAccount),
+                                                titleChange.title_});
+            showMessageText(account, chat, messageInfo, NULL, notice.c_str());
+            break;
+        }
+        case td::td_api::messageCall::ID:
+            showCallMessage(chat, messageInfo, static_cast<td::td_api::messageCall &>(*message.content_), account);
+            break;
+        case td::td_api::messageAnimatedEmoji::ID: {
+            const td::td_api::messageAnimatedEmoji &animatedEmoji =
+                static_cast<const td::td_api::messageAnimatedEmoji &>(*message.content_);
+            showMessageText(account, chat, messageInfo, animatedEmoji.emoji_.c_str(), NULL);
+			break;
+        }
+        default: {
+            // TRANSLATOR: In-chat error message, argument will be a Telegram type.
+            std::string notice = getUnsupportedMessageDescription(*message.content_);
+            notice = makeNoticeWithSender(chat, messageInfo, notice.c_str(), account.purpleAccount);
+            showMessageText(account, chat, messageInfo, NULL, notice.c_str());
+        }
+    }
+
+    // Put it back - may be needed if long download is in progress
+    fullMessage.repliedMessage = std::move(messageInfo.repliedMessage);
+}
+
+void showMessages(std::vector<IncomingMessage>& messages, TdAccountData &account)
+{
+    for (IncomingMessage &readyMessage: messages) {
+        if (!readyMessage.message) continue;
+        const td::td_api::chat *chat = account.getChat(getChatId(*readyMessage.message));
+        if (chat)
+            showMessage(*chat, readyMessage, account.transceiver, account);
+    }
+}
+
+const td::td_api::file *selectPhotoSize(PurpleAccount *account, const td::td_api::messagePhoto &photo)
+{
+    unsigned                     sizeLimit        = getAutoDownloadLimitKb(account);
+    const td::td_api::photoSize *selectedSize     = nullptr;
+    bool                         selectedFileSize = 0;
+    if (photo.photo_)
+        for (const auto &newSize: photo.photo_->sizes_)
+            if (newSize && newSize->photo_) {
+                unsigned fileSize            = getFileSizeKb(*newSize->photo_);
+                bool     isWithinLimit       = isSizeWithinLimit(fileSize, sizeLimit);
+                bool     selectedWithinLimit = isSizeWithinLimit(selectedFileSize, sizeLimit);
+                if (!selectedSize ||
+                    (!selectedWithinLimit && (isWithinLimit || (fileSize < selectedFileSize))) ||
+                    (selectedWithinLimit && isWithinLimit && (newSize->width_ > selectedSize->width_)))
+                {
+                    selectedSize = newSize.get();
+                    selectedFileSize = fileSize;
+                }
+            }
+
+    if (selectedSize)
+        purple_debug_misc(config::pluginId, "Selected size %dx%d for photo\n",
+                          (int)selectedSize->width_, (int)selectedSize->height_);
+    else
+        purple_debug_warning(config::pluginId, "No file found for a photo\n");
+
+    return selectedSize ? selectedSize->photo_.get() : nullptr;
+}
+
+void makeFullMessage(const td::td_api::chat &chat, td::td_api::object_ptr<td::td_api::message> message,
+                     IncomingMessage &fullMessage, const TdAccountData &account)
+{
+    if (!message) {
+        fullMessage.message = nullptr;
+        return;
+    }
+
+    fullMessage.repliedMessage = nullptr;
+    fullMessage.selectedPhotoSizeId = 0;
+    fullMessage.repliedMessageFetchDoneOrFailed = false;
+    fullMessage.inlineDownloadComplete = false;
+    fullMessage.inlineDownloadTimeout = false;
+    fullMessage.animatedStickerConverted = false;
+    fullMessage.animatedStickerConvertSuccess = false;
+    fullMessage.animatedStickerImageId = 0;
+
+    const char *option = purple_account_get_string(account.purpleAccount, AccountOptions::DownloadBehaviour,
+                                                   AccountOptions::DownloadBehaviourDefault());
+    fullMessage.standardDownloadConfigured = (strcmp(option, AccountOptions::DownloadBehaviourHyperlink) != 0);
+    fullMessage.inlineFileSizeLimit = getAutoDownloadLimitKb(account.purpleAccount);
+
+    TgMessageInfo &messageInfo = fullMessage.messageInfo;
+    messageInfo.id               = getId(*message);
+    messageInfo.type             = TgMessageInfo::Type::Other;
+    messageInfo.incomingGroupchatSender = getIncomingGroupchatSenderPurpleName(chat, *message, account);
+    // webOS: also record the sender's routable purple id ("id<userId>") so the transport/app can
+    // offer opening a 1:1 with them from a group message. Only for real user senders.
+    {
+        UserId gcSenderId = getSenderUserId(*message);
+        if (gcSenderId.valid())
+            messageInfo.incomingGroupchatSenderId = "id" + std::to_string(gcSenderId.value());
+    }
+    messageInfo.timestamp        = message->date_;
+    messageInfo.outgoing         = message->is_outgoing_;
+    messageInfo.sentLocally      = (message->sending_state_ != nullptr);
+    messageInfo.repliedMessageId = getReplyMessageId(*message);
+
+    if (message->forward_info_)
+        messageInfo.forwardedFrom = getForwardSource(*message->forward_info_, account);
+
+    if (message && message->content_) {
+        if (message->content_->get_id() == td::td_api::messagePhoto::ID) {
+            messageInfo.type = TgMessageInfo::Type::Photo;
+            const td::td_api::messagePhoto &photo = static_cast<const td::td_api::messagePhoto &>(*message->content_);
+            const td::td_api::file *file = selectPhotoSize(account.purpleAccount, photo);
+            if (file)
+                fullMessage.selectedPhotoSizeId = file->id_;
+        } else if (message->content_->get_id() == td::td_api::messageSticker::ID) {
+            messageInfo.type = TgMessageInfo::Type::Sticker;
+            td::td_api::messageSticker &sticker = static_cast<td::td_api::messageSticker &>(*message->content_);
+            if (sticker.sticker_ && sticker.sticker_->thumbnail_) {
+                fullMessage.thumbnail = std::move(sticker.sticker_->thumbnail_->file_);
+            }
+        }
+    }
+
+    fullMessage.message = std::move(message);
+}
+
+static const td::td_api::file *getSelectedPhotoSize(const IncomingMessage &fullMessage,
+                                                    const td::td_api::messagePhoto &photo)
+{
+    if (photo.photo_)
+        for (const auto &newSize: photo.photo_->sizes_)
+            if (newSize && newSize->photo_ && (newSize->photo_->id_ == fullMessage.selectedPhotoSizeId))
+                return newSize->photo_.get();
+
+    return nullptr;
+}
+
+static bool isInlineDownload(const IncomingMessage &fullMessage,
+                             const td::td_api::MessageContent &content,
+                             const td::td_api::chat &chat)
+{
+    return (content.get_id() == td::td_api::messagePhoto::ID) ||
+           (content.get_id() == td::td_api::messageSticker::ID) ||
+           !fullMessage.standardDownloadConfigured || !chat.type_ ||
+           ((chat.type_->get_id() != td::td_api::chatTypePrivate::ID) &&
+            (chat.type_->get_id() != td::td_api::chatTypeSecret::ID));
+}
+
+static bool inlineDownloadNeedAutoDl(const IncomingMessage &fullMessage,
+                                     const td::td_api::file &file)
+{
+    unsigned fileSize = getFileSizeKb(file);
+
+    return !((file.local_ && file.local_->is_downloading_completed_)) &&
+           isSizeWithinLimit(fileSize, fullMessage.inlineFileSizeLimit);
+}
+
+static bool isFileMessageReady(const IncomingMessage &fullMessage, ChatId chatId,
+                               const td::td_api::MessageContent &content,
+                               const td::td_api::file &file, const TdAccountData &account)
+{
+    const td::td_api::chat *chat = account.getChat(chatId);
+
+    if (chat && isInlineDownload(fullMessage, content, *chat)) {
+        // File will be shown inline
+        // Animated stickers are not ready until converted
+        if (fullMessage.inlineDownloadComplete)
+            return !((content.get_id() == td::td_api::messageSticker::ID) &&
+                     isStickerAnimated(fullMessage.inlineDownloadedFilePath) &&
+                     shouldConvertAnimatedSticker(fullMessage.messageInfo, account.purpleAccount) &&
+                     !fullMessage.animatedStickerConverted);
+        else if (file.local_ && file.local_->is_downloading_completed_)
+            return !((content.get_id() == td::td_api::messageSticker::ID) &&
+                     isStickerAnimated(file.local_->path_) &&
+                     shouldConvertAnimatedSticker(fullMessage.messageInfo, account.purpleAccount) &&
+                     !fullMessage.animatedStickerConverted);
+        else
+            // Files above limit will either be ignored (in which case, message is ready)
+            // or requested (in which case, don't try do display in order)
+            return fullMessage.inlineDownloadTimeout || !inlineDownloadNeedAutoDl(fullMessage, file);
+    } else
+        // Standard libpurple transfer will be used, nothing to postpone
+        return true;
+}
+
+void getFileFromMessage(const IncomingMessage &fullMessage, FileInfo &result)
+{
+    result.file = nullptr;
+    result.caption = "";
+    result.secret = false;
+    if (!fullMessage.message || !fullMessage.message->content_)
+        return;
+    const td::td_api::message &message = *fullMessage.message;
+
+    switch (message.content_->get_id()) {
+        case td::td_api::messagePhoto::ID: {
+            const td::td_api::messagePhoto &photo = static_cast<const td::td_api::messagePhoto &>(*message.content_);
+            result.file = getSelectedPhotoSize(fullMessage, photo);
+            result.name = ""; // will not be needed - inline download only
+            if (photo.caption_) result.caption = photo.caption_->text_;
+            // TRANSLATOR: File-type, used to describe what is being downloaded, in sentences like "Downloading photo" or "Ignoring photo download".
+            result.description = _("photo");
+            result.secret = photo.is_secret_;
+            break;
+        }
+        case td::td_api::messageDocument::ID: {
+            const td::td_api::messageDocument &document = static_cast<const td::td_api::messageDocument &>(*message.content_);
+            result.file = document.document_ ? document.document_->document_.get() : nullptr;
+            if (document.caption_) result.caption = document.caption_->text_;
+            result.name = getFileName(document.document_.get());
+            result.description = makeDocumentDescription(document.document_.get());
+            break;
+        }
+        case td::td_api::messageVideo::ID: {
+            const td::td_api::messageVideo &video = static_cast<const td::td_api::messageVideo &>(*message.content_);
+            result.file = video.video_ ? video.video_->video_.get() : nullptr;
+            if (video.caption_) result.caption = video.caption_->text_;
+            result.name = getFileName(video.video_.get());
+            result.description = makeDocumentDescription(video.video_.get());
+            result.secret = video.is_secret_;
+            break;
+        }
+        case td::td_api::messageAnimation::ID: {
+            const td::td_api::messageAnimation &animation = static_cast<const td::td_api::messageAnimation &>(*message.content_);
+            result.file = animation.animation_ ? animation.animation_->animation_.get() : nullptr;
+            if (animation.caption_) result.caption = animation.caption_->text_;
+            result.name = getFileName(animation.animation_.get());
+            result.description = makeDocumentDescription(animation.animation_.get());
+            result.secret = animation.is_secret_;
+            break;
+        }
+        case td::td_api::messageAudio::ID: {
+            const td::td_api::messageAudio &audio = static_cast<const td::td_api::messageAudio &>(*message.content_);
+            result.file = audio.audio_ ? audio.audio_->audio_.get() : nullptr;
+            if (audio.caption_) result.caption = audio.caption_->text_;
+            result.name = getFileName(audio.audio_.get());
+            result.description = makeDocumentDescription(audio.audio_.get());
+            break;
+        }
+        case td::td_api::messageVoiceNote::ID: {
+            const td::td_api::messageVoiceNote &audio = static_cast<const td::td_api::messageVoiceNote &>(*message.content_);
+            result.file = audio.voice_note_ ? audio.voice_note_->voice_.get() : nullptr;
+            if (audio.caption_) result.caption = audio.caption_->text_;
+            result.name = getFileName(audio.voice_note_.get());
+            result.description = makeDocumentDescription(audio.voice_note_.get());
+            break;
+        }
+        case td::td_api::messageVideoNote::ID: {
+            const td::td_api::messageVideoNote &video = static_cast<const td::td_api::messageVideoNote &>(*message.content_);
+            result.file = video.video_note_ ? video.video_note_->video_.get() : nullptr;
+            result.name = getFileName(video.video_note_.get());
+            result.description = makeDocumentDescription(video.video_note_.get());
+            result.secret = video.is_secret_;
+            break;
+        }
+        case td::td_api::messageSticker::ID: {
+            const td::td_api::messageSticker &sticker = static_cast<const td::td_api::messageSticker &>(*message.content_);
+            result.file = sticker.sticker_ ? sticker.sticker_->sticker_.get() : nullptr;
+            result.name = ""; // will not be needed - inline download only
+            // TRANSLATOR: File-type, used to describe what is being downloaded, in sentences like "Downloading photo" or "Ignoring photo download".
+            result.description = _("sticker");
+            break;
+        }
+    }
+}
+
+bool isMessageReady(const IncomingMessage &fullMessage, const TdAccountData &account)
+{
+    if (!fullMessage.message) return true;
+    const td::td_api::message &message = *fullMessage.message;
+    ChatId chatId = getChatId(message);
+
+    if (getReplyMessageId(message).valid() && !fullMessage.repliedMessageFetchDoneOrFailed)
+    {
+        return false;
+    }
+
+    if (message.content_)
+    {
+        FileInfo fileInfo;
+        getFileFromMessage(fullMessage, fileInfo);
+        // For stickers, will wait for sticker download to display the message, but not for
+        // animated sticker conversion
+        if (fileInfo.file && !isFileMessageReady(fullMessage, chatId, *message.content_,
+            *fileInfo.file, account))
+        {
+            return false;
+        }
+    }
+
+
+    return true;
+}
+
+void fetchExtras(IncomingMessage &fullMessage, TdTransceiver &transceiver, TdAccountData &account,
+                 TdTransceiver::ResponseCb2 onFetchReply)
+{
+    if (!fullMessage.message) return;
+    const td::td_api::message &message = *fullMessage.message;
+    MessageId messageId      = getId(message);
+    MessageId replyMessageId = getReplyMessageId(message);
+    ChatId    chatId         = getChatId(message);
+    const td::td_api::chat *chat = account.getChat(chatId);
+
+    if (replyMessageId.valid()) {
+        purple_debug_misc(config::pluginId, "Fetching message %" G_GINT64_FORMAT " which message %" G_GINT64_FORMAT " replies to\n",
+                        replyMessageId.value(), messageId.value());
+        auto getMessageReq = td::td_api::make_object<td::td_api::getMessage>();
+        getMessageReq->chat_id_    = chatId.value();
+        getMessageReq->message_id_ = replyMessageId.value();
+        transceiver.sendQueryWithTimeout(std::move(getMessageReq), onFetchReply, 1);
+    }
+
+    FileInfo fileInfo;
+    getFileFromMessage(fullMessage, fileInfo);
+    if (fileInfo.file && message.content_ && chat && isInlineDownload(fullMessage, *message.content_, *chat)) {
+        if (fileInfo.file->local_ && fileInfo.file->local_->is_downloading_completed_ &&
+            (message.content_->get_id() == td::td_api::messageSticker::ID) &&
+            isStickerAnimated(fileInfo.file->local_->path_))
+        {
+            if (shouldConvertAnimatedSticker(fullMessage.messageInfo, account.purpleAccount)) {
+                StickerConversionThread *thread;
+                thread = new StickerConversionThread(account.purpleAccount, fileInfo.file->local_->path_,
+                                                     chatId, &fullMessage.messageInfo);
+                thread->startThread();
+            }
+            // TODO: if animated stickers are disabled, fetch thumbnail instead
+        } else if (inlineDownloadNeedAutoDl(fullMessage, *fileInfo.file)) {
+            // TgMessageInfo on fullMessage has replyMessage=NULL which will be copied onto DownloadRequest.
+            // If message leaves PendingMessageQueue while download is still active, there's probably
+            // a replyMessage on IncomingMessage by then, and it needs to be moved over to DownloadRequest.
+            // Thumbnail also needs moving onto DownloadRequest.
+            downloadFileInline(fileInfo.file->id_, chatId, fullMessage.messageInfo, fileInfo.description,
+                               nullptr, transceiver, account);
+        }
+    }
+}
+
+void checkMessageReady(const IncomingMessage *message, TdTransceiver &transceiver,
+                       TdAccountData &account, std::vector<IncomingMessage> *rvReadyMessages)
+{
+    if (!message || !message->message) return;
+
+    if (isMessageReady(*message, account)) {
+        std::vector<IncomingMessage> readyMessages;
+        account.pendingMessages.setMessageReady(getChatId(*message->message), getId(*message->message),
+                                               rvReadyMessages ? *rvReadyMessages : readyMessages);
+        message = nullptr;
+        showMessages(rvReadyMessages ? *rvReadyMessages : readyMessages, account);
+    }
+}
+
+static void findMessageResponse(TdAccountData &account, ChatId chatId, MessageId pendingMessageId,
+                                td::td_api::object_ptr<td::td_api::Object> object)
+{
+    IncomingMessage *pendingMessage = account.pendingMessages.findPendingMessage(chatId, pendingMessageId);
+    if (!pendingMessage) return;
+
+    pendingMessage->repliedMessageFetchDoneOrFailed = true;
+    if (object && (object->get_id() == td::td_api::message::ID))
+        pendingMessage->repliedMessage = td::move_tl_object_as<td::td_api::message>(object);
+    else
+        purple_debug_misc(config::pluginId, "Failed to fetch reply source for message %" G_GINT64_FORMAT "\n",
+                          pendingMessageId.value());
+
+    checkMessageReady(pendingMessage, account.transceiver, account);
+}
+
+void handleIncomingMessage(TdAccountData &account, const td::td_api::chat &chat,
+    td::td_api::object_ptr<td::td_api::message> message,
+    PendingMessageQueue::MessageAction action)
+{
+    if (!message) return;
+    ChatId chatId = getId(chat);
+
+    if (isReadReceiptsEnabled(account.purpleAccount))
+        account.addPendingReadReceipt(chatId, getId(*message));
+
+    IncomingMessage fullMessage;
+    makeFullMessage(chat, std::move(message), fullMessage, account);
+
+    if (isMessageReady(fullMessage, account)) {
+        IncomingMessage readyMessage = account.pendingMessages.addReadyMessage(std::move(fullMessage), action);
+        if (readyMessage.message)
+            showMessage(chat, readyMessage, account.transceiver, account);
+    } else {
+        MessageId messageId = getId(*fullMessage.message);
+        IncomingMessage &addedMessage = account.pendingMessages.addPendingMessage(std::move(fullMessage), action);
+        fetchExtras(addedMessage, account.transceiver, account,
+            [&account, chatId, messageId](uint64_t, td::td_api::object_ptr<td::td_api::Object> object) {
+                findMessageResponse(account, chatId, messageId, std::move(object));
+            }
+        );
+    }
+}
+
+static void fetchHistoryRequest(TdAccountData &account, ChatId chatId, unsigned messagesFetched,
+                                MessageId fetchBackFrom, MessageId lastReceivedMessage);
+
+static void fetchHistoryResponse(TdAccountData &account, ChatId chatId, MessageId stopAt,
+                                 unsigned messagesFetched,
+                                 td::td_api::object_ptr<td::td_api::Object> response)
+{
+    MessageId requestMoreFrom = MessageId::invalid;
+    const td::td_api::chat *chat = account.getChat(chatId);
+
+    if (response && (response->get_id() == td::td_api::messages::ID)) {
+        td::td_api::messages &messages = static_cast<td::td_api::messages &>(*response);
+        purple_debug_misc(config::pluginId, "Fetched %zu messages for chat %" G_GINT64_FORMAT "\n",
+                          messages.messages_.size(), chatId.value());
+        auto stop = messages.messages_.begin();
+        MessageId lastMessageId = MessageId::invalid;
+        for (; stop != messages.messages_.end(); ++stop) {
+            td::td_api::object_ptr<td::td_api::message> message = std::move(*stop);
+            if (!message) {
+                purple_debug_warning(config::pluginId, "Erroneous message in history, stopping\n");
+                break;
+            }
+            if (stopAt.valid() && (getId(*message) == stopAt)) {
+                purple_debug_misc(config::pluginId, "Found message %" G_GINT64_FORMAT ", stopping\n",
+                                  stopAt.value());
+                break;
+            }
+            if ((!stopAt.valid() && (messagesFetched == 100)) ||
+                (messagesFetched == HISTORY_MESSAGES_ABSOLUTE_LIMIT))
+            {
+                purple_debug_misc(config::pluginId, "Reached history limit, stopping\n");
+                break;
+            }
+            messagesFetched++;
+            lastMessageId = getId(*message);
+            if (chat)
+                handleIncomingMessage(account, *chat, std::move(message), PendingMessageQueue::Prepend);
+        }
+
+        if (stop == messages.messages_.end())
+            requestMoreFrom = lastMessageId;
+    } else {
+        std::string message = formatMessage(_("Failed to fetch earlier messages: {}"),
+                                            getDisplayedError(response));
+        purple_debug_warning(config::pluginId, "%s\n", message.c_str());
+        if (chat)
+            showChatNotification(account, *chat, message.c_str(), PURPLE_MESSAGE_ERROR);
+    }
+
+    if (requestMoreFrom.valid())
+        fetchHistoryRequest(account, chatId, messagesFetched, requestMoreFrom, stopAt);
+    else {
+        purple_debug_misc(config::pluginId, "Done fetching history for chat %" G_GINT64_FORMAT "\n",
+                          chatId.value());
+        std::vector<IncomingMessage> readyMessages;
+        account.pendingMessages.setChatReady(chatId, readyMessages);
+        showMessages(readyMessages, account);
+    }
+}
+
+static void fetchHistoryRequest(TdAccountData &account, ChatId chatId, unsigned messagesFetched,
+                                MessageId fetchBackFrom, MessageId stopAt)
+{
+    auto request = td::td_api::make_object<td::td_api::getChatHistory>();
+    request->chat_id_ = chatId.value();
+    request->from_message_id_ = fetchBackFrom.valid() ? fetchBackFrom.value() : 0;
+    request->limit_ = 30;
+    request->offset_ = 0;
+    request->only_local_ = false;
+    purple_debug_misc(config::pluginId, "Requesting history for chat %" G_GINT64_FORMAT
+                      " starting from %" G_GINT64_FORMAT "\n", chatId.value(), fetchBackFrom.value());
+    account.transceiver.sendQuery(std::move(request),
+        [&account, chatId, messagesFetched, stopAt](uint64_t requestId, td::td_api::object_ptr<td::td_api::Object> response) {
+            fetchHistoryResponse(account, chatId, stopAt, messagesFetched, std::move(response));
+        });
+}
+
+void fetchHistory(TdAccountData &account, ChatId chatId, MessageId fetchFrom, MessageId stopAt)
+{
+    if (!account.pendingMessages.isChatReady(chatId))
+        return;
+
+    account.pendingMessages.setChatNotReady(chatId);
+    fetchHistoryRequest(account, chatId, 0, fetchFrom, stopAt);
+}

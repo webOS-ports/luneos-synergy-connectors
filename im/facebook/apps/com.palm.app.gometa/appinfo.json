@@ -1,0 +1,16 @@
+{
+    "id": "com.palm.app.gometa",
+    "version": "0.9.0",
+    "vendor": "WebOS Ports",
+    "maintainer": "Herman van Hazendonk <github.com@herrie.org>",
+    "type": "web",
+    "main": "validator.html",
+    "title": "Facebook (E2EE)",
+    "visible": false,
+    "icon": "images/header-icon.png",
+    "splashicon": "images/icon-256x256.png",
+    "noWindow": true,
+    "uiRevision": 2,
+    "keywords": ["Facebook", "Messenger", "IM", "E2EE"],
+    "requiredPermissions": ["accountsservice.management", "accountsservice.operation", "networkconnection.query"]
+}

@@ -1,0 +1,93 @@
+[{
+    "templateId": "com.palm.whatsapp",
+    "loc_name": "WhatsApp",
+    "icon": {
+        "loc_32x32": "images/whatsapp-32x32.png",
+        "loc_48x48": "images/whatsapp-48x48.png"
+    },
+    "validator": {
+        "customUI": {
+            "appId": "com.palm.app.whatsapp",
+            "name": "validator.html"
+        }
+    },
+    "loc_usernameLabel": "PHONE NUMBER",
+    "readPermissions": [
+        "com.palm.imlibpurple",
+        "com.palm.app.messaging",
+        "org.webosports.app.messaging",
+        "com.palm.app.contacts",
+        "com.palm.service.contacts",
+        "com.palm.service.contacts.linker",
+        "com.palm.app.whatsapp",
+        "com.palm.whatsapp",
+        "com.palm.app.phone"
+    ],
+    "writePermissions": [
+        "com.palm.app.contacts",
+        "com.palm.service.contacts",
+        "com.palm.service.contacts.linker",
+        "com.palm.app.messaging",
+        "org.webosports.app.messaging",
+        "com.palm.app.whatsapp",
+        "com.palm.whatsapp",
+        "com.palm.app.phone"
+    ],
+    "capabilityProviders": [
+        {
+            "capability": "MESSAGING",
+            "capabilitySubtype": "IM",
+            "id": "com.palm.whatsapp.im",
+            "alwaysOn": true,
+            "loc_shortName": "WhatsApp",
+            "icon": {
+                "loc_32x32": "images/whatsapp-32x32.png",
+                "loc_48x48": "images/whatsapp-48x48.png",
+                "splitter": "images/whatsapp-32x32.png"
+            },
+            "implementation": "palm://com.palm.imlibpurple/",
+            "onEnabled": "palm://com.palm.imlibpurple/onEnabled",
+            "onDelete": "palm://com.palm.imlibpurple/onDelete",
+            "serviceName": "type_whatsapp",
+            "dbkinds": {
+                "immessage": "com.palm.immessage.libpurple:1",
+                "imcommand": "com.palm.imcommand.libpurple:1"
+            },
+            "invites": {
+                "supportsCustomMessage": false
+            },
+            "groupChat": {
+                "supported": true,
+                "topicsSupported": true,
+                "invitesSupportMessages": false
+            },
+            "chatWithNonBuddies": true
+        },
+        {
+            "capability": "CONTACTS",
+            "id": "com.palm.whatsapp.contacts",
+            "alwaysOn": true,
+            "implementation": "palm://com.palm.imlibpurple/",
+            "sync": "palm://com.palm.imlibpurple/sync",
+            "readOnlyData": true,
+            "db_kinds": {
+                "contact": "com.palm.contact.libpurple:1"
+            }
+        },
+        {
+            "capability": "PHONE",
+            "id": "com.palm.whatsapp.call",
+            "alwaysOn": true,
+            "implementation": "palm://com.palm.whatsapp.call/",
+            "serviceName": "type_whatsapp",
+            "wanAllowed": true,
+            "wifiAllowed": true,
+            "pausePrompt": false,
+            "pauseCode": [],
+            "waitCode": [],
+            "keyHoldMappings": [],
+            "launchCode": "*#",
+            "videoFormat": "both"
+        }
+    ]
+}]

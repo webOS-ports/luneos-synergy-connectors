@@ -1,0 +1,39 @@
+{
+	"templateId": "com.palm.mega",
+	"loc_name": "MEGA",
+	"loc_usernameLabel": "EMAIL ADDRESS",
+	"icon": {
+		"loc_32x32": "images/mega-32x32.png",
+		"loc_48x48": "images/mega-48x48.png"
+	},
+
+	"__comment": "Mega has NO OAuth: sign-in is the account EMAIL + PASSWORD. The customUI app com.palm.app.mega-auth renders a two-field form and calls com.palm.service.mega/login, which runs the us0/us handshake and returns the stored session credentials. Unlike the OAuth connectors (shared com.palm.app.cloud-auth), Mega ships its own auth app. MEGA provides BOTH DOCUMENTS and PHOTO.UPLOAD (photo source + device->cloud upload).",
+	"validator": {
+		"customUI": { "appId": "com.palm.app.mega-auth", "name": "login.html" },
+		"address":  "palm://com.palm.service.mega/login"
+	},
+	"onCredentialsChanged": "palm://com.palm.service.mega/checkCredentials",
+
+	"__comment2": "com.palm.app.mega-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists (accounts/handlers/create.js -> Utils.hasPermission).",
+	"__comment3": "com.palm.service.mega is in read+writePermissions so the service can readCredentials(accountId) for file ops and writeCredentials back (accounts/handlers/credentials.js checks these lists).",
+	"readPermissions":  ["com.quickoffice.webos", "com.quickoffice.ar", "com.palm.app.mega-auth", "com.palm.app.mega-files", "com.palm.app.photos", "com.palm.service.mega", "com.palm.service.photos"],
+	"writePermissions": ["com.palm.app.mega-auth", "com.palm.app.mega-files", "com.palm.app.photos", "com.palm.service.mega", "com.palm.service.photos"],
+
+	"capabilityProviders": [
+		{
+			"capability": "DOCUMENTS",
+			"id": "com.palm.mega.documents",
+			"implementation": "palm://com.palm.service.mega/",
+			"__comment": "The file-picker app and the QuickOffice reroute consume listFolder/downloadFile/uploadFile. The reroute is account-derived (FileStore routes ANY DOCUMENTS capability implemented by a palm://com.palm.service.* URI via the generic 'modern' path, keyed on account _id), so this needs NO per-provider mxId or QuickOffice change. Locators are opaque Mega node handles; the root sentinel 'root' maps to the Cloud Drive root."
+		},
+		{
+			"capability": "PHOTO.UPLOAD",
+			"id": "com.palm.mega.photos",
+			"implementation": "palm://com.palm.service.photos",
+			"onEnabled": "palm://com.palm.service.photos/onEnabled",
+			"onDelete": "palm://com.palm.service.photos/onDelete",
+			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
+			"__comment": "Makes the MEGA account a photo source (and device->cloud upload target). The stock Photos aggregator (com.palm.service.photos) discovers PHOTO.UPLOAD accounts and - via the templateId->serviceName fall-through in its Utils.js (see ../photos-integration/) - calls com.palm.service.mega/listAlbums+listPhotos. One folder is surfaced as one album: 'Camera Uploads' under the Cloud Drive root. NOTE: Mega is end-to-end encrypted, so listPhotos DOWNLOADS+DECRYPTS each image to a local file and returns a file:// src_big (the aggregator's curl cannot decrypt Mega's ciphertext URLs)."
+		}
+	]
+}

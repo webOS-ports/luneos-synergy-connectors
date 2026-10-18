@@ -1,0 +1,37 @@
+# editor / OS cruft
+*~
+*.swp
+.DS_Store
+*.orig
+*.bak
+
+# native build output (plugin sources are vendored, objects are not)
+build/
+build-*/
+*.o
+*.a
+*.la
+*.lo
+*.so
+*.so.*
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+# Rust (purple-presage) and Go caches
+target/
+# libtgvoip in-tree autotools output (config.h only at its top level:
+# webrtc_dsp/**/config.h are real sources)
+/im/telegram/plugin/libtgvoip/Makefile
+/im/telegram/plugin/libtgvoip/config.h
+/im/telegram/plugin/libtgvoip/config.log
+/im/telegram/plugin/libtgvoip/config.status
+/im/telegram/plugin/libtgvoip/stamp-h1
+/im/telegram/plugin/libtgvoip/libtool
+/im/telegram/plugin/libtgvoip/**/.deps/
+/im/telegram/plugin/libtgvoip/**/.libs/
+/im/telegram/plugin/libtgvoip/**/.dirstamp
+
+# test harness: real credentials and run output
+tests/creds.local.json
+/build-output/
+__pycache__/

@@ -1,0 +1,41 @@
+[
+    {
+        "templateId": "org.webosports.app.music.tidal",
+        "loc_name": "Tidal",
+        "icon": {
+            "loc_32x32": "images/tidal-32x32.png",
+            "loc_48x48": "images/tidal-48x48.png"
+        },
+        "validator": {
+            "customUI": {
+                "appId": "org.webosports.app.musicauth",
+                "name": "validator.html"
+            }
+        },
+        "loc_usernameLabel": "TIDAL ACCOUNT",
+        "readPermissions": [
+            "org.webosports.app.music.service",
+            "org.webosports.app.music",
+            "org.webosports.app.musicauth"
+        ],
+        "writePermissions": [
+            "org.webosports.app.music.service",
+            "org.webosports.app.music",
+            "org.webosports.app.musicauth"
+        ],
+        "capabilityProviders": [
+            {
+                "capability": "Music",
+                "capabilitySubtype": "STREAMING",
+                "id": "org.webosports.app.music.tidal.streaming",
+                "alwaysOn": true,
+                "loc_shortName": "Tidal",
+                "icon": {
+                    "loc_32x32": "images/tidal-32x32.png",
+                    "loc_48x48": "images/tidal-48x48.png",
+                    "splitter": "images/tidal-32x32.png"
+                }
+            }
+        ]
+    }
+]

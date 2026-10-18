@@ -1,0 +1,10 @@
+/* Minimal styling for the Flickr auth validator. The WebView fills the space
+   between the header and the Cancel toolbar; header/toolbar reuse the shared
+   accounts-* classes from $enyo-lib/accounts. */
+.accounts-header {
+	height: 48px;
+}
+.enyo-webview,
+.webView {
+	background-color: #ffffff;
+}

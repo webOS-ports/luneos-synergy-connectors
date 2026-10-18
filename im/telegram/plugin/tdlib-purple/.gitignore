@@ -1,0 +1,5 @@
+build/
+/.ga_cache/
+/td_repo/
+/td_destdir/
+*.kdev4

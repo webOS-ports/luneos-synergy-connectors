@@ -1,0 +1,39 @@
+{
+	"templateId": "com.palm.s3",
+	"loc_name": "S3 Storage",
+	"loc_usernameLabel": "BUCKET",
+	"icon": {
+		"loc_32x32": "images/s3-32x32.png",
+		"loc_48x48": "images/s3-48x48.png"
+	},
+
+	"__comment": "Generic S3-compatible storage (AWS S3, IDrive e2, Backblaze B2, Wasabi, MinIO, ...). No OAuth: the customUI app com.palm.app.s3-auth collects endpoint/region/bucket/access-key/secret and calls com.palm.service.s3/login, which validates them (SigV4-signed ListObjectsV2) and returns the stored credentials. Provides BOTH DOCUMENTS and PHOTO.UPLOAD.",
+	"validator": {
+		"customUI": { "appId": "com.palm.app.s3-auth", "name": "login.html" },
+		"address":  "palm://com.palm.service.s3/login"
+	},
+	"onCredentialsChanged": "palm://com.palm.service.s3/checkCredentials",
+
+	"__comment2": "com.palm.app.s3-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists.",
+	"__comment3": "com.palm.service.s3 is in read+writePermissions so the service can readCredentials(accountId) for file ops. S3 keys are static (no refresh), so the service does not normally write back, but the permission is kept for symmetry.",
+	"readPermissions":  ["com.quickoffice.webos", "com.quickoffice.ar", "com.palm.app.s3-auth", "com.palm.app.s3-files", "com.palm.app.photos", "com.palm.service.s3", "com.palm.service.photos"],
+	"writePermissions": ["com.palm.app.s3-auth", "com.palm.app.s3-files", "com.palm.app.photos", "com.palm.service.s3", "com.palm.service.photos"],
+
+	"capabilityProviders": [
+		{
+			"capability": "DOCUMENTS",
+			"id": "com.palm.s3.documents",
+			"implementation": "palm://com.palm.service.s3/",
+			"__comment": "The file-picker app and the account-derived QuickOffice reroute consume listFolder/downloadFile/uploadFile. Locators are S3 keys/prefixes; the root sentinel maps to the empty prefix (bucket root)."
+		},
+		{
+			"capability": "PHOTO.UPLOAD",
+			"id": "com.palm.s3.photos",
+			"implementation": "palm://com.palm.service.photos",
+			"onEnabled": "palm://com.palm.service.photos/onEnabled",
+			"onDelete": "palm://com.palm.service.photos/onDelete",
+			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
+			"__comment": "Makes the S3 bucket a photo source. The Photos aggregator calls com.palm.service.s3/listAlbums+listPhotos; one prefix ('Camera Uploads/') is surfaced as one album. src_big is a short-lived PRESIGNED GET URL (SigV4 query signature), which the aggregator's curl fetches with no auth header."
+		}
+	]
+}

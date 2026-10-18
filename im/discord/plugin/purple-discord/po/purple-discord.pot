@@ -1,0 +1,615 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) YEAR THE PACKAGE'S COPYRIGHT HOLDER
+# This file is distributed under the same license as the PACKAGE package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: PACKAGE VERSION\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-03-11 10:36+0100\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=CHARSET\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "Unknown user"
+msgstr ""
+
+#, c-format
+msgid "&lt;message at %s&gt;"
+msgstr ""
+
+#, c-format
+msgid "Connection error: %s."
+msgstr ""
+
+#, c-format
+msgid "%d second%s ago"
+msgstr ""
+
+#, c-format
+msgid "%d minute%s ago"
+msgstr ""
+
+#, c-format
+msgid "%d hour%s ago"
+msgstr ""
+
+#, c-format
+msgid "%d day%s ago"
+msgstr ""
+
+#, c-format
+msgid "%d year%s ago"
+msgstr ""
+
+#, c-format
+msgid "in %d second%s"
+msgstr ""
+
+#, c-format
+msgid "in %d minute%s"
+msgstr ""
+
+#, c-format
+msgid "in %d hour%s"
+msgstr ""
+
+#, c-format
+msgid "in %d day%s"
+msgstr ""
+
+#, c-format
+msgid "in %d year%s"
+msgstr ""
+
+msgid "your"
+msgstr ""
+
+#, c-format
+msgid "%s's"
+msgstr ""
+
+#, c-format
+msgid "%s removed the reaction \"%s\"%s"
+msgstr ""
+
+#, c-format
+msgid "%s reacted with \"%s\"%s"
+msgstr ""
+
+msgid "You"
+msgstr ""
+
+msgid "person"
+msgstr ""
+
+msgid "people"
+msgstr ""
+
+#, c-format
+msgid "%d %s%s"
+msgstr ""
+
+msgid "other "
+msgstr ""
+
+#, c-format
+msgid "and %s"
+msgstr ""
+
+msgid ", "
+msgstr ""
+
+msgid " "
+msgstr ""
+
+#, c-format
+msgid "EDIT: %s"
+msgstr ""
+
+#, c-format
+msgid "%s started a call"
+msgstr ""
+
+#, c-format
+msgid "%s joined the guild!"
+msgstr ""
+
+#, c-format
+msgid "%s started thread \"%s\" from message at %s"
+msgstr ""
+
+#, c-format
+msgid "%s started thread \"%s\""
+msgstr ""
+
+#, c-format
+msgid "%d %s"
+msgstr ""
+
+#, c-format
+msgid "%u messages between "
+msgstr ""
+
+#, c-format
+msgid "%u messages at "
+msgstr ""
+
+#, c-format
+msgid "%sand %s were deleted"
+msgstr ""
+
+#, c-format
+msgid "Message at %s was deleted"
+msgstr ""
+
+#, c-format
+msgid "Your request to join the server %s has been approved!"
+msgstr ""
+
+#, c-format
+msgid ""
+"Your request to join the server %s is currently pending. You will be "
+"notified of any updates regarding your request."
+msgstr ""
+
+#, c-format
+msgid ""
+"Your request to join the server %s was rejected. The reason given was:\n"
+"\n"
+"%s"
+msgstr ""
+
+msgid "Server Join Request Update"
+msgstr ""
+
+msgid "Group DMs"
+msgstr ""
+
+msgid "ID"
+msgstr ""
+
+msgid "Topic"
+msgstr ""
+
+msgid "Cancelled 2FA auth"
+msgstr ""
+
+msgid "Two-factor authentication"
+msgstr ""
+
+msgid "Enter Discord auth code"
+msgstr ""
+
+msgid "You can get this token from your two-factor authentication mobile app."
+msgstr ""
+
+msgid "_Login"
+msgstr ""
+
+msgid "_Cancel"
+msgstr ""
+
+msgid "Need CAPTCHA to login. Consider using Harmony first, then retry."
+msgstr ""
+
+msgid "Bad username/password"
+msgstr ""
+
+msgid "Username needs to be an email address"
+msgstr ""
+
+msgid "Cancelled QR Code auth"
+msgstr ""
+
+msgid "Websocket failed to send"
+msgstr ""
+
+msgid "Reauthentication required"
+msgstr ""
+
+msgid "Websocket protocol error"
+msgstr ""
+
+msgid "Websocket protocol error: unreasonable frame length"
+msgstr ""
+
+msgid "Lost connection to server"
+msgstr ""
+
+msgid "Couldn't connect to gateway"
+msgstr ""
+
+msgid "No pinned messages"
+msgstr ""
+
+msgid ""
+"Active Threads:\n"
+"<pre>Creation Time       | Last Message Time   | Name"
+msgstr ""
+
+msgid "Server Roles:"
+msgstr ""
+
+msgid "No server roles"
+msgstr ""
+
+msgid "Name"
+msgstr ""
+
+msgid "Bad channel type"
+msgstr ""
+
+msgid "Cannot join a voice channel as text"
+msgstr ""
+
+msgid "Could not create conversation"
+msgstr ""
+
+msgid "Could not send message to this user"
+msgstr ""
+
+msgid "Invalid channel for this user"
+msgstr ""
+
+msgid "Cannot send a message to someone who is not on your friend list."
+msgstr ""
+
+#, c-format
+msgid "No users with tag %s exist"
+msgstr ""
+
+msgid "Username"
+msgstr ""
+
+msgid "Display Name"
+msgstr ""
+
+msgid "Online"
+msgstr ""
+
+msgid "Idle"
+msgstr ""
+
+msgid "Offline"
+msgstr ""
+
+msgid "Do Not Disturb"
+msgstr ""
+
+msgid "Mobile - Online"
+msgstr ""
+
+msgid "Mobile - Idle"
+msgstr ""
+
+msgid "Mobile - Offline"
+msgstr ""
+
+msgid "Mobile - Do Not Disturb"
+msgstr ""
+
+msgid "Status"
+msgstr ""
+
+msgid "Playing"
+msgstr ""
+
+msgid "Custom Status"
+msgstr ""
+
+msgid "Bio"
+msgstr ""
+
+msgid "Pronouns"
+msgstr ""
+
+msgid "Connected Accounts"
+msgstr ""
+
+msgid "Mutual Servers"
+msgstr ""
+
+msgid "Badges"
+msgstr ""
+
+msgid "Invisible"
+msgstr ""
+
+msgid "Mobile"
+msgstr ""
+
+msgid "Unmute"
+msgstr ""
+
+msgid "Mute"
+msgstr ""
+
+msgid "Grab Full History"
+msgstr ""
+
+msgid "Limit Grabbed History"
+msgstr ""
+
+msgid "Default"
+msgstr ""
+
+msgid "Large Channel"
+msgstr ""
+
+msgid "Small Channel"
+msgstr ""
+
+msgid "Force Treat as..."
+msgstr ""
+
+#, c-format
+msgid "Playing %s"
+msgstr ""
+
+#, c-format
+msgid "%s"
+msgstr ""
+
+msgid "Email address..."
+msgstr ""
+
+msgid "Show reaction emojis"
+msgstr ""
+
+msgid "Use status message as in-game info"
+msgstr ""
+
+msgid "Override global custom status message"
+msgstr ""
+
+msgid "Auto-create rooms on buddy list"
+msgstr ""
+
+msgid "Number of users in a large channel"
+msgstr ""
+
+msgid "Display images in conversations"
+msgstr ""
+
+msgid "Display images in large servers"
+msgstr ""
+
+msgid "Max displayed image width (0 disables)"
+msgstr ""
+
+msgid "Display custom emoji as inline images"
+msgstr ""
+
+msgid ""
+"Approximate max number of users to keep track of, per server (0 disables)"
+msgstr ""
+
+msgid "Fetch names for reactors to backlogged messages (can be spammy)"
+msgstr ""
+
+msgid "Fetch unread chat messages when account connects"
+msgstr ""
+
+msgid "Open chat when you are @mention'd"
+msgstr ""
+
+msgid "Indicate thread replies with this prefix: "
+msgstr ""
+
+msgid "Indicate thread parent messages with this prefix: "
+msgstr ""
+
+msgid "Auth token"
+msgstr ""
+
+msgid "Server Rules"
+msgstr ""
+
+#, c-format
+msgid "%s Member Screening"
+msgstr ""
+
+msgid "_OK"
+msgstr ""
+
+#, c-format
+msgid "Error with invite code %s"
+msgstr ""
+
+msgid "Join a server"
+msgstr ""
+
+msgid "Enter the join URL here"
+msgstr ""
+
+msgid "_Join"
+msgstr ""
+
+#, c-format
+msgid "Are you sure you want to leave the server %s?"
+msgstr ""
+
+msgid "Leaving Server!"
+msgstr ""
+
+msgid "Buddy List Abbreviation"
+msgstr ""
+
+msgid "Effective Guild Size"
+msgstr ""
+
+msgid "Large"
+msgstr ""
+
+msgid "Small"
+msgstr ""
+
+msgid "Leave this server"
+msgstr ""
+
+msgid "Manage discord servers"
+msgstr ""
+
+msgid "Edit per-server settings"
+msgstr ""
+
+msgid "Join a server..."
+msgstr ""
+
+msgid "Manage servers..."
+msgstr ""
+
+msgid "Warning"
+msgstr ""
+
+msgid ""
+"Fetching a channel's entire history can take a lot of memory and time to "
+"complete. Are you sure you want to continue?"
+msgstr ""
+
+#, c-format
+msgid "Server Name: %s"
+msgstr ""
+
+msgid "Can't Cancel Upload"
+msgstr ""
+
+msgid "Cannot Cancel Discord Upload After Start"
+msgstr ""
+
+msgid "Connection Error"
+msgstr ""
+
+msgid "Malformed Response"
+msgstr ""
+
+msgid "Check Debug Logs For More Info"
+msgstr ""
+
+msgid "Couldn't load file"
+msgstr ""
+
+msgid "Maximum file size is 10MB"
+msgstr ""
+
+msgid "Guessing file type is:"
+msgstr ""
+
+msgid "DM Does Not Exist"
+msgstr ""
+
+msgid "DM does not exist"
+msgstr ""
+
+msgid "Try Sending A Regular Message First"
+msgstr ""
+
+msgid "Couldn't find room id"
+msgstr ""
+
+msgid "Check debug messages for more info"
+msgstr ""
+
+msgid ""
+"reply &lt;timestamp&gt; &lt;message&gt;:  Replies to the message at &lt;"
+"timestamp&gt; with &lt;message&gt;<br />Accepted timestamp formats: YYYY-MM-"
+"DDthh:mm:ss, YYYY-MM-DDThh:mm:ss, hh:mm:ss"
+msgstr ""
+
+msgid ""
+"react &lt;timestamp&gt; &lt;emoji&gt;:  Reacts to the message at &lt;"
+"timestamp&gt; with &lt;emoji&gt;<br />Accepted timestamp formats: YYYY-MM-"
+"DDthh:mm:ss, YYYY-MM-DDThh:mm:ss, hh:mm:ss"
+msgstr ""
+
+msgid ""
+"unreact &lt;timestamp&gt; &lt;emoji&gt;:  Removes the reaction &lt;emoji&gt; "
+"from the message at &lt;timestamp&gt;<br />Accepted timestamp formats: YYYY-"
+"MM-DDthh:mm:ss, YYYY-MM-DDThh:mm:ss, hh:mm:ss"
+msgstr ""
+
+msgid "nick &lt;new nickname&gt;:  Changes nickname on a server"
+msgstr ""
+
+msgid "kick &lt;username&gt;:  Remove someone from a server"
+msgstr ""
+
+msgid ""
+"ban &lt;username&gt;:  Remove someone from a server and prevent them "
+"rejoining"
+msgstr ""
+
+msgid "leave:  Leave the channel"
+msgstr ""
+
+msgid "part:  Leave the channel"
+msgstr ""
+
+msgid "pinned:  Display pinned messages"
+msgstr ""
+
+msgid "roles:  Display server roles"
+msgstr ""
+
+msgid ""
+"thread &lt;timestamp&gt; &lt;message&gt;:  Sends message to thread<br /"
+">Accepted timestamp formats: YYYY-MM-DDthh:mm:ss, YYYY-MM-DDThh:mm:ss, hh:mm:"
+"ss"
+msgstr ""
+
+msgid "threads:  Display active channel threads"
+msgstr ""
+
+msgid "threadhistory &lt;timestamp&gt;:  Retrieves full history of thread"
+msgstr ""
+
+msgid ""
+"thist &lt;timestamp&gt;:  Retrieves full history of thread.<br />Alias of "
+"threadhistory"
+msgstr ""
+
+msgid ""
+"grabhistory:  Retrieves full history of channel. Intended for rules channels "
+"and the like. Using this on old, highly active channels is not recommended"
+msgstr ""
+
+msgid ""
+"hist:  Retrieves full history of channel. Intended for rules channels and "
+"the like. Using this on old, highly active channels is not recommended.<br /"
+">Alias of grabhistory"
+msgstr ""
+
+msgid "servername:  Displays the name of the server for the current channel."
+msgstr ""
+
+msgid "server:  Displays the name of the server for the current channel."
+msgstr ""
+
+msgid ""
+"joinserver &lt;invite code/URL&gt;:   Joins a new server using the invite "
+"code or URL."
+msgstr ""
+
+msgid "mute <username>:  Mute someone in channel"
+msgstr ""
+
+msgid "unmute <username>:  Un-mute someone in channel"
+msgstr ""
+
+msgid "topic <description>:  Set the channel topic description"
+msgstr ""
+
+msgid "Protocol"
+msgstr ""
+
+msgid "Discord Protocol Plugins."
+msgstr ""
+
+msgid "Adds Discord protocol support to libpurple."
+msgstr ""

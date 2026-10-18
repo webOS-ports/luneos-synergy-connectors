@@ -1,0 +1,74 @@
+[{
+    "templateId": "com.palm.googlechat",
+    "loc_name": "Google Chat",
+    "icon": {
+        "loc_32x32": "images/googlechat-32x32.png",
+        "loc_48x48": "images/googlechat-48x48.png"
+    },
+    "validator": {
+        "customUI": {
+            "appId": "com.palm.app.googlechat",
+            "name": "validator.html"
+        }
+    },
+    "loc_usernameLabel": "EMAIL ADDRESS",
+    "readPermissions": [
+        "com.palm.imlibpurple",
+        "com.palm.app.messaging",
+        "org.webosports.app.messaging",
+        "com.palm.app.contacts",
+        "com.palm.service.contacts",
+        "com.palm.service.contacts.linker",
+        "com.palm.app.googlechat"
+    ],
+    "writePermissions": [
+        "com.palm.app.contacts",
+        "com.palm.service.contacts",
+        "com.palm.service.contacts.linker",
+        "com.palm.app.messaging",
+        "org.webosports.app.messaging",
+        "com.palm.app.googlechat"
+    ],
+    "capabilityProviders": [
+        {
+            "capability": "MESSAGING",
+            "capabilitySubtype": "IM",
+            "id": "com.palm.googlechat.im",
+            "alwaysOn": true,
+            "loc_shortName": "Google Chat",
+            "icon": {
+                "loc_32x32": "images/googlechat-32x32.png",
+                "loc_48x48": "images/googlechat-48x48.png",
+                "splitter": "images/googlechat-32x32.png"
+            },
+            "implementation": "palm://com.palm.imlibpurple/",
+            "onEnabled": "palm://com.palm.imlibpurple/onEnabled",
+            "onDelete": "palm://com.palm.imlibpurple/onDelete",
+            "serviceName": "type_googlechat",
+            "dbkinds": {
+                "immessage": "com.palm.immessage.libpurple:1",
+                "imcommand": "com.palm.imcommand.libpurple:1"
+            },
+            "invites": {
+                "supportsCustomMessage": false
+            },
+            "groupChat": {
+                "supported": true,
+                "topicsSupported": true,
+                "invitesSupportMessages": false
+            },
+            "chatWithNonBuddies": true
+        },
+        {
+            "capability": "CONTACTS",
+            "id": "com.palm.googlechat.contacts",
+            "alwaysOn": true,
+            "implementation": "palm://com.palm.imlibpurple/",
+            "sync": "palm://com.palm.imlibpurple/sync",
+            "readOnlyData": true,
+            "db_kinds": {
+                "contact": "com.palm.contact.libpurple:1"
+            }
+        }
+    ]
+}]

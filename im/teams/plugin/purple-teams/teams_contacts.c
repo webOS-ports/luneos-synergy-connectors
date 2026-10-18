@@ -1,0 +1,3424 @@
+/*
+ * Teams Plugin for libpurple/Pidgin
+ * Copyright (c) 2014-2020 Eion Robb
+ * 
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+ 
+
+#include "teams_contacts.h"
+#include "connection.h"
+#include "glib.h"
+#include "glibcompat.h"
+#include "libteams.h"
+#include "purplecompat.h"
+#include "teams_connection.h"
+#include "teams_messages.h"
+#include "teams_util.h"
+
+#include "http.h"
+
+#include <stdio.h> // webOS: fopen/fwrite to persist received media to a WebKit-readable file
+#include <glib/gstdio.h> // webOS: g_spawn/g_unlink/g_stat for the voice-note WAV->M4A transcode
+#include "util.h"
+#include "xfer.h"
+#include "image-store.h"
+
+static void purple_conversation_write_system_message_ts(
+		PurpleConversation *conv, const gchar *msg, PurpleMessageFlags flags,
+		time_t ts) {
+	PurpleMessage *pmsg = purple_message_new_system(msg, flags);
+	purple_message_set_time(pmsg, ts);
+	purple_conversation_write_message(conv, pmsg);
+	purple_message_destroy(pmsg);
+}
+static void purple_conversation_write_img_message(
+		PurpleConversation *conv, const char* who, const gchar *msg,
+		PurpleMessageFlags flags, time_t ts) {
+	PurpleMessage *pmsg;
+
+	// A NULL conv reaches purple_conversation_write_message -> purple_conversation_get_im_data
+	// which asserts conv != NULL and then derefs it -> SIGSEGV that takes the whole transport down
+	// (seen on Teams image send/receive when no PurpleConversation exists yet for `who`). Guard it.
+	if (conv == NULL) {
+		purple_debug_warning("teams", "write_img_message: no conversation for %s, dropping inline image\n", who ? who : "(null)");
+		return;
+	}
+
+	if (flags & PURPLE_MESSAGE_SEND) {
+		pmsg = purple_message_new_outgoing(who, msg, flags);
+		purple_message_set_time(pmsg, ts);
+	} else {
+		pmsg = purple_message_new_incoming(who, msg, flags, ts);
+	}
+		
+	purple_conversation_write_message(conv, pmsg);
+	purple_message_destroy(pmsg);
+}
+
+// Check that the conversation hasn't been closed
+static gboolean
+purple_conversation_is_valid(PurpleConversation *conv)
+{
+	GList *convs = purple_conversations_get_all();
+	
+	return (g_list_find(convs, conv) != NULL);
+}
+
+
+typedef struct {
+	PurpleXfer *xfer;
+	JsonObject *info;
+	gchar *from;
+	gchar *url;
+	gchar *id;
+	TeamsAccount *sa;
+	gboolean is_image; // webOS: send as an inline AMSImage picture, not a File.1 attachment
+	gboolean is_audio; // webOS: send as a Teams voice note (audio card), not a File.1 attachment
+	gboolean is_video; // webOS: send as a Teams video clip (inline AMSVideo), not a File.1 attachment
+	guint duration_secs; // webOS: voice-note / video length in seconds (captured before upload)
+	guint width, height; // webOS: video display dimensions (parsed from the mp4 tkhd) for the AMSVideo markup
+} TeamsFileTransfer;
+
+static guint active_icon_downloads = 0;
+
+static void teams_get_icon_now(PurpleBuddy *buddy);
+
+static GHashTable *icon_queue_set = NULL;
+static GQueue *icon_download_queue = NULL;
+static guint   icon_queue_timer_id = 0;
+
+static gboolean
+teams_process_icon_queue(gpointer data)
+{
+	if (icon_download_queue == NULL || g_queue_is_empty(icon_download_queue)) {
+		icon_queue_timer_id = 0;
+		return G_SOURCE_REMOVE;
+	}
+
+	// Respect the concurrent download cap and try again next tick.
+	if (active_icon_downloads > 4) {
+		return G_SOURCE_CONTINUE;
+	}
+
+	PurpleBuddy *buddy = g_queue_pop_head(icon_download_queue);
+	if (buddy) {
+		// Remove from the deduplication set now that it is being processed.
+		if (icon_queue_set != NULL) {
+			g_hash_table_remove(icon_queue_set, buddy);
+		}
+		teams_get_icon_now(buddy);
+	}
+
+	if (g_queue_is_empty(icon_download_queue)) {
+		icon_queue_timer_id = 0;
+		return G_SOURCE_REMOVE;
+	}
+	return G_SOURCE_CONTINUE;
+}
+
+static void
+teams_get_icon_cb(PurpleHttpConnection *http_conn, PurpleHttpResponse *response, gpointer user_data)
+{
+	PurpleHttpRequest *request = purple_http_conn_get_request(http_conn);
+	PurpleBuddy *buddy = user_data;
+	const gchar *url = purple_http_request_get_url(request);
+	const gchar *data;
+	gsize len;
+	
+	active_icon_downloads--;
+
+	if (!buddy || !purple_http_response_is_successful(response)) {
+		return;
+	}
+	
+	data = purple_http_response_get_data(response, &len);
+	
+	if (!len || !*data) {
+		return;
+	}
+
+	// Reject responses that are too small to contain a valid image header,
+	// or that don't begin with a recognised image magic sequence.
+	// The Teams API returns short JSON bodies (e.g. "{}") for users with no
+	// avatar. Storing these 2-byte blobs via purple_buddy_icons_set_for_user()
+	// corrupts the icon store and ultimately the heap.
+	if (len < 8 ||
+	    (memcmp(data, "\x89PNG",     4) != 0 &&   /* PNG  */
+	     memcmp(data, "\xff\xd8\xff", 3) != 0 &&   /* JPEG */
+	     memcmp(data, "GIF8",        4) != 0 &&   /* GIF  */
+	     memcmp(data, "BM",          2) != 0 &&   /* BMP  */
+	     memcmp(data, "RIFF",        4) != 0)) {  /* WebP */
+		purple_debug_warning("teams", "Ignoring non-image response (%" G_GSIZE_FORMAT " bytes) for %s\n",
+		                     len, purple_buddy_get_name(buddy));
+		return;
+	}
+
+	// A buddy icon should never be larger than 10 MB. A garbage size probably
+	// indicates heap corruption. It is better to skip the icon since that will
+	// prevent propagation of a potentially corrupt icon into the icon store.
+	if (len > 10 * 1024 * 1024) {
+		purple_debug_warning("teams", "Ignoring suspiciously large icon response (%" G_GSIZE_FORMAT " bytes) for %s\n",
+		                     len, purple_buddy_get_name(buddy));
+		return;
+	}
+	
+	purple_buddy_icons_set_for_user(purple_buddy_get_account(buddy), purple_buddy_get_name(buddy), g_memdup2(data, len), len, url);
+	
+}
+
+static void
+teams_get_icon_now(PurpleBuddy *buddy)
+{
+	TeamsBuddy *sbuddy;
+	TeamsAccount *sa;
+	gchar *url;
+	PurpleHttpRequest *request;
+	
+	purple_debug_info("teams", "getting new buddy icon for %s\n", purple_buddy_get_name(buddy));
+	
+	sbuddy = purple_buddy_get_protocol_data(buddy);
+	
+	if (!sbuddy || !sbuddy->sa || !sbuddy->sa->pc)
+		return;
+
+	sa = sbuddy->sa;
+
+	const gchar *buddy_name = purple_buddy_get_name(buddy);
+	if (!buddy_name || !*buddy_name)
+		return;
+
+	if (sbuddy->avatar_url && sbuddy->avatar_url[0]) {
+		url = g_strdup(sbuddy->avatar_url);
+	} else {
+		const gchar *self = teams_strip_user_prefix(sa->username);
+		const gchar *self_guid = g_str_has_prefix(self, "orgid:") ? self + 6 : self;
+
+		gchar *self_guid_escaped = g_strdup(purple_url_encode(self_guid));
+		//https://teams.microsoft.com/api/mt/apac/beta/users/.../profilepicturev2?displayname=Eion%20Robb&size=HR96x96
+		//https://teams.microsoft.com/api/mt/part/au-01/beta/users/...myid.../profilepicturev2/8:orgid:userid?displayname=Eion%20Robb&size=HR196x196&ETag=1704940983743
+		url = g_strdup_printf("https://" TEAMS_BASE_ORIGIN_HOST TEAMS_PROFILES_PREFIX "users/%s/profilepicturev2/%s%s?size=HR128x128", self_guid_escaped, teams_user_url_prefix(buddy_name), purple_url_encode(buddy_name));
+
+		g_free(self_guid_escaped);
+
+		// alternative
+		//https://aus.loki.delve.office.com/api/v2/personaphoto?AadObjectId=12345678-abcd-4321-1234-123456789abc&AuthToken=eyJ...&ClientType=MicrosoftStream
+	}
+
+	if (purple_strequal(url, purple_buddy_icons_get_checksum_for_user(buddy))) {
+		g_free(url);
+		return;
+	}
+	
+	request = purple_http_request_new(url);
+	purple_http_request_set_keepalive_pool(request, sa->keepalive_pool);
+	purple_http_request_set_max_redirects(request, 0);
+	purple_http_request_set_timeout(request, 30);
+	
+	// Uses a cookie instead of the Authorization header cos a browser wouldn't request an image with an auth header
+	if (g_str_has_prefix(url, "https://" TEAMS_BASE_ORIGIN_HOST "/api/mt/") && strstr(url, "/profilepicturev2")) {
+		purple_http_request_header_set(request, "Referer", "https://" TEAMS_BASE_ORIGIN_HOST "/");
+		purple_http_request_header_set_printf(request, "Cookie", "authtoken=Bearer%%3D%s%%26Origin%%3Dhttps%%3A%%2F%%2F" TEAMS_BASE_ORIGIN_HOST, sa->id_token);
+	}
+	
+	purple_http_request(sa->pc, request, teams_get_icon_cb, buddy);
+	
+	purple_http_request_unref(request);
+	g_free(url);
+
+	active_icon_downloads++;
+}
+
+void
+teams_get_icon(PurpleBuddy *buddy)
+{
+	if (!buddy) return;
+	if (purple_strequal(purple_core_get_ui(), "BitlBee"))
+		return;
+
+	if (icon_download_queue == NULL) {
+		icon_download_queue = g_queue_new();
+	}
+	if (icon_queue_set == NULL) {
+		icon_queue_set = g_hash_table_new(g_direct_hash, g_direct_equal);
+	}
+
+	// Don't queue the same buddy more than once. Many API callbacks (searchV2,
+	// fetchShortProfile, fetchFederated, fetchTflConsumers, contactsv3, ...)
+	// call teams_get_icon() for the same buddy. This can produce several
+	// concurrent HTTP downloads that race to overwrite the same PurpleBuddyIcon
+	// slot, which corrupts the icon-store metadata.
+	if (g_hash_table_lookup(icon_queue_set, buddy)) {
+		return;
+	}
+
+	g_queue_push_tail(icon_download_queue, buddy);
+	g_hash_table_insert(icon_queue_set, buddy, GUINT_TO_POINTER(TRUE));
+
+	// Start the single queue-processing timer if it isn't already running.
+	if (icon_queue_timer_id == 0) {
+		icon_queue_timer_id = g_timeout_add(100, teams_process_icon_queue, NULL);
+	}
+}
+
+void
+teams_flush_icon_queue_for_account(PurpleAccount *account)
+{
+	if (icon_download_queue == NULL) {
+		return;
+	}
+
+	// Walk the queue and remove every entry that belongs to this account
+	GList *entry = icon_download_queue->head;
+	while (entry != NULL) {
+		GList *next = entry->next;
+		PurpleBuddy *b = entry->data;
+		if (b && purple_buddy_get_account(b) == account) {
+			if (icon_queue_set != NULL) {
+				g_hash_table_remove(icon_queue_set, b);
+			}
+			g_queue_delete_link(icon_download_queue, entry);
+		}
+		entry = next;
+	}
+
+	// If the queue is now empty, stop the timer so it does not fire
+	// with an empty queue (which would be safe but wasteful).
+	if (g_queue_is_empty(icon_download_queue) && icon_queue_timer_id != 0) {
+		g_source_remove(icon_queue_timer_id);
+		icon_queue_timer_id = 0;
+	}
+}
+
+typedef struct SkypeImgMsgContext_ {
+	PurpleConversation *conv;
+	time_t composetimestamp;
+	gchar* from;
+} SkypeImgMsgContext;
+
+/* webOS: transcode a downloaded audio file to WAV for in-app playback. Teams voice notes are AAC in
+ * MP4 (.m4a); the WebKit <audio> gate accepts "audio/aac" but the media server then "Failed to get a
+ * pipeline" for AAC/MP4 (it plays Ogg/Opus and raw WAV fine, not AAC). Raw WAV is the simplest
+ * pipeline, so we transcode m4a -> wav and hand the app the .wav. gst-launch runs with a CLEAN env --
+ * the transport's LD_PRELOAD/wpe-glibc LD_LIBRARY_PATH SEGFAULTs stock binaries (same as the outgoing
+ * faac/ffmpeg path). Returns a newly-allocated .wav path (caller frees) or NULL to keep the original. */
+static gchar *
+teams_audio_to_wav(const gchar *in_path)
+{
+	gchar *stem = NULL, *wav = NULL, *result = NULL, *loc_in = NULL, *loc_out = NULL;
+	const gchar *dot;
+	gint status = 0;
+	gboolean ok;
+
+	if (in_path == NULL)
+		return NULL;
+	dot = strrchr(in_path, '.');
+	if (dot == NULL)
+		return NULL;
+	stem = g_strndup(in_path, dot - in_path);
+	wav = g_strconcat(stem, ".wav", NULL);
+	loc_in = g_strconcat("location=", in_path, NULL);
+	loc_out = g_strconcat("location=", wav, NULL);
+
+	{
+		gchar *envp[] = { (gchar *) "PATH=/usr/bin:/bin", NULL };
+		gchar *argv[] = { (gchar *) "/usr/bin/gst-launch-0.10",
+			(gchar *) "filesrc", loc_in,
+			(gchar *) "!", (gchar *) "decodebin2",
+			(gchar *) "!", (gchar *) "audioconvert",
+			(gchar *) "!", (gchar *) "wavenc",
+			(gchar *) "!", (gchar *) "filesink", loc_out, NULL };
+		ok = g_spawn_sync(NULL, argv, envp, G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
+			NULL, NULL, NULL, NULL, &status, NULL);
+	}
+	if (ok && g_file_test(wav, G_FILE_TEST_EXISTS)) {
+		GStatBuf st;
+		if (g_stat(wav, &st) == 0 && st.st_size > 44) /* bigger than a bare WAV header */
+			result = g_strdup(wav);
+	}
+
+	g_free(stem);
+	g_free(wav);
+	g_free(loc_in);
+	g_free(loc_out);
+	return result;
+}
+
+static void
+teams_got_imagemessage(PurpleHttpConnection *http_conn, PurpleHttpResponse *response, gpointer user_data)
+{
+	gchar *msg_tmp;
+	const gchar *url_text;
+	gsize len;
+	PurpleMessageFlags flags = PURPLE_MESSAGE_NO_LOG;
+
+	SkypeImgMsgContext *ctx = user_data;
+	PurpleConversation *conv = ctx->conv;
+	PurpleConnection *pc = purple_conversation_get_connection(conv);
+	TeamsAccount *sa = pc ? purple_connection_get_protocol_data(pc) : NULL;
+
+	time_t ts = ctx->composetimestamp;
+	gchar* ctx_from = ctx->from;
+	ctx->from = NULL;
+	g_free(ctx);
+
+	// Bail if the account was freed by a re-login flap, or the conversation was closed, before this
+	// (authenticated) media download returned. teams_account_is_live is a pointer check (no deref).
+	if (!teams_account_is_live(sa) || !purple_conversation_is_valid(conv)) {
+		g_free(ctx_from);
+		return;
+	}
+
+	url_text = purple_http_response_get_data(response, &len);
+
+	if (!url_text || !len || url_text[0] == '{' || url_text[0] == '<') {
+		g_free(ctx_from);
+		return;
+	}
+
+	if (!purple_http_response_is_successful(response)) {
+		g_free(ctx_from);
+		return;
+	}
+
+	// webOS: persist the (authenticated - fetched with the skype_token cookie) media to a WebKit-
+	// readable file and surface it as a file:// URL in the message body. The transport renders that
+	// inline (image) or with the audio player (voice note), the SAME path as remote image URLs --
+	// whereas a libpurple imgstore <img id=N> is DROPPED by incoming_message_cb, and handing the app
+	// the raw authenticated ASM URL shows an unloadable link (and, for audio, storm-spawns
+	// media-pipeline on the failing fetch, exhausting fds). Detect the type from the magic bytes.
+	const guchar *b = (const guchar *) url_text;
+	const gchar *ext = ".bin";
+	if      (len >= 3  && b[0]==0xFF && b[1]==0xD8 && b[2]==0xFF)                                   ext = ".jpg";
+	else if (len >= 4  && b[0]==0x89 && b[1]=='P'  && b[2]=='N'  && b[3]=='G')                      ext = ".png";
+	else if (len >= 6  && b[0]=='G'  && b[1]=='I'  && b[2]=='F')                                    ext = ".gif";
+	else if (len >= 12 && b[0]=='R'  && b[1]=='I'  && b[2]=='F'  && b[3]=='F' && b[8]=='W'  && b[9]=='E' && b[10]=='B' && b[11]=='P') ext = ".webp";
+	else if (len >= 4  && b[0]=='O'  && b[1]=='g'  && b[2]=='g'  && b[3]=='S')                      ext = ".ogg";
+	else if (len >= 3  && b[0]=='I'  && b[1]=='D'  && b[2]=='3')                                    ext = ".mp3";
+	else if (len >= 12 && b[0]=='R'  && b[1]=='I'  && b[2]=='F'  && b[3]=='F' && b[8]=='W'  && b[9]=='A' && b[10]=='V' && b[11]=='E') ext = ".wav";
+	else if (len >= 8  && b[4]=='f'  && b[5]=='t'  && b[6]=='y'  && b[7]=='p')                      ext = ".m4a"; // ISO-BMFF (m4a/aac)
+
+	gchar *hash = g_compute_checksum_for_data(G_CHECKSUM_SHA1, b, len);
+	g_mkdir_with_parents("/media/internal/.im-attachments/teams", 0755);
+	gchar *path = g_strdup_printf("/media/internal/.im-attachments/teams/%s%s", hash, ext);
+	g_free(hash);
+
+	FILE *f = fopen(path, "wb");
+	if (f == NULL) {
+		purple_debug_error("teams", "failed to save received media to %s\n", path);
+		g_free(path);
+		g_free(ctx_from);
+		return;
+	}
+	fwrite(url_text, 1, len, f);
+	fclose(f);
+
+	// webOS: an AAC .m4a (Teams voice note) can't be played by the in-app media server ("Failed to get
+	// a pipeline" for AAC/MP4), so transcode it to WAV, which plays. Keep the original if it fails.
+	if (g_str_equal(ext, ".m4a")) {
+		gchar *wav = teams_audio_to_wav(path);
+		if (wav != NULL) {
+			g_unlink(path);
+			g_free(path);
+			path = wav;
+		}
+	}
+
+	msg_tmp = g_strdup_printf("file://%s", path);
+	g_free(path);
+
+	if (sa && teams_is_user_self(sa, ctx_from)) {
+		flags |= PURPLE_MESSAGE_SEND;
+	} else {
+		flags |= PURPLE_MESSAGE_RECV;
+	}
+
+	purple_conversation_write_img_message(conv, ctx_from, msg_tmp, flags, ts);
+
+	g_free(msg_tmp);
+	g_free(ctx_from);
+}
+
+void
+teams_download_uri_to_conv(TeamsAccount *sa, const gchar *uri, PurpleConversation *conv, time_t ts, const gchar* from)
+{
+	gchar *url, *text;
+	PurpleHttpRequest *request;
+	PurpleMessageFlags flags = 0;
+	
+	text = purple_strreplace(uri, "/imgt1", "/imgpsh_fullsize");
+	url = purple_strreplace(text, "/imgo", "/imgpsh_fullsize");
+	g_free(text);
+
+	if (purple_strequal(purple_core_get_ui(), "BitlBee")) {
+		// Bitlbee doesn't support images, so just plop a url to the image instead
+		
+		purple_conversation_write_system_message_ts(conv, url, PURPLE_MESSAGE_SYSTEM, ts);
+		g_free(url);
+		
+		return;
+	}
+	
+	request = purple_http_request_new(uri);
+	purple_http_request_set_keepalive_pool(request, sa->keepalive_pool);
+	
+	static GRegex *skype_token_uri_regex = NULL;
+	if (skype_token_uri_regex == NULL) {
+		// webOS: match ANY *.asm.skype.com host, not just bare "api.asm.skype.com". Consumer/personal
+		// Teams serves media from region-prefixed hosts (us-api.asm.skype.com, nus1-api.asm.skype.com,
+		// ...); the old exact-match failed those, so the image download went out WITHOUT the skype_token
+		// cookie -> 401 -> an HTML/JSON body -> teams_got_imagemessage bailed -> empty bubble, no image.
+		skype_token_uri_regex = g_regex_new("^https://[^/]*\\.asm\\.skype\\.com/|^https://[^\\.]*\\.asyncgw\\.teams\\.microsoft\\.com/", G_REGEX_OPTIMIZE, 0, NULL);
+	}
+
+	//Only for skype domains
+	if (skype_token_uri_regex != NULL && g_regex_match(skype_token_uri_regex, uri, 0, NULL)) {
+		purple_http_request_header_set_printf(request, "Cookie", "skypetoken_asm=%s", sa->skype_token);
+	}
+	
+	purple_http_request_header_set(request, "Accept", "*/*"); // webOS: also allow audio/* voice notes, not just image/*
+	SkypeImgMsgContext *ctx = g_new(SkypeImgMsgContext, 1);
+	ctx->composetimestamp = ts;
+	ctx->conv = conv;
+	ctx->from = g_strdup(from);
+	purple_http_request(sa->pc, request, teams_got_imagemessage, ctx);
+	purple_http_request_unref(request);
+
+	// webOS: no synchronous "Click here to view full version" link -- teams_got_imagemessage now saves
+	// the download to a file:// the app renders inline (image) / plays (audio). The bare link was the
+	// "weird link" the user saw, and for audio it let the app storm-spawn media-pipeline on the
+	// unloadable authenticated URL.
+	(void) flags;
+	g_free(url);
+}
+
+void
+teams_download_moji_to_conv(TeamsAccount *sa, const gchar *text, const gchar *url_thumbnail, PurpleConversation *conv, time_t ts, const gchar* from)
+{
+	gchar *cdn_url_thumbnail;
+	PurpleHttpURL *httpurl;
+	PurpleHttpRequest *request;
+	PurpleMessageFlags flags = 0;
+
+	httpurl = purple_http_url_parse(url_thumbnail);
+
+	cdn_url_thumbnail = g_strdup_printf("https://%s/%s", TEAMS_STATIC_CDN_HOST, purple_http_url_get_path(httpurl));
+	
+	request = purple_http_request_new(cdn_url_thumbnail);
+	purple_http_request_set_keepalive_pool(request, sa->keepalive_pool);
+	purple_http_request_header_set_printf(request, "Cookie", "vdms-skype-token=%s", sa->vdms_token);
+	purple_http_request_header_set(request, "Accept", "image/*");
+	SkypeImgMsgContext *ctx = g_new(SkypeImgMsgContext, 1);
+	ctx->composetimestamp = ts;
+	ctx->conv = conv;
+	ctx->from = g_strdup(from);
+	purple_http_request(sa->pc, request, teams_got_imagemessage, ctx);
+	purple_http_request_unref(request);
+	
+	if (teams_is_user_self(sa, from)) {
+		flags |= PURPLE_MESSAGE_SEND;
+	} else {
+		flags |= PURPLE_MESSAGE_RECV;
+	}
+	
+	purple_conversation_write_img_message(conv, from, text, flags, ts);
+
+	g_free(cdn_url_thumbnail);
+	purple_http_url_free(httpurl);
+}
+
+static void
+teams_got_vm_file(PurpleHttpConnection *http_conn, PurpleHttpResponse *response, gpointer user_data)
+{
+	PurpleXfer *xfer = user_data;
+	const gchar *data;
+	gsize len;
+	
+	data = purple_http_response_get_data(response, &len);
+	purple_xfer_write(xfer, (guchar *)data, len);
+}
+
+static void
+teams_init_vm_download(PurpleXfer *xfer)
+{
+	TeamsAccount *sa;
+	JsonObject *file = purple_xfer_get_protocol_data(xfer);
+	gint64 fileSize;
+	const gchar *url;
+	PurpleHttpRequest *request;
+
+	fileSize = json_object_get_int_member(file, "fileSize");
+	url = json_object_get_string_member(file, "url");
+	
+	purple_xfer_set_completed(xfer, FALSE);
+	sa = purple_connection_get_protocol_data(purple_account_get_connection(purple_xfer_get_account(xfer)));
+	
+	request = purple_http_request_new(url);
+	purple_http_request_set_keepalive_pool(request, sa->keepalive_pool);
+	purple_http_request_set_max_len(request, fileSize);
+	purple_http_request(sa->pc, request, teams_got_vm_file, xfer);
+	purple_http_request_unref(request);
+	
+	json_object_unref(file);
+}
+
+static void
+teams_cancel_vm_download(PurpleXfer *xfer)
+{
+	JsonObject *file = purple_xfer_get_protocol_data(xfer);
+	json_object_unref(file);
+}
+
+static void
+teams_got_vm_download_info(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	PurpleConversation *conv = user_data;
+	PurpleXfer *xfer;
+	JsonObject *obj, *file;
+	JsonArray *files;
+	gint64 fileSize;
+	const gchar *url, *assetId, *status;
+	gchar *filename;
+	
+	if (node == NULL || json_node_get_node_type(node) != JSON_NODE_OBJECT)
+		return;
+	obj = json_node_get_object(node);
+	
+	files = json_object_get_array_member(obj, "files");
+	/* webOS: guarded macro can yield NULL - bound the index-0 access (raw call asserts on NULL). */
+	file = (json_array_get_length(files) >= 1) ? json_array_get_object_element(files, 0) : NULL;
+	if (file != NULL) {
+		status = json_object_get_string_member(file, "status");
+		if (status && g_str_equal(status, "ok")) {
+			assetId = json_object_get_string_member(obj, "assetId");
+			fileSize = json_object_get_int_member(file, "fileSize");
+			url = json_object_get_string_member(file, "url");
+			(void) url;
+			
+			filename = g_strconcat(assetId, ".mp4", NULL);
+			
+			xfer = purple_xfer_new(sa->account, PURPLE_XFER_TYPE_RECEIVE, purple_conversation_get_name(conv));
+			purple_xfer_set_size(xfer, fileSize);
+			purple_xfer_set_filename(xfer, filename);
+			json_object_ref(file);
+			purple_xfer_set_protocol_data(xfer, file);
+			purple_xfer_set_init_fnc(xfer, teams_init_vm_download);
+			purple_xfer_set_cancel_recv_fnc(xfer, teams_cancel_vm_download);
+			purple_xfer_add(xfer);
+			
+			g_free(filename);
+		} else if (status && g_str_equal(status, "running")) {
+			//teams_download_video_message(sa, sid??????, conv);
+		}
+	}
+}
+
+static void
+teams_got_vm_info(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	PurpleConversation *conv = user_data;
+	JsonObject *obj, *response, *media_stream;
+	const gchar *filename;
+	
+	if (node == NULL || json_node_get_node_type(node) != JSON_NODE_OBJECT)
+		return;
+	obj = json_node_get_object(node);
+	
+	response = json_object_get_object_member(obj, "response");
+	media_stream = json_object_get_object_member(response, "media_stream");
+	filename = json_object_get_string_member(media_stream, "filename");
+	
+	if (filename != NULL) {
+		// Need to keep retrying this url until it comes back with status:ok
+		gchar *url = g_strdup_printf("/vod/api-create?assetId=%s&profile=mp4-vm", purple_url_encode(filename));
+		teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, "media.vm.skype.com", url, NULL, teams_got_vm_download_info, conv, TRUE);
+		g_free(url);
+	}
+
+}
+
+void
+teams_download_video_message(TeamsAccount *sa, const gchar *sid, PurpleConversation *conv)
+{
+	gchar *url, *username_encoded;
+	
+	username_encoded = g_strdup(purple_url_encode(sa->username));
+	url = g_strdup_printf("/users/%s/video_mails/%s", username_encoded, purple_url_encode(sid));
+	
+	teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, TEAMS_VIDEOMAIL_HOST, url, NULL, teams_got_vm_info, conv, TRUE);
+	
+	g_free(url);
+	g_free(username_encoded);
+	
+}
+
+
+static void
+teams_free_xfer(PurpleXfer *xfer)
+{
+	TeamsFileTransfer *swft;
+	
+	swft = purple_xfer_get_protocol_data(xfer);
+	g_return_if_fail(swft != NULL);
+	
+	if (swft->info != NULL)
+		json_object_unref(swft->info);
+	g_free(swft->url);
+	g_free(swft->id);
+	g_free(swft->from);
+	g_free(swft);
+	
+	purple_xfer_set_protocol_data(xfer, NULL);
+}
+
+static void
+teams_got_file(PurpleHttpConnection *http_conn, PurpleHttpResponse *response, gpointer user_data)
+{
+	TeamsFileTransfer *swft = user_data;
+	PurpleXfer *xfer = swft->xfer;
+	TeamsAccount *sa = swft->sa;
+	const gchar *data;
+	gsize len;
+	
+	
+	if (!purple_http_response_is_successful(response)) {
+		purple_xfer_error(purple_xfer_get_xfer_type(xfer), sa->account, swft->from, purple_http_response_get_error(response));
+		purple_xfer_cancel_local(xfer);
+	} else {
+		data = purple_http_response_get_data(response, &len);
+		purple_xfer_write_file(xfer, (guchar *)data, len);
+		purple_xfer_set_completed(xfer, TRUE);
+	}
+	
+	//cleanup
+	teams_free_xfer(xfer);
+	purple_xfer_end(xfer);
+}
+
+static void
+teams_init_file_download(PurpleXfer *xfer)
+{
+	TeamsAccount *sa;
+	TeamsFileTransfer *swft;
+	const gchar *view_location;
+	gint64 content_full_length;
+	PurpleHttpRequest *request;
+	
+	swft = purple_xfer_get_protocol_data(xfer);
+	sa = swft->sa;
+	
+	view_location = json_object_get_string_member(swft->info, "view_location");
+	content_full_length = json_object_get_int_member(swft->info, "content_full_length");
+	
+	purple_xfer_start(xfer, -1, NULL, 0);
+	
+	request = purple_http_request_new(view_location);
+	purple_http_request_set_keepalive_pool(request, sa->keepalive_pool);
+	purple_http_request_header_set_printf(request, "Cookie", "skypetoken_asm=%s", sa->skype_token);
+	purple_http_request_header_set(request, "Accept", "*/*");
+	purple_http_request_set_max_len(request, content_full_length);
+	purple_http_request(sa->pc, request, teams_got_file, swft);
+	purple_http_request_unref(request);
+}
+
+static void
+teams_got_file_info(PurpleHttpConnection *http_conn, PurpleHttpResponse *response, gpointer user_data)
+{
+	JsonObject *obj;
+	PurpleXfer *xfer;
+	TeamsFileTransfer *swft = user_data;
+	TeamsAccount *sa = swft->sa;
+	const gchar *data;
+	gsize len;
+	
+	data = purple_http_response_get_data(response, &len);
+	obj = json_decode_object(data, len);
+
+	if (obj == NULL) {
+		g_free(swft->url);
+		g_free(swft->from);
+		g_free(swft);
+		return;
+	}
+	
+	/* 
+	{
+		"content_length": 40708,
+		"content_full_length": 40708,
+		"view_length": 40708,
+		"content_state": "ready",
+		"view_state": "ready",
+		"view_location": "uri/views/original",
+		"status_location": "uri/views/original/status",
+		"scan": {
+			"status": "passed"
+		},
+		"original_filename": "filename"
+	} */
+	purple_debug_info("teams", "File info: %s\n", data);
+	
+	if (!json_object_has_member(obj, "content_state") || !purple_strequal(json_object_get_string_member(obj, "content_state"), "ready")) {
+		teams_present_uri_as_filetransfer(sa, json_object_get_string_member(obj, "status_location"), swft->from);
+		g_free(swft->url);
+		g_free(swft->from);
+		g_free(swft);
+		json_object_unref(obj);
+		return;
+	}
+	
+	swft->info = obj;
+	
+	xfer = purple_xfer_new(sa->account, PURPLE_XFER_TYPE_RECEIVE, swft->from);
+	purple_xfer_set_size(xfer, json_object_get_int_member(obj, "content_full_length"));
+	purple_xfer_set_filename(xfer, json_object_get_string_member(obj, "original_filename"));
+	purple_xfer_set_init_fnc(xfer, teams_init_file_download);
+	purple_xfer_set_cancel_recv_fnc(xfer, teams_free_xfer);
+	
+	swft->xfer = xfer;
+	purple_xfer_set_protocol_data(xfer, swft);
+	
+	purple_xfer_request(xfer);
+}
+
+void
+teams_present_uri_as_filetransfer(TeamsAccount *sa, const gchar *uri, const gchar *from)
+{
+	TeamsFileTransfer *swft;
+	PurpleHttpRequest *request;
+	
+	swft = g_new0(TeamsFileTransfer, 1);
+	swft->sa = sa;
+	swft->url = g_strdup(uri);
+	swft->from = g_strdup(from);
+	
+	request = purple_http_request_new(uri);
+	if (!g_str_has_suffix(uri, "/views/original/status")) {
+		purple_http_request_set_url_printf(request, "%s%s", uri, "/views/original/status");
+	}
+	purple_http_request_set_keepalive_pool(request, sa->keepalive_pool);
+	purple_http_request_header_set_printf(request, "Cookie", "skypetoken_asm=%s", sa->skype_token);
+	purple_http_request_header_set(request, "Accept", "*/*");
+	purple_http_request(sa->pc, request, teams_got_file_info, swft);
+	purple_http_request_unref(request);
+}
+
+static void
+got_file_send_progress(PurpleHttpConnection *http_conn, PurpleHttpResponse *response, gpointer user_data)
+{
+	TeamsFileTransfer *swft = user_data;
+	PurpleXfer *xfer = swft->xfer;
+	TeamsAccount *sa = swft->sa;
+	JsonObject *obj;
+	const gchar *data;
+	gsize len;
+	
+	data = purple_http_response_get_data(response, &len);
+	obj = json_decode_object(data, len);
+	if (obj == NULL) {
+		return;
+	}
+
+	//{"content_length":0,"content_full_length":0,"view_length":0,"content_state":"no content","view_state":"none","view_location":"https://nus1-api.asm.skype.com/v1/objects/0-cus-d1-61121cfae8cf601944627a66afdb77ad/views/original","status_location":"https://nus1-api.asm.skype.com/v1/objects/0-cus-d1-61121cfae8cf601944627a66afdb77ad/views/original/status"}
+	
+	if (json_object_has_member(obj, "status_location")) {
+		g_free(swft->url);
+		swft->url = g_strdup(json_object_get_string_member(obj, "status_location"));
+	}
+	
+	if (json_object_has_member(obj, "content_state") && purple_strequal(json_object_get_string_member(obj, "content_state"), "ready")) {
+		PurpleXmlNode *uriobject = purple_xmlnode_new("URIObject");
+		PurpleXmlNode *title = purple_xmlnode_new_child(uriobject, "Title");
+		PurpleXmlNode *description = purple_xmlnode_new_child(uriobject, "Description");
+		PurpleXmlNode *anchor = purple_xmlnode_new_child(uriobject, "a");
+		PurpleXmlNode *originalname = purple_xmlnode_new_child(uriobject, "OriginalName");
+		PurpleXmlNode *filesize = purple_xmlnode_new_child(uriobject, "FileSize");
+		gchar *message, *temp;
+		//We finally did it!
+		// May the peasants rejoice
+		purple_xfer_set_completed(xfer, TRUE);
+		
+		// Don't forget to let the other end know about it
+		
+		purple_xmlnode_set_attrib(uriobject, "type", "File.1");
+		temp = g_strconcat("https://" TEAMS_XFER_HOST "/v1/objects/", purple_url_encode(swft->id), NULL);
+		purple_xmlnode_set_attrib(uriobject, "uri", temp);
+		g_free(temp);
+		temp = g_strconcat("https://" TEAMS_XFER_HOST "/v1/objects/", purple_url_encode(swft->id), "/views/thumbnail", NULL);
+		purple_xmlnode_set_attrib(uriobject, "url_thumbnail", temp);
+		g_free(temp);
+		purple_xmlnode_insert_data(title, purple_xfer_get_filename(xfer), -1);
+		purple_xmlnode_insert_data(description, "Description: ", -1);
+		temp = g_strconcat("https://login.skype.com/login/sso?go=webclient.xmm&docid=", purple_url_encode(swft->id), NULL);
+		purple_xmlnode_set_attrib(anchor, "href", temp);
+		purple_xmlnode_insert_data(anchor, temp, -1);
+		g_free(temp);
+		purple_xmlnode_set_attrib(originalname, "v", purple_xfer_get_filename(xfer));
+		temp = g_strdup_printf("%" G_GSIZE_FORMAT, (gsize) purple_xfer_get_size(xfer));
+		purple_xmlnode_set_attrib(filesize, "v", temp);
+		g_free(temp);
+		
+		temp = purple_xmlnode_to_str(uriobject, NULL);
+		message = purple_strreplace(temp, "'", "\"");
+		g_free(temp);
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+		PurpleMessage *msg = purple_message_new_outgoing(swft->from, message, PURPLE_MESSAGE_SEND);
+		teams_send_im(sa->pc, msg);
+		purple_message_destroy(msg);
+#else
+		teams_send_im(sa->pc, swft->from, message, PURPLE_MESSAGE_SEND);
+#endif
+		g_free(message);
+		
+		teams_free_xfer(xfer);
+		purple_xfer_unref(xfer);
+		
+		purple_xmlnode_free(uriobject);
+	}
+	
+	json_object_unref(obj);
+	
+	// probably good
+}
+
+static gboolean
+poll_file_send_progress(gpointer user_data)
+{
+	TeamsFileTransfer *swft = user_data;
+	TeamsAccount *sa = swft->sa;
+	PurpleHttpRequest *request;
+	
+	request = purple_http_request_new(swft->url);
+	purple_http_request_set_keepalive_pool(request, sa->keepalive_pool);
+	purple_http_request_header_set_printf(request, "Cookie", "skypetoken_asm=%s", sa->skype_token);
+	purple_http_request_header_set(request, "Accept", "*/*");
+	purple_http_request(sa->pc, request, got_file_send_progress, swft);
+	purple_http_request_unref(request);
+	
+	return FALSE;
+}
+
+static void
+teams_xfer_send_contents_reader(PurpleHttpConnection *con, gchar *buf, size_t offset, size_t len, gpointer user_data, PurpleHttpContentReaderCb cb)
+{
+	TeamsFileTransfer *swft = user_data;
+	PurpleXfer *xfer = swft->xfer;
+	gsize read;
+	
+	purple_debug_info("teams", "Asked %" G_GSIZE_FORMAT " bytes from offset %" G_GSIZE_FORMAT "\n", len, offset);
+	purple_xfer_set_bytes_sent(xfer, offset);
+	read = purple_xfer_read_file(xfer, (guchar *)buf, len);
+	purple_debug_info("teams", "Read %" G_GSIZE_FORMAT " bytes\n", read);
+	
+	cb(con, TRUE, read != len, read);
+}
+
+/* webOS: best-effort duration (seconds) of a voice note for the audio card. Opus/Ogg voice notes
+ * carry a 48kHz granule position in their last OggS page; other/unparsable formats fall back to 0
+ * (the card still plays -- only the displayed length is off). */
+static guint
+teams_audio_duration_secs(const gchar *path)
+{
+	FILE *f;
+	long fsize, tail, start, i;
+	unsigned char hdr[4];
+	unsigned char *buf;
+	guint secs = 0;
+
+	if (path == NULL)
+		return 0;
+	f = fopen(path, "rb");
+	if (f == NULL)
+		return 0;
+	if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+	fsize = ftell(f);
+	if (fsize <= 27 || fseek(f, 0, SEEK_SET) != 0 || fread(hdr, 1, 4, f) != 4 ||
+			memcmp(hdr, "OggS", 4) != 0) {
+		fclose(f);
+		return 0;
+	}
+	/* scan the tail for the LAST OggS page and read its 64-bit LE granule position (page offset +6) */
+	tail = fsize > 65536 ? 65536 : fsize;
+	start = fsize - tail;
+	buf = g_malloc(tail);
+	if (fseek(f, start, SEEK_SET) == 0 && (long) fread(buf, 1, tail, f) == tail) {
+		for (i = tail - 27; i >= 0; i--) {
+			if (buf[i] == 'O' && buf[i+1] == 'g' && buf[i+2] == 'g' && buf[i+3] == 'S') {
+				guint64 g = 0;
+				int k;
+				for (k = 0; k < 8; k++)
+					g |= ((guint64) buf[i + 6 + k]) << (8 * k);
+				if (g != G_MAXUINT64)
+					secs = (guint) (g / 48000);
+				break;
+			}
+		}
+	}
+	g_free(buf);
+	fclose(f);
+	return secs;
+}
+
+// webOS: pull display width/height (tkhd, 16.16 fixed) and duration (mvhd) out of an mp4 for the
+// AMSVideo markup. Best-effort: reads up to the first 8 MB (faststart moov lives at the front); leaves
+// outputs at 0 if it can't parse (the recipient re-derives real dimensions from the video itself).
+static guint32 teams_be32(const guchar *b) {
+	return ((guint32)b[0] << 24) | ((guint32)b[1] << 16) | ((guint32)b[2] << 8) | (guint32)b[3];
+}
+// Return the payload (past the 8/16-byte header) of the first child box named `name` within [data,end).
+static const guchar *teams_mp4_find(const guchar *data, gsize len, const char *name, gsize *out_len) {
+	gsize i = 0;
+	while (i + 8 <= len) {
+		guint32 size = teams_be32(data + i);
+		gsize hdr = 8;
+		if (size == 1) { if (i + 16 > len) break; size = teams_be32(data + i + 12); hdr = 16; }
+		else if (size == 0) size = len - i;
+		if (size < hdr || i + size > len) break;
+		if (memcmp(data + i + 4, name, 4) == 0) { if (out_len) *out_len = size - hdr; return data + i + hdr; }
+		i += size;
+	}
+	return NULL;
+}
+static void teams_mp4_video_info(const char *path, guint *w, guint *h, guint *secs) {
+	*w = *h = *secs = 0;
+	FILE *f = g_fopen(path, "rb");
+	if (f == NULL) return;
+	gsize cap = 8 * 1024 * 1024;
+	guchar *buf = g_malloc(cap);
+	gsize n = fread(buf, 1, cap, f);
+	fclose(f);
+
+	gsize moovlen = 0;
+	const guchar *moov = teams_mp4_find(buf, n, "moov", &moovlen);
+	if (moov != NULL) {
+		gsize mvlen = 0;
+		const guchar *mvhd = teams_mp4_find(moov, moovlen, "mvhd", &mvlen);
+		if (mvhd != NULL && mvlen >= 20) {
+			guint32 ts = 0, dur = 0;
+			if (mvhd[0] == 1 && mvlen >= 32) { ts = teams_be32(mvhd + 20); dur = teams_be32(mvhd + 28); }
+			else { ts = teams_be32(mvhd + 12); dur = teams_be32(mvhd + 16); }
+			if (ts > 0) *secs = dur / ts;
+		}
+		// First trak whose tkhd carries non-zero display dimensions is the video track.
+		gsize scan = 0;
+		while (scan + 8 <= moovlen) {
+			guint32 size = teams_be32(moov + scan);
+			gsize hdr = 8;
+			if (size == 1) { if (scan + 16 > moovlen) break; size = teams_be32(moov + scan + 12); hdr = 16; }
+			else if (size == 0) size = moovlen - scan;
+			if (size < hdr || scan + size > moovlen) break;
+			if (memcmp(moov + scan + 4, "trak", 4) == 0) {
+				gsize tklen = 0;
+				const guchar *tkhd = teams_mp4_find(moov + scan + hdr, size - hdr, "tkhd", &tklen);
+				if (tkhd != NULL && tklen >= 8) {
+					guint32 tw = teams_be32(tkhd + tklen - 8) >> 16;
+					guint32 th = teams_be32(tkhd + tklen - 4) >> 16;
+					if (tw > 0 && th > 0) { *w = tw; *h = th; break; }
+				}
+			}
+			scan += size;
+		}
+	}
+	g_free(buf);
+}
+
+static void
+teams_xfer_send_done(PurpleHttpConnection *conn, PurpleHttpResponse *resp, gpointer user_data)
+{
+	gsize len;
+	const gchar *data = purple_http_response_get_data(resp, &len);
+	const gchar *error = purple_http_response_get_error(resp);
+	int code = purple_http_response_get_code(resp);
+	TeamsFileTransfer *swft = user_data;
+	purple_debug_info("teams", "Finished [%d]: %s\n", code, error);
+	purple_debug_info("teams", "Server message: %s\n", data);
+
+	if (swft->is_image) {
+		// webOS: the image content is uploaded -> send it as an inline AMSImage <img> now, exactly like
+		// the paste-an-image path (teams_conversation_send_image_part2_cb) -- no status poll. The
+		// recipient fetches /views/imgo and renders it inline (a File.1 URIObject shows "Unsupported
+		// Content" instead). teams_send_message tags a non-<URIObject> body as RichText/Html.
+		TeamsAccount *sa = swft->sa;
+		PurpleXfer *xfer = swft->xfer;
+		gchar *image_url = g_strdup_printf("https://%s/v1/objects/%s/views/imgo", TEAMS_XFER_HOST, purple_url_encode(swft->id));
+		gchar *html = g_strdup_printf(
+			"<p><img itemscope=\"image\" style=\"vertical-align:bottom\" src=\"%s\" alt=\"image\" "
+			"itemtype=\"http://schema.skype.com/AMSImage\" height=\"250\" id=\"%s\" itemid=\"%s\" "
+			"href=\"%s\" target-src=\"%s\"></p>",
+			image_url, swft->id, swft->id, image_url, image_url);
+		purple_xfer_set_completed(xfer, TRUE);
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+		PurpleMessage *m = purple_message_new_outgoing(swft->from, html, PURPLE_MESSAGE_SEND);
+		teams_send_im(sa->pc, m);
+		purple_message_destroy(m);
+#else
+		teams_send_im(sa->pc, swft->from, html, PURPLE_MESSAGE_SEND);
+#endif
+		g_free(html);
+		g_free(image_url);
+		teams_free_xfer(xfer);
+		purple_xfer_unref(xfer);
+		return;
+	}
+
+	if (swft->is_audio) {
+		// webOS: the audio content is uploaded -> send it as a Teams voice note (audio card) now, no
+		// status poll (mirrors the is_image path). The recipient plays /views/audio inline.
+		TeamsAccount *sa = swft->sa;
+		PurpleXfer *xfer = swft->xfer;
+		// duration was captured from the Opus source in teams_xfer_send_init (the xfer now points at the
+		// .m4a, which teams_audio_duration_secs can't parse); fall back to parsing if it wasn't set.
+		guint dur = swft->duration_secs > 0 ? swft->duration_secs
+			: teams_audio_duration_secs(purple_xfer_get_local_filename(xfer));
+		purple_xfer_set_completed(xfer, TRUE);
+		teams_send_audio_card(sa, swft->from, swft->id, dur);
+		teams_free_xfer(xfer);
+		purple_xfer_unref(xfer);
+		return;
+	}
+
+	if (swft->is_video) {
+		// webOS: the video content is uploaded -> send it as a Teams video card now, no status poll
+		// (mirrors is_image/is_audio). The recipient plays /views/video inline; a File.1 URIObject would
+		// show "Unsupported Content".
+		TeamsAccount *sa = swft->sa;
+		PurpleXfer *xfer = swft->xfer;
+		purple_xfer_set_completed(xfer, TRUE);
+		teams_send_video_card(sa, swft->from, swft->id, swft->width, swft->height, swft->duration_secs);
+		teams_free_xfer(xfer);
+		purple_xfer_unref(xfer);
+		return;
+	}
+
+	g_timeout_add_seconds(1, poll_file_send_progress, user_data);
+}
+
+static void
+teams_xfer_send_watcher(PurpleHttpConnection *http_conn, gboolean state, int processed, int total, gpointer user_data)
+{
+	TeamsFileTransfer *swft = user_data;
+	PurpleXfer *xfer = swft->xfer;
+	if (!state) purple_xfer_update_progress(xfer);
+}
+
+static void
+teams_xfer_send_begin(gpointer user_data)
+{
+	TeamsFileTransfer *swft = user_data;
+	PurpleXfer *xfer = swft->xfer;
+	TeamsAccount *sa = swft->sa;
+	PurpleHttpConnection *http_conn;
+
+	PurpleHttpRequest *request = purple_http_request_new("");
+	purple_http_request_set_keepalive_pool(request, sa->keepalive_pool);
+	// webOS: images upload to the image content view (imgpsh) and audio to the audio view, both as
+	// octet-stream; generic files to the original view as multipart/form-data (the recipient renders
+	// the former two inline -- see is_image/is_audio).
+	purple_http_request_set_url_printf(request, "https://%s/v1/objects/%s/content/%s", TEAMS_XFER_HOST, purple_url_encode(swft->id), swft->is_image ? "imgpsh" : (swft->is_audio ? "audio" : (swft->is_video ? "video" : "original")));
+	purple_http_request_set_method(request, "PUT");
+	purple_http_request_header_set(request, "Host", TEAMS_XFER_HOST);
+	purple_http_request_header_set(request, "Content-Type", (swft->is_image || swft->is_audio || swft->is_video) ? "application/octet-stream" : "multipart/form-data");
+	purple_http_request_header_set_printf(request, "Content-Length", "%" G_GSIZE_FORMAT, (gsize) purple_xfer_get_size(xfer));
+	purple_http_request_header_set_printf(request, "Authorization", "skype_token %s", sa->skype_token);
+	purple_http_request_set_contents_reader(request, teams_xfer_send_contents_reader, purple_xfer_get_size(xfer), user_data);
+	purple_http_request_set_http11(request, TRUE);
+	purple_xfer_start(xfer, -1, NULL, 0);
+	http_conn = purple_http_request(sa->pc, request, teams_xfer_send_done, user_data);
+	purple_http_conn_set_progress_watcher(http_conn, teams_xfer_send_watcher, user_data, 1);
+
+	purple_http_request_unref(request);
+}
+
+static void
+teams_got_object_for_file(PurpleHttpConnection *http_conn, PurpleHttpResponse *response, gpointer user_data)
+{
+	TeamsFileTransfer *swft = user_data;
+	PurpleXfer *xfer = swft->xfer;
+	JsonObject *obj;
+	const gchar *data;
+	gsize len;
+	
+	data = purple_http_response_get_data(response, &len);
+	obj = json_decode_object(data, len);
+
+	//Get back {"id": "0-cus-d3-deadbeefdeadbeef012345678"}
+	if (obj == NULL || !json_object_has_member(obj, "id")) {
+		// swft is still the xfer's protocol data, and purple_xfer_cancel_local() fires the
+		// cancel_send_fnc (teams_free_xfer), which frees swft->from + swft a SECOND time -> a
+		// double-free that aborts the whole transport whenever a Teams image/file object-creation
+		// POST comes back without an id. NULL the protocol data first so teams_free_xfer's
+		// g_return_if_fail(swft != NULL) bails instead of re-freeing what we free here.
+		g_free(swft->from);
+		g_free(swft);
+		purple_xfer_set_protocol_data(xfer, NULL);
+		purple_xfer_cancel_local(xfer);
+		if (obj != NULL) {
+			json_object_unref(obj);
+		}
+		return;
+	}
+	
+	swft->id = g_strdup(json_object_get_string_member(obj, "id"));
+	swft->url = g_strconcat("https://" TEAMS_XFER_HOST "/v1/objects/", purple_url_encode(swft->id), "/views/original/status", NULL);
+	
+	json_object_unref(obj);
+	
+	//Send the data
+	
+	//can't use fetch_url_request because it doesn't handle binary data
+	teams_xfer_send_begin(user_data);
+	
+}
+
+/* webOS: transcode a recorded voice note's source PCM WAV to AAC/M4A. Teams' clients only play
+ * voice notes as AAC/M4A (audio card /views/audio) -- an Ogg/Opus upload shows "Can't play message"
+ * on Android. Our transport hands us an Opus .ogg but keeps voicenote_X.wav next to it; this device's
+ * ffmpeg has no PCM/Opus decoder, so we go from the WAV via the standalone faac + ffmpeg binaries:
+ *   1) faac  -o X.aac X.wav                          (PCM WAV -> raw ADTS AAC; this faac lacks MP4)
+ *   2) ffmpeg -i X.aac -acodec copy -f mp4 X.m4a     (wrap AAC in MP4; --disable-bsfs build, and it
+ *                                                      won't infer the muxer from .m4a, hence -f mp4)
+ * Returns a newly-allocated .m4a path (caller frees) or NULL to fall back to the original file. */
+static gchar *
+teams_voicenote_to_m4a(const gchar *audio_path)
+{
+	gchar *stem = NULL, *wav = NULL, *aac = NULL, *m4a = NULL, *result = NULL;
+	const gchar *dot;
+	gint status = 0;
+	gboolean ok;
+
+	if (audio_path == NULL)
+		return NULL;
+	dot = strrchr(audio_path, '.');
+	if (dot == NULL)
+		return NULL;
+
+	stem = g_strndup(audio_path, dot - audio_path);
+	wav = (g_ascii_strcasecmp(dot, ".wav") == 0) ? g_strdup(audio_path) : g_strconcat(stem, ".wav", NULL);
+	if (!g_file_test(wav, G_FILE_TEST_EXISTS))
+		goto out;
+
+	aac = g_strconcat(stem, ".aac", NULL);
+	m4a = g_strconcat(stem, ".m4a", NULL);
+
+	// CRITICAL: run faac/ffmpeg with a CLEAN environment. The transport is launched with an
+	// LD_PRELOAD (app libstdc++ + wpe-glibc librt + libasound) and a wpe-glibc-first LD_LIBRARY_PATH;
+	// inherited by the child, those make the stock /usr/bin/faac (and ffmpeg) SEGFAULT. A minimal env
+	// lets the default loader pick their normal system libs. (envp replaces, not augments, the env.)
+	{
+		gchar *envp[] = { (gchar *) "PATH=/usr/bin:/bin", NULL };
+		gchar *argv[] = { (gchar *) "/usr/bin/faac", (gchar *) "-o", aac, wav, NULL };
+		ok = g_spawn_sync(NULL, argv, envp, G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
+			NULL, NULL, NULL, NULL, &status, NULL);
+	}
+	if (!ok || !g_file_test(aac, G_FILE_TEST_EXISTS))
+		goto out;
+
+	{
+		// RE-ENCODE (not -acodec copy): faac emits ADTS-framed AAC, and this ffmpeg has NO aac_adtstoasc
+		// bitstream filter (--disable-bsfs) to strip it, so a stream-copy leaves ADTS sync headers in the
+		// MP4 with no proper esds codec-config -> Teams/Android shows the card but "can't play". Decoding
+		// the ADTS and re-encoding through libfaac writes a clean raw-AAC MP4 (correct esds). 16 kHz is a
+		// safe AAC-LC rate (the 8 kHz source upsamples; fine for voice).
+		gchar *envp[] = { (gchar *) "PATH=/usr/bin:/bin", NULL };
+		gchar *argv[] = { (gchar *) "/usr/bin/ffmpeg", (gchar *) "-y", (gchar *) "-i", aac,
+			(gchar *) "-acodec", (gchar *) "libfaac", (gchar *) "-ar", (gchar *) "16000",
+			(gchar *) "-f", (gchar *) "mp4", m4a, NULL };
+		ok = g_spawn_sync(NULL, argv, envp, G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
+			NULL, NULL, NULL, NULL, &status, NULL);
+	}
+	if (ok && g_file_test(m4a, G_FILE_TEST_EXISTS))
+		result = g_strdup(m4a);
+
+out:
+	if (aac != NULL)
+		g_unlink(aac); // drop the intermediate raw-AAC
+	g_free(stem);
+	g_free(wav);
+	g_free(aac);
+	g_free(m4a);
+	return result;
+}
+
+static void
+teams_xfer_send_init(PurpleXfer *xfer)
+{
+	PurpleConnection *pc = purple_account_get_connection(purple_xfer_get_account(xfer));
+	TeamsAccount *sa = purple_connection_get_protocol_data(pc);
+	gchar *basename;
+
+	// webOS: a recorded voice note reaches us as Opus (.ogg); Teams needs AAC/M4A (else Android shows
+	// "Can't play message"). Transcode the source WAV -> M4A and send that instead. Repoint the xfer so
+	// the object create/upload + is_audio detection below all see the .m4a.
+	{
+		const gchar *lf = purple_xfer_get_local_filename(xfer);
+		const gchar *d = lf ? strrchr(lf, '.') : NULL;
+		if (d != NULL && (g_ascii_strcasecmp(d, ".ogg") == 0 || g_ascii_strcasecmp(d, ".opus") == 0)) {
+			// Capture the length from the Opus source NOW -- after we repoint the xfer to the .m4a,
+			// teams_audio_duration_secs (Ogg-granule only) can't read it and the card would show PT1S.
+			TeamsFileTransfer *swft0 = purple_xfer_get_protocol_data(xfer);
+			guint dur = teams_audio_duration_secs(lf);
+			gchar *m4a = teams_voicenote_to_m4a(lf);
+			if (m4a != NULL) {
+				GStatBuf st;
+				if (swft0 != NULL)
+					swft0->duration_secs = dur;
+				purple_xfer_set_local_filename(xfer, m4a);
+				if (g_stat(m4a, &st) == 0)
+					purple_xfer_set_size(xfer, (size_t) st.st_size);
+				purple_debug_info("teams", "voice note transcoded to M4A: %s (%ld bytes, %us)\n",
+					m4a, (long) purple_xfer_get_size(xfer), dur);
+				g_free(m4a);
+			} else {
+				purple_debug_warning("teams", "voice-note WAV->M4A transcode failed; sending Opus as-is\n");
+			}
+		}
+	}
+
+	basename = g_path_get_basename(purple_xfer_get_local_filename(xfer));
+	gchar *id, *post;
+	TeamsFileTransfer *swft = purple_xfer_get_protocol_data(xfer);
+	JsonObject *obj = json_object_new();
+	JsonObject *permissions = json_object_new();
+	JsonArray *userpermissions = json_array_new();
+	PurpleHttpRequest *request;
+	
+	purple_xfer_set_filename(xfer, basename);
+	purple_xfer_ref(xfer);
+
+	// webOS: an image must be created as a "pish/image" (Inline) object so it gets the /views/imgo image
+	// view and can be sent as an inline AMSImage <img> (which the recipient renders). A generic
+	// "sharing/file" object goes as a File.1 URIObject that modern Teams shows as "Unsupported Content".
+	{
+		const gchar *dot = strrchr(basename, '.');
+		swft->is_image = dot != NULL && (
+			g_ascii_strcasecmp(dot, ".png")  == 0 || g_ascii_strcasecmp(dot, ".jpg") == 0 ||
+			g_ascii_strcasecmp(dot, ".jpeg") == 0 || g_ascii_strcasecmp(dot, ".gif") == 0 ||
+			g_ascii_strcasecmp(dot, ".webp") == 0 || g_ascii_strcasecmp(dot, ".bmp") == 0);
+		// webOS: a voice note is created as a "pish/audio" (Inline) object so it gets a /views/audio
+		// view, then sent as an audio card (teams_send_audio_card) -- NOT a File.1 URIObject.
+		swft->is_audio = dot != NULL && (
+			g_ascii_strcasecmp(dot, ".ogg")  == 0 || g_ascii_strcasecmp(dot, ".opus") == 0 ||
+			g_ascii_strcasecmp(dot, ".mp3")  == 0 || g_ascii_strcasecmp(dot, ".m4a")  == 0 ||
+			g_ascii_strcasecmp(dot, ".wav")  == 0 || g_ascii_strcasecmp(dot, ".amr")  == 0);
+		// webOS: a video clip is created as a "sharing/video" object (parallels sharing/audio) so it gets
+		// a /views/video view, then sent as a video card (teams_send_video_card) -- NOT a File.1 URIObject
+		// (which modern Teams shows as "Unsupported Content").
+		swft->is_video = dot != NULL && (
+			g_ascii_strcasecmp(dot, ".mp4")  == 0 || g_ascii_strcasecmp(dot, ".mov")  == 0 ||
+			g_ascii_strcasecmp(dot, ".m4v")  == 0 || g_ascii_strcasecmp(dot, ".3gp")  == 0);
+	}
+
+	if (swft->is_video) {
+		// Parse the mp4 for the AMSVideo width/height/duration hints (see teams_send_video_card).
+		teams_mp4_video_info(purple_xfer_get_local_filename(xfer), &swft->width, &swft->height, &swft->duration_secs);
+		purple_debug_info("teams", "video info: %ux%u %us\n", swft->width, swft->height, swft->duration_secs);
+	}
+
+	// webOS: a voice note is a "sharing/audio" object (verified against a real incoming Teams voice
+	// note) -- its /views/audio serves audio/mp4 to the recipient. "pish/audio" creates an object whose
+	// /views/audio 400s ("Can't play message"). Images are "pish/image" (Inline AMSImage), video is
+	// "sharing/video" (/views/video), else File.1.
+	json_object_set_string_member(obj, "type", swft->is_image ? "pish/image" : (swft->is_audio ? "sharing/audio" : (swft->is_video ? "sharing/video" : "sharing/file")));
+	json_object_set_string_member(obj, "filename", basename);
+	if (swft->is_image) {
+		json_object_set_string_member(obj, "sharingMode", "Inline");
+	}
+	
+	id = g_strconcat(teams_user_url_prefix(swft->from), swft->from, NULL);
+	json_array_add_string_element(userpermissions, "read");
+	json_object_set_array_member(permissions, id, userpermissions);
+	json_object_set_object_member(obj, "permissions", permissions);
+	
+	post = teams_jsonobj_to_string(obj);
+	//POST to api.asm.skype.com  /v1/objects
+	//{"type":"sharing/file","permissions":{"8:eionrobb":["read"]},"filename":"GiantLobsterMoose.txt"}
+	
+	request = purple_http_request_new("https://" TEAMS_XFER_HOST "/v1/objects");
+	purple_http_request_set_method(request, "POST");
+	purple_http_request_set_keepalive_pool(request, sa->keepalive_pool);
+	purple_http_request_header_set_printf(request, "Authorization", "skype_token %s", sa->skype_token); //slightly different to normal!
+	purple_http_request_header_set(request, "Content-Type", "application/json");
+	purple_http_request_header_set(request, "X-Client-Version", TEAMS_CLIENTINFO_VERSION);
+	purple_http_request_set_contents(request, post, -1);
+	purple_http_request(sa->pc, request, teams_got_object_for_file, swft);
+	purple_http_request_unref(request);
+	
+	g_free(post);
+	json_object_unref(obj);
+	g_free(id);
+	g_free(basename);
+}
+
+PurpleXfer *
+teams_new_xfer(
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+PurpleProtocolXfer *prplxfer, 
+#endif
+PurpleConnection *pc, const char *who)
+{
+	TeamsAccount *sa = purple_connection_get_protocol_data(pc);
+	PurpleXfer *xfer;
+	TeamsFileTransfer *swft;
+	
+	xfer = purple_xfer_new(sa->account, PURPLE_XFER_TYPE_SEND, who);
+	
+	swft = g_new0(TeamsFileTransfer, 1);
+	swft->sa = sa;
+	swft->from = g_strdup(who);
+	swft->xfer = xfer;
+	purple_xfer_set_protocol_data(xfer, swft);
+	
+	purple_xfer_set_init_fnc(xfer, teams_xfer_send_init);
+	//purple_xfer_set_write_fnc(xfer, teams_xfer_send_write);
+	//purple_xfer_set_end_fnc(xfer, teams_xfer_send_end);
+	purple_xfer_set_request_denied_fnc(xfer, teams_free_xfer);
+	purple_xfer_set_cancel_send_fnc(xfer, teams_free_xfer);
+	
+	return xfer;
+}
+
+void
+teams_send_file(
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+PurpleProtocolXfer *prplxfer, 
+#endif
+PurpleConnection *pc, const gchar *who, const gchar *filename)
+{
+	PurpleXfer *xfer = teams_new_xfer(
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+		prplxfer, 
+#endif
+		pc, who);
+	
+	if (filename && *filename)
+		purple_xfer_request_accepted(xfer, filename);
+	else
+		purple_xfer_request(xfer);
+}
+
+
+void
+teams_chat_send_file(PurpleConnection *pc, int id, const char *filename)
+{
+	//TODO
+// 	PurpleConversation *conv = purple_find_chat(pc, id);
+// 	PurpleXfer *xfer = teams_new_xfer(
+// #if PURPLE_VERSION_CHECK(3, 0, 0)
+// 		prplxfer, 
+// #endif
+// 		pc, who);
+	
+// 	if (filename && *filename)
+// 		purple_xfer_request_accepted(xfer, filename);
+// 	else
+// 		purple_xfer_request(xfer);
+}
+
+gboolean
+teams_can_receive_file(
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+PurpleProtocolXfer *prplxfer, 
+#endif
+PurpleConnection *pc, const gchar *who)
+{
+	if (!who || g_str_equal(who, purple_account_get_username(purple_connection_get_account(pc))))
+		return FALSE;
+	
+	return TRUE;
+}
+
+gboolean
+teams_chat_can_receive_file(PurpleConnection *pc, int id)
+{
+	// Probably?
+	//return TRUE;
+	// But not until we implement it!
+	return FALSE;
+}
+
+
+#ifdef ENABLE_TEAMS_PERSONAL
+static void teams_get_skype_contacts_before_login(TeamsAccount *sa);
+#endif
+
+static void
+teams_got_self_details(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	JsonObject *userobj;
+	const gchar *old_alias;
+	const gchar *displayname = NULL;
+	const gchar *username;
+	
+	if (node == NULL || json_node_get_node_type(node) != JSON_NODE_OBJECT)
+		return;
+	userobj = json_node_get_object(node);
+	
+	/* Personal/TFL: only accounts migrated from a classic Skype account carry a
+	 * skypeName; personal accounts created later (MSN/Microsoft, post-merger) have
+	 * none and expose only primaryMemberName (the MSA MRI, e.g. "live:.cid.<hex>").
+	 * The stock code bailed when skypeName was absent, so teams_do_all_the_things()
+	 * never ran and login never completed (stayed offline). Fall back to
+	 * primaryMemberName when skypeName is absent so those accounts can finish login
+	 * and fetch the buddy list. */
+	if (json_object_has_member(userobj, "skypeName")) {
+		username = json_object_get_string_member(userobj, "skypeName");
+	} else if (json_object_has_member(userobj, "primaryMemberName")) {
+		username = json_object_get_string_member(userobj, "primaryMemberName");
+		purple_debug_info("teams", "No skypeName in self details; using primaryMemberName '%s' as identity\n", username ? username : "(null)");
+	} else {
+		purple_debug_error("teams", "No skypeName or primaryMemberName in self details\n");
+		return;
+	}
+	g_free(sa->username); sa->username = g_strdup(username);
+	purple_connection_set_display_name(sa->pc, sa->username);
+
+	old_alias = purple_account_get_private_alias(sa->account);
+	/* Consumer self-details omit userDetails entirely — guard the parse (the stock
+	 * json_decode_object(NULL) / has_member(NULL) path would misbehave). */
+	if ((!old_alias || !*old_alias) && json_object_has_member(userobj, "userDetails")) {
+		JsonObject *userDetails = json_decode_object(json_object_get_string_member(userobj, "userDetails"), -1);
+
+		if (userDetails) {
+			if (json_object_has_member(userDetails, "name"))
+				displayname = json_object_get_string_member(userDetails, "name");
+			if ((!displayname || purple_strequal(displayname, username)) && json_object_has_member(userDetails, "upn"))
+				displayname = json_object_get_string_member(userDetails, "upn");
+
+			if (displayname)
+				purple_account_set_private_alias(sa->account, displayname);
+
+			json_object_unref(userDetails);
+		}
+	}
+	
+	if (json_object_has_member(userobj, "primaryMemberName")) {
+		g_free(sa->primary_member_name);
+		sa->primary_member_name = g_strdup(json_object_get_string_member(userobj, "primaryMemberName"));
+	}
+	
+	/* Personal/TFL: gate on our own logged_in flag, NOT IS_CONNECTED. The
+	 * early-CONNECTED watchdog fix sets the connection CONNECTED during the device-
+	 * code wait, so an IS_CONNECTED check here would be true on the first pass and
+	 * skip teams_do_all_the_things() -> no friend list. logged_in is only set once
+	 * the full setup has actually run (else-branch of teams_do_all_the_things). */
+	if (!sa->logged_in) {
+#ifdef ENABLE_TEAMS_PERSONAL
+		/* Personal/TFL: load the Skype buddy roster into libpurple's blist BEFORE
+		 * we report the connection CONNECTED. A headless transport UI may run a
+		 * ONE-SHOT buddy-list consolidation the instant the login-state reaches
+		 * "retrieving-buddies" (i.e. at CONNECTED), reading the in-memory blist at
+		 * that exact moment — with no way to re-query. If our async contacts fetch lands after
+		 * that, Messaging caches an EMPTY buddy list forever. So fetch the contacts,
+		 * populate the blist, THEN connect. Falls through to teams_do_all_the_things()
+		 * even if the fetch fails, so login never hangs. */
+		teams_get_skype_contacts_before_login(sa);
+#else
+		teams_do_all_the_things(sa);
+#endif
+	}
+}
+
+
+void
+teams_get_self_details(TeamsAccount *sa)
+{
+	teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, TEAMS_CONTACTS_HOST, TEAMS_CONTACTS_PATH_PREFIX "/v1/users/ME/properties", NULL, teams_got_self_details, NULL, TRUE);
+}
+
+
+
+
+
+
+
+
+
+void
+teams_search_results_add_buddy(PurpleConnection *pc, GList *row, void *user_data)
+{
+	TeamsAccount *sa = purple_connection_get_protocol_data(pc);
+	PurpleAccount *account = purple_connection_get_account(pc);
+	PurpleGroup *group = teams_get_blist_group(sa);
+	const gchar *mri = g_list_nth_data(row, 0);
+	const gchar *displayName = g_list_nth_data(row, 1);
+	
+	mri = teams_strip_user_prefix(mri);
+
+	if (!purple_blist_find_buddy(account, mri)) {
+		purple_blist_request_add_buddy(account, mri, purple_group_get_name(group), displayName);
+	}
+}
+
+void
+teams_received_contacts(TeamsAccount *sa, PurpleXmlNode *contacts)
+{
+	PurpleNotifySearchResults *results;
+	PurpleNotifySearchColumn *column;
+
+	PurpleXmlNode *contact;
+	
+	results = purple_notify_searchresults_new();
+	if (results == NULL) {
+		return;
+	}
+		
+	/* columns: Friend ID, Name */
+	column = purple_notify_searchresults_column_new(_("Skype Name"));
+	purple_notify_searchresults_column_add(results, column);
+	column = purple_notify_searchresults_column_new(_("Display Name"));
+	purple_notify_searchresults_column_add(results, column);
+
+	
+	purple_notify_searchresults_button_add(results,
+			PURPLE_NOTIFY_BUTTON_ADD,
+			teams_search_results_add_buddy);
+	
+	for(contact = purple_xmlnode_get_child(contacts, "c"); contact;
+		contact = purple_xmlnode_get_next_twin(contact))
+	{
+		GList *row = NULL;
+
+		gchar *contact_id = g_strdup(purple_xmlnode_get_attrib(contact, "s"));
+		gchar *contact_name = g_strdup(purple_xmlnode_get_attrib(contact, "f"));
+
+		row = g_list_append(row, contact_id);
+		row = g_list_append(row, contact_name);
+
+		purple_notify_searchresults_row_add(results, row);
+	}
+	
+	purple_notify_searchresults(sa->pc, _("Received contacts"), NULL, NULL, results, NULL, NULL);
+}
+
+static PurpleNotifySearchResults*
+create_search_results(JsonNode *node, gint *olength)
+{
+	PurpleNotifySearchColumn *column;
+	gint index, length;
+	JsonObject *response = NULL;
+	JsonArray *resultsarray = NULL;
+	
+	response = json_node_get_object(node);
+	resultsarray = json_object_get_array_member(response, "results");
+	if (resultsarray == NULL) {
+		resultsarray = json_object_get_array_member(response, "value");
+	}
+	if (resultsarray == NULL) {
+		resultsarray = json_object_get_array_member(response, "values");
+	}
+	length = json_array_get_length(resultsarray);
+	
+	PurpleNotifySearchResults *results = purple_notify_searchresults_new();
+	if (results == NULL || length == 0)
+	{
+		if (olength)
+		{
+			*olength = 0;
+		}
+		return NULL;
+	}
+	
+	column = purple_notify_searchresults_column_new(_("ID"));
+	purple_notify_searchresults_column_add(results, column);
+	column = purple_notify_searchresults_column_new(_("Display Name"));
+	purple_notify_searchresults_column_add(results, column);
+	column = purple_notify_searchresults_column_new(_("Email"));
+	purple_notify_searchresults_column_add(results, column);
+	column = purple_notify_searchresults_column_new(_("Given Name"));
+	purple_notify_searchresults_column_add(results, column);
+	column = purple_notify_searchresults_column_new(_("Surname"));
+	purple_notify_searchresults_column_add(results, column);
+	
+	purple_notify_searchresults_button_add(results,
+			PURPLE_NOTIFY_BUTTON_ADD,
+			teams_search_results_add_buddy);
+	
+	for(index = 0; index < length; index++)
+	{
+		JsonObject *result = json_array_get_object_element(resultsarray, index);
+		JsonObject *contact = json_object_get_object_member(result, "nodeProfileData");
+		if (contact == NULL) {
+			contact = result;
+		}
+		
+		/* the row in the search results table */
+		/* prepend to it backwards then reverse to speed up adds */
+		GList *row = NULL;
+
+#define add_skypecontact_row(value) (\
+		row = g_list_prepend(row, \
+			!json_object_has_member(contact, (value)) ? NULL : \
+			g_strdup(json_object_get_string_member(contact, (value)))\
+		) \
+)		
+		add_skypecontact_row("mri");
+		add_skypecontact_row("email");
+		add_skypecontact_row("displayName");
+		add_skypecontact_row("givenName");
+		add_skypecontact_row("surname");
+		
+		row = g_list_reverse(row);
+		
+		purple_notify_searchresults_row_add(results, row);
+	}
+	
+	if (olength)
+	{
+		*olength = length;
+	}
+	return results;
+}
+
+static void
+teams_search_users_text_cb(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	gint length;
+	gchar *search_term = user_data;
+	PurpleNotifySearchResults *results = create_search_results(node, &length);
+	
+	if (results == NULL || length == 0)
+	{
+		gchar *primary_text = g_strdup_printf(_("Your search for the user \"%s\" returned no results"), search_term);
+		purple_notify_warning(sa->pc, _("No users found"), primary_text, "", purple_request_cpar_from_connection(sa->pc));
+		g_free(primary_text);
+		g_free(search_term);
+		return;
+	}
+	
+	purple_notify_searchresults(sa->pc, NULL, search_term, NULL, results, NULL, NULL);
+}
+
+void
+teams_search_users_text(gpointer user_data, const gchar *text)
+{
+	TeamsAccount *sa = user_data;
+	const gchar *url = TEAMS_PROFILES_PREFIX "users/searchV2?includeDLs=true&includeBots=true&searchExternalContacts=true&searchImplicitContacts=false&enableGuest=true&source=newChat&skypeTeamsInfo=true";
+	//https://teams.microsoft.com/api/mt/part/au-01/beta/users/emailaddressgoeshere@example.com/externalsearchv3?includeTFLUsers=true
+	//https://substrate.office.com/search/api/v1/suggestions?scenario=peoplepicker.addToChat&setflight=ServeEdContactsFromEdShards
+
+	//https://teams.live.com/api/mt/beta/users/searchUsers
+	// {"emails":["emailaddressgoeshere@example.com"],"phones":[]}
+	
+	teams_post_or_get(sa, TEAMS_METHOD_POST | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, url, text, teams_search_users_text_cb, g_strdup(text), TRUE);
+	
+}
+
+void
+teams_search_users(PurpleProtocolAction *action)
+{
+	PurpleConnection *pc = purple_protocol_action_get_connection(action);
+	TeamsAccount *sa = purple_connection_get_protocol_data(pc);
+	
+	purple_request_input(pc, _("Search for Teams Contacts"),
+					   _("Search for Teams Contacts"),
+					   NULL,
+					   NULL, FALSE, FALSE, NULL,
+					   _("_Search"), G_CALLBACK(teams_search_users_text),
+					   _("_Cancel"), NULL,
+					   purple_request_cpar_from_connection(pc),
+					   sa);
+
+}
+
+static void
+teams_cancel_work_location_response_cb(gpointer user_data, PurpleRequestFields *fields)
+{
+	GHashTable *buildings = user_data;
+	g_dataset_destroy(buildings);
+	g_hash_table_destroy(buildings);
+}
+
+static void
+teams_set_work_location_response_cb(gpointer user_data, PurpleRequestFields *fields)
+{
+	GHashTable *buildings = user_data;
+	TeamsAccount *sa = g_dataset_get_data(buildings, "account");
+	JsonObject *obj;
+	const gchar *selected_location = NULL;
+	gchar *post_data = NULL;
+
+	g_dataset_destroy(buildings);
+	
+	PurpleRequestField *field = purple_request_fields_get_field(fields, "set_work_location");
+	if (field != NULL) {
+		gint choice_value = purple_request_field_choice_get_value(field);
+		GList *labels = purple_request_field_choice_get_labels(field);
+		selected_location = g_list_nth_data(labels, choice_value);
+	}
+	
+	if (selected_location != NULL) {
+		const gchar *buildingId = g_hash_table_lookup(buildings, selected_location);
+		obj = json_object_new();
+		// Create a time string for the end of today
+		gchar *end_of_day = NULL;
+		time_t now = time(NULL);
+		struct tm *tm_info = localtime(&now);
+		tm_info->tm_hour = 23;
+		tm_info->tm_min = 59;
+		tm_info->tm_sec = 59;
+		end_of_day = g_strdup(purple_utf8_strftime("%Y-%m-%dT%H:%M:%S.999Z", tm_info));
+
+		if (buildingId != NULL || purple_strequal(selected_location, _("Office"))) {
+			obj = json_object_new();
+			json_object_set_int_member(obj, "location", 1);
+			json_object_set_string_member(obj, "expirationTime", end_of_day);
+			json_object_set_string_member(obj, "locationId", buildingId);
+			json_object_set_int_member(obj, "locationIdType", 1);
+		
+		} else if (purple_strequal(selected_location, _("Remote"))) {
+			json_object_set_int_member(obj, "location", 2);
+			json_object_set_string_member(obj, "expirationTime", end_of_day);
+		
+		} else {
+			json_object_set_int_member(obj, "location", 0);
+		}
+
+		post_data = teams_jsonobj_to_string(obj);
+		g_free(end_of_day);
+		json_object_unref(obj);
+		
+		// PUT to https://teams.microsoft.com/ups/apac/v1/me/workLocation/
+		const gchar *url = "/ups/apac/v1/me/workLocation/";
+		teams_post_or_get(sa, TEAMS_METHOD_PUT | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, url, post_data, NULL, NULL, TRUE);
+		g_free(post_data);
+	}
+	
+	g_hash_table_destroy(buildings);
+}
+
+static void
+teams_swl_got_building_info(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	JsonObject *obj, *data;
+	JsonArray *places;
+	gint index, length;
+	PurpleRequestFields *fields = purple_request_fields_new();
+	PurpleRequestFieldGroup *field_group = purple_request_field_group_new(NULL);
+	PurpleRequestField *field = purple_request_field_choice_new("set_work_location", _("Work Location"), 0);
+	GHashTable *buildings = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	g_dataset_set_data(buildings, "account", sa);
+
+	purple_request_field_choice_add(field, _("(Unset)"));
+	purple_request_field_choice_add(field, _("Office"));
+	purple_request_field_choice_add(field, _("Remote"));
+
+	if (node != NULL) {
+		obj = json_node_get_object(node);
+		data = json_object_get_object_member(obj, "data");
+		if (data != NULL) {
+				
+			places = json_object_get_array_member(data, "places");
+			if (places != NULL) {
+				length = json_array_get_length(places);
+				
+				for(index = 0; index < length; index++)
+				{
+					JsonObject *place = json_array_get_object_element(places, index);
+					const gchar *buildingName = json_object_get_string_member(place, "name");
+					const gchar *buildingId = json_object_get_string_member(place, "id");
+					purple_request_field_choice_add(field, buildingName);
+					g_hash_table_insert(buildings, g_strdup(buildingName), g_strdup(buildingId));
+				}
+			}
+		}
+	}
+	purple_request_field_group_add_field(field_group, field);
+	purple_request_fields_add_group(fields, field_group);
+
+	purple_request_fields(sa->pc,
+		_("Set Work Location"),
+		_("Select your work location from the options below:"),
+		NULL,
+		fields,
+		_("_Set"), G_CALLBACK(teams_set_work_location_response_cb),
+		_("_Cancel"), G_CALLBACK(teams_cancel_work_location_response_cb),
+		purple_request_cpar_from_connection(sa->pc),
+		buildings);
+}
+
+void
+teams_set_work_location_action(PurpleProtocolAction *action)
+{
+	PurpleConnection *pc = purple_protocol_action_get_connection(action);
+	TeamsAccount *sa = purple_connection_get_protocol_data(pc);
+	
+	// Grab building info from https://teams.microsoft.com/api/mt/part/au-01/v2.0/places/findPlaces?filterQuery=Type%20%3D%20%22Building%22
+	const gchar *url = "/api/mt/part/au-01/v2.0/places/findPlaces?filterQuery=Type%20%3D%20%22Building%22";
+	teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, url, NULL, teams_swl_got_building_info, NULL, TRUE);
+}
+
+// Number of friend profile entries to process per idle tick before yielding to
+// the GTK main loop. Keeps the UI responsive during large profile fetches.
+#define TEAMS_PROFILE_BATCH_SIZE 20
+
+typedef struct {
+	PurpleConnection *pc;
+	JsonArray *contacts;
+	gint next_index;
+	gint length;
+} TeamsBatchProfileData;
+
+static gboolean
+teams_process_profile_batch(gpointer user_data)
+{
+	TeamsBatchProfileData *data = user_data;
+
+	if (!PURPLE_IS_CONNECTION(data->pc) || !purple_connection_get_protocol_data(data->pc)) {
+		// Connection was dropped while we were idle, clean up and stop
+		json_array_unref(data->contacts);
+		g_free(data);
+		return G_SOURCE_REMOVE;
+	}
+
+	TeamsAccount *sa = purple_connection_get_protocol_data(data->pc);
+	PurpleGroup *group = teams_get_blist_group(sa);
+	gint end_index = MIN(data->next_index + TEAMS_PROFILE_BATCH_SIZE, data->length);
+	gint index;
+
+	for (index = data->next_index; index < end_index; index++) {
+		JsonObject *contact = json_array_get_object_element(data->contacts, index);
+
+		const gchar *mri = json_object_get_string_member(contact, "mri");
+		const gchar *username = teams_strip_user_prefix(mri);
+		const gchar *new_avatar;
+		const gchar *displayName = json_object_get_string_member(contact, "displayName");
+		const gchar *givenName = json_object_get_string_member(contact, "givenName");
+		const gchar *tenantName = json_object_get_string_member(contact, "tenantName");
+		const gchar *userType = json_object_get_string_member(contact, "type");
+		PurpleBuddy *buddy;
+		TeamsBuddy *sbuddy;
+
+		if (!username || !*username) {
+			continue;
+		}
+
+		buddy = purple_blist_find_buddy(sa->account, username);
+		if (!buddy) {
+			buddy = purple_buddy_new(sa->account, username, NULL);
+			purple_blist_add_buddy(buddy, NULL, group, NULL);
+		}
+
+		sbuddy = purple_buddy_get_protocol_data(buddy);
+		if (sbuddy == NULL) {
+			sbuddy = g_new0(TeamsBuddy, 1);
+			purple_buddy_set_protocol_data(buddy, sbuddy);
+			sbuddy->skypename = g_strdup(username);
+			sbuddy->sa = sa;
+		}
+
+		if (displayName && *displayName) {
+			g_free(sbuddy->display_name);
+			sbuddy->display_name = g_strdup(displayName);
+			if (!purple_strequal(purple_buddy_get_local_alias(buddy), sbuddy->display_name)) {
+				purple_serv_got_alias(sa->pc, username, sbuddy->display_name);
+			}
+		}
+
+		if (givenName && *givenName && !purple_strequal(json_object_get_string_member(contact, "email"), givenName)) {
+			g_free(sbuddy->fullname);
+			if (json_object_has_member(contact, "surname")) {
+				gchar *fullname = g_strconcat(givenName, " ", json_object_get_string_member(contact, "surname"), NULL);
+
+				if (fullname && *fullname) {
+					purple_buddy_set_server_alias(buddy, fullname);
+				}
+
+				sbuddy->fullname = fullname;
+			} else {
+				purple_buddy_set_server_alias(buddy, givenName);
+				sbuddy->fullname = g_strdup(givenName);
+			}
+		}
+
+		if (tenantName && *tenantName) {
+			// Better than nine ants
+			g_free(sbuddy->tenant);
+			sbuddy->tenant = g_strdup(tenantName);
+		}
+
+		if (userType && *userType) {
+			// Kind of like blood type but not as tasty
+			g_free(sbuddy->user_type);
+			sbuddy->user_type = g_strdup(userType);
+		}
+
+		// Only bots have images
+		new_avatar = json_object_get_string_member(contact, "imageUri");
+		if (new_avatar && *new_avatar && (!sbuddy->avatar_url || !g_str_equal(sbuddy->avatar_url, new_avatar))) {
+			g_free(sbuddy->avatar_url);
+			sbuddy->avatar_url = g_strdup(new_avatar);
+		}
+		teams_get_icon(buddy);
+	}
+
+	data->next_index = end_index;
+
+	if (data->next_index >= data->length) {
+		// All entries processed
+		json_array_unref(data->contacts);
+		g_free(data);
+		return G_SOURCE_REMOVE;
+	}
+
+	// More entries remain. Yield to the main loop and continue next tick.
+	return G_SOURCE_CONTINUE;
+}
+
+static void
+teams_got_friend_profiles(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	JsonObject *obj;
+	JsonArray *contacts;
+
+	if (node == NULL)
+		return;
+	obj = json_node_get_object(node);
+	contacts = json_object_get_array_member(obj, "value");
+	if (contacts == NULL) {
+		contacts = json_object_get_array_member(obj, "resolvedUsers");
+	}
+	if (contacts == NULL || json_array_get_length(contacts) == 0) {
+		return;
+	}
+
+	TeamsBatchProfileData *data = g_new0(TeamsBatchProfileData, 1);
+	data->pc = sa->pc;
+	data->contacts = json_array_ref(contacts);
+	data->next_index = 0;
+	data->length = (gint)json_array_get_length(contacts);
+
+	g_idle_add(teams_process_profile_batch, data);
+}
+
+void
+teams_get_friend_profiles(TeamsAccount *sa, GSList *contacts)
+{
+	//TODO users/fetch?isMailAddress=false&skypeTeamsInfo=true&includeIBBarredUsers=true
+	const gchar *profiles_url = TEAMS_PROFILES_PREFIX "users/fetchShortProfile?isMailAddress=false&canBeSmtpAddress=false&enableGuest=true&includeIBBarredUsers=true&skypeTeamsInfo=true&includeBots=true";
+	const gchar *federated_profiles_url = TEAMS_PROFILES_PREFIX "users/fetchFederated";
+	const gchar *skype_profiles_url = TEAMS_PROFILES_PREFIX "users/fetchTflConsumers?edEnabled=false&includeDisabledAccounts=true";
+	GString *postdata;
+	GSList *cur = contacts;
+	const gchar *user_prefix;
+	const gint max_contacts = 900;
+	gint count = 0;
+
+	if (contacts == NULL)
+		return;
+
+	postdata = g_string_new("[\"\"");
+
+	do {
+		user_prefix = teams_user_url_prefix(cur->data);
+		if (g_str_equal(user_prefix, "8:") && strncmp(cur->data, "orgid:", 6) != 0) continue;
+		// Skip contacts whose profiles have already been fetched to avoid duplicate
+		// HTTP requests and the server-side throttling they cause.
+		if (g_hash_table_lookup(sa->fetched_profiles, (gconstpointer) cur->data) != NULL) continue;
+		g_hash_table_insert(sa->fetched_profiles, g_strdup(cur->data), GUINT_TO_POINTER(TRUE));
+		g_string_append_printf(postdata, ",\"%s%s\"", user_prefix, (gchar *) cur->data);
+		count++;
+
+		if (count >= max_contacts) {
+			g_string_append(postdata, "]");
+			teams_post_or_get(sa, TEAMS_METHOD_POST | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, profiles_url, postdata->str, teams_got_friend_profiles, NULL, TRUE);
+			teams_post_or_get(sa, TEAMS_METHOD_POST | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, federated_profiles_url, postdata->str, teams_got_friend_profiles, NULL, TRUE);
+			teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, skype_profiles_url, postdata->str, teams_got_friend_profiles, NULL, TRUE);
+			g_string_free(postdata, TRUE);
+
+			postdata = g_string_new("[\"\"");
+			count = 0;
+		}
+	} while((cur = g_slist_next(cur)));
+
+	if (count > 0) {	
+		g_string_append(postdata, "]");
+	
+		teams_post_or_get(sa, TEAMS_METHOD_POST | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, profiles_url, postdata->str, teams_got_friend_profiles, NULL, TRUE);
+		teams_post_or_get(sa, TEAMS_METHOD_POST | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, federated_profiles_url, postdata->str, teams_got_friend_profiles, NULL, TRUE);
+		teams_post_or_get(sa, TEAMS_METHOD_POST | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, skype_profiles_url, postdata->str, teams_got_friend_profiles, NULL, TRUE);
+	}
+
+	g_string_free(postdata, TRUE);
+}
+
+
+static void
+teams_got_info(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	gchar *username = user_data;
+	PurpleNotifyUserInfo *user_info;
+	JsonObject *userobj;
+	PurpleBuddy *buddy;
+	
+	if (node == NULL)
+		return;
+	if (json_node_get_node_type(node) == JSON_NODE_ARRAY)
+		node = json_array_get_element(json_node_get_array(node), 0);
+	if (json_node_get_node_type(node) != JSON_NODE_OBJECT)
+		return;
+	userobj = json_node_get_object(node);
+	if (json_object_has_member(userobj, "value")) {
+		node = json_object_get_member(userobj, "value");
+		
+		if (json_node_get_node_type(node) == JSON_NODE_ARRAY)
+			node = json_array_get_element(json_node_get_array(node), 0);
+		userobj = json_node_get_object(node);
+	} else if (json_object_has_member(userobj, "resolvedUsers")) {
+		node = json_object_get_member(userobj, "resolvedUsers");
+		
+		if (json_node_get_node_type(node) == JSON_NODE_ARRAY)
+			node = json_array_get_element(json_node_get_array(node), 0);
+		userobj = json_node_get_object(node);
+	}
+	
+	if (!json_object_has_member(userobj, "mri")) {
+		return;
+	}
+	
+	if (!username || !*username) {
+		const gchar *mri = json_object_get_string_member(userobj, "mri");
+		g_free(username);
+		username = g_strdup(teams_strip_user_prefix(mri));
+	}
+	if (!username || !*username) {
+		g_free(username);
+		return;
+	}
+	
+	user_info = purple_notify_user_info_new();
+	
+#define _SKYPE_USER_INFO(prop, key) if (prop && json_object_has_member(userobj, (prop)) && !json_object_get_null_member(userobj, (prop))) \
+	purple_notify_user_info_add_pair_html(user_info, _(key), json_object_get_string_member(userobj, (prop)));
+	
+	_SKYPE_USER_INFO("givenName", "First Name");
+	_SKYPE_USER_INFO("surname", "Last Name");
+	_SKYPE_USER_INFO("email", "Email");
+	_SKYPE_USER_INFO("tenantName", "Tenant");
+	_SKYPE_USER_INFO("displayName", "Display Name");
+	_SKYPE_USER_INFO("type", "User Type");
+	_SKYPE_USER_INFO("jobTitle", "Job Title");
+	_SKYPE_USER_INFO("department", "Department");
+	_SKYPE_USER_INFO("userLocation", "Location");
+
+	buddy = purple_blist_find_buddy(sa->account, username);
+	if (buddy) {
+		const gchar *firstname = json_object_get_string_member(userobj, "givenName");
+		const gchar *surname = json_object_get_string_member(userobj, "surname");
+		const gchar *display_name = json_object_get_string_member(userobj, "displayName");
+		const gchar *tenantName = json_object_get_string_member(userobj, "tenantName");
+		const gchar *userType = json_object_get_string_member(userobj, "type");
+		TeamsBuddy *sbuddy = purple_buddy_get_protocol_data(buddy);
+		
+		if (sbuddy == NULL) {
+			
+			sbuddy = g_new0(TeamsBuddy, 1);
+			sbuddy->skypename = g_strdup(username);
+			sbuddy->sa = sa;
+			
+			sbuddy->buddy = buddy;
+			purple_buddy_set_protocol_data(buddy, sbuddy);
+			
+		}
+		
+		if (tenantName && *tenantName) {
+			g_free(sbuddy->tenant);
+			sbuddy->tenant = g_strdup(tenantName);
+		}
+		if (userType && *userType) {
+			g_free(sbuddy->user_type);
+			sbuddy->user_type = g_strdup(userType);
+		}
+		
+		if (display_name && *display_name) {
+			g_free(sbuddy->display_name);
+			sbuddy->display_name = g_strdup(display_name);
+			if (sbuddy->display_name && *sbuddy->display_name && !purple_strequal(purple_buddy_get_local_alias(buddy), sbuddy->display_name)) {
+				purple_serv_got_alias(sa->pc, username, sbuddy->display_name);
+			}
+		}
+		if (firstname && *firstname && !purple_strequal(json_object_get_string_member(userobj, "email"), firstname)) {
+			g_free(sbuddy->fullname);
+			sbuddy->fullname = g_strconcat(firstname, (surname ? " " : NULL), surname, NULL);
+			if (sbuddy->fullname && *sbuddy->fullname && !purple_strequal(purple_buddy_get_server_alias(buddy), sbuddy->fullname)) {
+				purple_buddy_set_server_alias(buddy, sbuddy->fullname);
+			}
+		}
+
+		// Force download their avatar again
+		teams_get_icon_now(buddy);
+		// Force update their online status
+		teams_subscribe_to_single_contact_status(sa, username);
+	}
+	
+	purple_notify_userinfo(sa->pc, username, user_info, NULL, NULL);
+	
+	g_free(username);
+}
+
+void
+teams_get_info(PurpleConnection *pc, const gchar *username)
+{
+	TeamsAccount *sa = purple_connection_get_protocol_data(pc);
+	gchar *url = NULL;
+	gchar *postdata;
+	
+	url = g_strconcat(TEAMS_PROFILES_PREFIX, "users/", teams_user_url_prefix(username), purple_url_encode(username), "/?throwIfNotFound=false&isMailAddress=false&enableGuest=true&includeIBBarredUsers=true&skypeTeamsInfo=true&includeBots=true", NULL);
+	
+	teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, url, NULL, teams_got_info, g_strdup(username), TRUE);
+	
+	g_free(url);
+	
+	// Check if the user is a Skype user
+	if (!g_str_has_prefix(username, "orgid:")) {
+		url = TEAMS_PROFILES_PREFIX "users/fetchTflConsumers?edEnabled=false&includeDisabledAccounts=true";
+		postdata = g_strconcat("[\"", teams_user_url_prefix(username), username, "\"]", NULL);
+		teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, url, postdata, teams_got_info, g_strdup(username), TRUE);
+		g_free(postdata);
+		return;
+	}
+	
+	// just in case they're a user on a different tenant:
+
+	url = TEAMS_PROFILES_PREFIX "users/fetchFederated";
+	
+	postdata = g_strconcat("[\"", teams_user_url_prefix(username), username, "\"]", NULL);
+	
+	teams_post_or_get(sa, TEAMS_METHOD_POST | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, url, postdata, teams_got_info, g_strdup(username), TRUE);
+	
+	//TODO users/fetch?isMailAddress=false&skypeTeamsInfo=true&includeIBBarredUsers=true
+
+	g_free(postdata);
+
+	//TODO deleted users
+	//https://aus.loki.delve.office.com/api/v3/personacards?viewType=Card&personaType=User&ConvertGetPost=true&teamsMri=8%3Aorgid%3A...
+	// {
+	// 	"Card": {
+	// 		"headerInfo": {
+	// 		"attributedUserHeaderInfo": {
+	// 			"displayName": {
+	// 				"value": "... Deleted User Name ...",
+	// 				"source": "Directory"
+	// 			},
+	// 		}
+	// 	}
+	// }
+}
+
+void
+teams_get_friend_profile(TeamsAccount *sa, const gchar *who)
+{
+	GSList *contacts = NULL;
+	gchar *whodup;
+	
+	g_return_if_fail(sa && who && *who);
+	
+	whodup = g_strdup(who);
+	contacts = g_slist_prepend(contacts, whodup);
+	
+	teams_get_friend_profiles(sa, contacts);
+	
+	g_free(contacts);
+	g_free(whodup);
+}
+
+PurpleChat *
+teams_find_chat_from_node(const PurpleAccount *account, const char *id, PurpleBlistNode *root)
+{
+	PurpleBlistNode *node;
+
+	for (
+		node = root;
+		node != NULL;
+		node = purple_blist_node_next(node, TRUE)
+	) {
+		if (PURPLE_IS_CHAT(node)) {
+			PurpleChat *chat = PURPLE_CHAT(node);
+
+			if (purple_chat_get_account(chat) != account) {
+				continue;
+			}
+
+			GHashTable *components = purple_chat_get_components(chat);
+			const gchar *chat_id = g_hash_table_lookup(components, "chatname");
+
+			if (purple_strequal(chat_id, id)) {
+				return chat;
+			}
+		}
+	}
+
+	return NULL;
+}
+
+PurpleChat *
+teams_find_chat(PurpleAccount *account, const char *id)
+{
+	return teams_find_chat_from_node(account, id, purple_blist_get_root());
+}
+
+static void
+teams_purge_meeting_chats_from_blist(TeamsAccount *sa)
+{
+	if (!purple_account_get_bool(sa->account, "hide_meeting_chats", FALSE)) {
+		return;
+	}
+
+	PurpleBlistNode *node = purple_blist_get_root();
+	while (node != NULL) {
+		PurpleBlistNode *next = purple_blist_node_next(node, TRUE);
+		if (PURPLE_IS_CHAT(node)) {
+			PurpleChat *chat = PURPLE_CHAT(node);
+			if (purple_chat_get_account(chat) == sa->account) {
+				GHashTable *components = purple_chat_get_components(chat);
+				const gchar *chat_id = g_hash_table_lookup(components, "chatname");
+				if (TEAMS_CHAT_IS_MEETING(chat_id)) {
+					purple_blist_remove_chat(chat);
+				}
+			}
+		}
+		node = next;
+	}
+}
+
+
+PurpleChat *
+teams_find_chat_in_group(PurpleAccount *account, const char *id, PurpleGroup *group)
+{
+	g_return_val_if_fail(group != NULL, NULL);
+
+	return teams_find_chat_from_node(account, id, PURPLE_BLIST_NODE(group));
+}
+
+static void
+teams_get_friend_list_teams_cb(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	JsonObject *obj;
+	JsonArray *teams, *chats, *users;
+	guint index, length;
+	PurpleGroup *group = teams_get_blist_group(sa);
+	GSList *users_to_fetch = NULL;
+	GSList *users_to_subscribe = NULL;
+	PurpleBuddy *buddy;
+
+	if (node == NULL)
+		return;
+
+	obj = json_node_get_object(node);
+
+	// Group chats
+	chats = json_object_get_array_member(obj, "chats");
+	length = json_array_get_length(chats);
+	for(index = 0; index < length; index++)
+	{
+		JsonObject *chat = json_array_get_object_element(chats, index);
+		const gchar *id = json_object_get_string_member(chat, "id");
+		gboolean is_one_on_one = json_object_get_boolean_member(chat, "isOneOnOne");
+		JsonObject *relationshipState = json_object_get_object_member(chat, "relationshipState");
+
+		if (relationshipState) {
+			gboolean inQuarantine = json_object_get_boolean_member(relationshipState, "inQuarantine");
+			const gchar *blockTime = json_object_get_string_member(relationshipState, "blockTime");
+
+			if (inQuarantine || blockTime != NULL) {
+				// Probably spam, or pending spam
+				continue;
+			}
+		}
+		
+		if (is_one_on_one) {
+			JsonArray *members = json_object_get_array_member(chat, "members");
+			guint members_len = json_array_get_length(members);
+			if (members_len < 1) continue;
+			JsonObject *member = json_array_get_object_element(members, 0);
+			const gchar *mri = json_object_get_string_member(member, "mri");
+			if (mri == NULL) continue;
+			const gchar *buddyid = teams_strip_user_prefix(mri);
+			
+			if (teams_is_user_self(sa, buddyid)) {
+				// There were two in the bed and the little one said....
+				if (members_len < 2) {
+					// ... goodnight!
+					continue;
+				}
+				member = json_array_get_object_element(members, 1);
+				if (member == NULL) {
+					continue;
+				}
+				mri = json_object_get_string_member(member, "mri");
+				if (mri == NULL) continue;
+				buddyid = teams_strip_user_prefix(mri);
+			}
+
+			if (!buddyid || !*buddyid) continue;
+
+			users_to_fetch = g_slist_prepend(users_to_fetch, g_strdup(buddyid));
+			users_to_subscribe = g_slist_prepend(users_to_subscribe, g_strdup(buddyid));
+			
+			//Create an array of one to one mappings for IMs
+			if (!g_hash_table_contains(sa->buddy_to_chat_lookup, buddyid)) {
+				// If we already have a buddy -> chat mapping, then it's probably more valid than the new one we're trying to add
+				g_hash_table_insert(sa->buddy_to_chat_lookup, g_strdup(buddyid), g_strdup(id));
+			}
+			g_hash_table_insert(sa->chat_to_buddy_lookup, g_strdup(id), g_strdup(buddyid));
+			
+			buddy = purple_blist_find_buddy(sa->account, buddyid);
+			if (!buddy)
+			{
+				buddy = purple_buddy_new(sa->account, buddyid, NULL);
+				purple_blist_add_buddy(buddy, NULL, group, NULL);
+			}
+			
+		} else {
+			const gchar *title = json_object_get_string_member(chat, "title");
+			PurpleChat *purple_chat = teams_find_chat(sa->account, id);
+			
+			if (TEAMS_CHAT_IS_MEETING(id) && purple_account_get_bool(sa->account, "hide_meeting_chats", FALSE)) {
+				continue;
+			}
+			
+			if (purple_chat == NULL) {
+				GHashTable *components = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+				g_hash_table_replace(components, g_strdup("chatname"), g_strdup(id));
+				
+				purple_chat = purple_chat_new(sa->account, title, components);
+				purple_blist_add_chat(purple_chat, group, NULL);
+				
+			} else {
+				purple_chat_set_alias(purple_chat, title);
+				
+			}
+			
+			if (!TEAMS_CHAT_IS_MEETING(id)) {
+				JsonArray *members = json_object_get_array_member(chat, "members");
+				guint members_index, members_length = json_array_get_length(members);
+
+				for(members_index = 0; members_index < members_length; members_index++)
+				{
+					JsonObject *member = json_array_get_object_element(members, members_index);
+					const gchar *mri = json_object_get_string_member(member, "mri");
+					const gchar *buddyid = teams_strip_user_prefix(mri);
+
+					users_to_fetch = g_slist_prepend(users_to_fetch, g_strdup(buddyid));
+				}
+			}
+		}
+	}
+	
+	// Teams
+	teams = json_object_get_array_member(obj, "teams");
+	// TODO treat as a group with channels within?
+	(void) teams;
+	
+	// Users
+	users = json_object_get_array_member(obj, "users");
+	(void) users;
+
+	if (users_to_fetch)
+	{
+		teams_get_friend_profiles(sa, users_to_fetch);
+		g_slist_free_full(users_to_fetch, g_free);
+	}
+	if (users_to_subscribe)
+	{
+		teams_subscribe_to_contact_status(sa, users_to_subscribe);
+		g_slist_free_full(users_to_subscribe, g_free);
+	}
+}
+
+static void
+teams_lookup_buddy_list_contacts(TeamsAccount *sa)
+{
+	GSList *users_to_fetch = NULL;
+	// Find everyone on the buddy list to lookup
+	PurpleBlistNode *bnode;
+	for (bnode = purple_blist_get_root();
+	     bnode != NULL;
+		 bnode = purple_blist_node_next(bnode, TRUE)) {
+		if (PURPLE_IS_BUDDY(bnode)) {
+			PurpleBuddy *buddy = PURPLE_BUDDY(bnode);
+			const gchar *name;
+			if (purple_buddy_get_account(buddy) != sa->account) {
+				continue;
+			}
+			
+			name = purple_buddy_get_name(buddy);
+			users_to_fetch = g_slist_prepend(users_to_fetch, g_strdup(name));
+		}
+	}
+
+	if (users_to_fetch)
+	{
+		teams_get_friend_profiles(sa, users_to_fetch);
+		teams_subscribe_to_contact_status(sa, users_to_fetch);
+		g_slist_free_full(users_to_fetch, g_free);
+	}
+}
+
+static void
+teams_get_friend_suggestions_cb(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	JsonObject *obj, *firstgroup;
+	JsonArray *groups, *suggestions;
+	PurpleGroup *group = teams_get_blist_group(sa);
+	GSList *users_to_fetch = NULL;
+	guint index, length;
+
+	if (node == NULL || json_node_get_node_type(node) != JSON_NODE_OBJECT)
+		return;
+
+	obj = json_node_get_object(node);
+	groups = json_object_get_array_member(obj, "Groups");
+	/* webOS: "Groups" can be absent/empty (guarded macro -> NULL) - bound the index-0 access
+	 * (raw json_array_get_object_element asserts 'array != NULL' - the residual suggestions-fetch
+	 * criticals). No groups -> nothing to suggest. */
+	firstgroup = (json_array_get_length(groups) >= 1) ? json_array_get_object_element(groups, 0) : NULL;
+	if (firstgroup == NULL)
+		return;
+	suggestions = json_object_get_array_member(firstgroup, "Suggestions");
+	length = json_array_get_length(suggestions);
+	
+	for(index = 0; index < length; index++)
+	{
+		JsonObject *contact = json_array_get_object_element(suggestions, index);
+		const gchar *mri = json_object_get_string_member(contact, "MRI");
+		const gchar *display_name = json_object_get_string_member(contact, "DisplayName");
+		const gchar *firstname = json_object_get_string_member(contact, "GivenName");
+		const gchar *surname = json_object_get_string_member(contact, "Surname");
+		
+		PurpleBuddy *buddy;
+		const gchar *id;
+		
+		id = teams_strip_user_prefix(mri);
+		if (!id || !*id) continue;
+		
+		buddy = purple_blist_find_buddy(sa->account, id);
+		if (!buddy)
+		{
+			buddy = purple_buddy_new(sa->account, id, display_name);
+			purple_blist_add_buddy(buddy, NULL, group, NULL);
+		}
+
+		TeamsBuddy *sbuddy = purple_buddy_get_protocol_data(buddy);
+		if (sbuddy == NULL) {
+			sbuddy = g_new0(TeamsBuddy, 1);
+			sbuddy->skypename = g_strdup(id);
+			sbuddy->sa = sa;
+			
+			sbuddy->buddy = buddy;
+			purple_buddy_set_protocol_data(buddy, sbuddy);
+		}
+
+		if (firstname && *firstname) {
+			g_free(sbuddy->fullname);
+			sbuddy->fullname = g_strconcat(firstname, (surname ? " " : NULL), surname, NULL);
+		}
+		if (display_name && *display_name) {
+			g_free(sbuddy->display_name);
+			sbuddy->display_name = g_strdup(display_name);
+		}
+		
+		if (sbuddy->display_name && *sbuddy->display_name && !purple_strequal(purple_buddy_get_local_alias(buddy), sbuddy->display_name)) {
+			purple_serv_got_alias(sa->pc, id, sbuddy->display_name);
+		}
+		if (sbuddy->fullname && *sbuddy->fullname && !purple_strequal(purple_buddy_get_server_alias(buddy), sbuddy->fullname)) {
+			purple_buddy_set_server_alias(buddy, sbuddy->fullname);
+		}
+		
+		teams_get_icon(buddy);
+		users_to_fetch = g_slist_prepend(users_to_fetch, sbuddy->skypename);
+		
+		if (purple_strequal(id, sa->primary_member_name)) {
+			g_free(sa->self_display_name);
+			sa->self_display_name = g_strdup(display_name);
+		}
+	}
+	
+	if (users_to_fetch)
+	{
+		teams_get_friend_profiles(sa, users_to_fetch);
+		teams_subscribe_to_contact_status(sa, users_to_fetch);
+		g_slist_free(users_to_fetch);
+	}
+}
+
+static void
+teams_get_workingwith_cb(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	JsonObject *obj;
+	JsonArray *contacts;
+	PurpleGroup *group = teams_get_blist_group(sa);
+	GSList *users_to_fetch = NULL;
+	guint index, length;
+
+	if (node == NULL)
+		return;
+
+	obj = json_node_get_object(node);
+	contacts = json_object_get_array_member(obj, "value");
+	length = json_array_get_length(contacts);
+	
+	for(index = 0; index < length; index++)
+	{
+		JsonObject *contact = json_array_get_object_element(contacts, index);
+		const gchar *aadObjectId = json_object_get_string_member(contact, "aadObjectId");
+		const gchar *full_name = json_object_get_string_member(contact, "fullName");
+		
+		if (!aadObjectId || !*aadObjectId) continue;
+
+		PurpleBuddy *buddy;
+		gchar *id;
+		
+		id = g_strconcat("orgid:", aadObjectId, NULL);
+		
+		buddy = purple_blist_find_buddy(sa->account, id);
+		if (!buddy)
+		{
+			buddy = purple_buddy_new(sa->account, id, full_name);
+			purple_blist_add_buddy(buddy, NULL, group, NULL);
+		}
+		
+		TeamsBuddy *sbuddy = purple_buddy_get_protocol_data(buddy);
+		if (sbuddy == NULL) {
+			sbuddy = g_new0(TeamsBuddy, 1);
+			sbuddy->skypename = g_strdup(id);
+			sbuddy->sa = sa;
+			
+			sbuddy->buddy = buddy;
+			purple_buddy_set_protocol_data(buddy, sbuddy);
+		}
+		
+		if(full_name && *full_name && !purple_strequal(sbuddy->fullname, full_name)) {
+			g_free(sbuddy->fullname);
+			sbuddy->fullname = g_strdup(full_name);
+			if (!purple_strequal(purple_buddy_get_server_alias(buddy), sbuddy->fullname)) {
+				purple_buddy_set_server_alias(buddy, sbuddy->fullname);
+			}
+		}
+
+		g_free(id);
+		
+		teams_get_icon(buddy);
+		users_to_fetch = g_slist_prepend(users_to_fetch, sbuddy->skypename);
+	}
+	
+	if (users_to_fetch)
+	{
+		teams_get_friend_profiles(sa, users_to_fetch);
+		teams_subscribe_to_contact_status(sa, users_to_fetch);
+		g_slist_free(users_to_fetch);
+	}
+
+}
+
+static void
+teams_get_friend_list_cb(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	JsonObject *obj;
+	JsonArray *contacts;
+	PurpleGroup *group = teams_get_blist_group(sa);
+	GSList *users_to_fetch = NULL;
+	guint index, length;
+
+	if (node == NULL)
+		return;
+
+	obj = json_node_get_object(node);
+	contacts = json_object_get_array_member(obj, "value");
+	length = json_array_get_length(contacts);
+	
+	for(index = 0; index < length; index++)
+	{
+		JsonObject *contact = json_array_get_object_element(contacts, index);
+		const gchar *type = json_object_get_string_member(contact, "type");
+		
+		if (purple_strequal(type, "Group")) {
+			continue;
+		}
+		
+		const gchar *mri = json_object_get_string_member(contact, "mri");
+		const gchar *display_name = json_object_get_string_member(contact, "displayName");
+		// const gchar *avatar_url = NULL;
+		// gboolean authorized = json_object_get_boolean_member(contact, "authorized");
+		// gboolean blocked = json_object_get_boolean_member(contact, "blocked");
+		
+		// const gchar *mood = json_object_get_string_member(profile, "mood");
+		// JsonObject *name = json_object_get_object_member(profile, "name");
+		const gchar *firstname = json_object_get_string_member(contact, "givenName");
+		const gchar *surname = json_object_get_string_member(contact, "surname");
+		
+		PurpleBuddy *buddy;
+		const gchar *id;
+		
+		id = teams_strip_user_prefix(mri);
+		if (!id || !*id) continue;
+
+		if (!display_name && !firstname && !surname && json_object_has_member(contact, "name")) {
+			JsonObject *name = json_object_get_object_member(contact, "name");
+			display_name = json_object_get_string_member(name, "displayName");
+			firstname = json_object_get_string_member(name, "givenName");
+			surname = json_object_get_string_member(name, "surname");
+		}
+		
+		buddy = purple_blist_find_buddy(sa->account, id);
+		if (!buddy)
+		{
+			buddy = purple_buddy_new(sa->account, id, display_name);
+			purple_blist_add_buddy(buddy, NULL, group, NULL);
+		}
+
+		TeamsBuddy *sbuddy = purple_buddy_get_protocol_data(buddy);
+		if (sbuddy == NULL) {
+			sbuddy = g_new0(TeamsBuddy, 1);
+			sbuddy->skypename = g_strdup(id);
+			sbuddy->sa = sa;
+			
+			sbuddy->buddy = buddy;
+			purple_buddy_set_protocol_data(buddy, sbuddy);
+		}
+		
+		if (firstname && *firstname) {
+			g_free(sbuddy->fullname);
+			sbuddy->fullname = g_strconcat(firstname, (surname ? " " : NULL), surname, NULL);
+		}
+		if (display_name && *display_name) {
+			g_free(sbuddy->display_name);
+			sbuddy->display_name = g_strdup(display_name);
+		}
+		
+		if (sbuddy->display_name && *sbuddy->display_name && !purple_strequal(purple_buddy_get_local_alias(buddy), sbuddy->display_name)) {
+			purple_serv_got_alias(sa->pc, id, sbuddy->display_name);
+		}
+		if (sbuddy->fullname && *sbuddy->fullname && !purple_strequal(purple_buddy_get_server_alias(buddy), sbuddy->fullname)) {
+			purple_buddy_set_server_alias(buddy, sbuddy->fullname);
+		}
+		
+		// if (json_object_has_member(profile, "avatar_url")) {
+			// avatar_url = json_object_get_string_member(profile, "avatar_url");
+			// if (avatar_url && *avatar_url && (!sbuddy->avatar_url || !g_str_equal(sbuddy->avatar_url, avatar_url))) {
+				// g_free(sbuddy->avatar_url);
+				// sbuddy->avatar_url = g_strdup(avatar_url);			
+				// teams_get_icon(buddy);
+			// }
+		// }
+		teams_get_icon(buddy);
+		
+		// if (blocked == TRUE) {
+			// purple_account_privacy_deny_add(sa->account, id, TRUE);
+		// } else {
+			users_to_fetch = g_slist_prepend(users_to_fetch, sbuddy->skypename);
+		// }
+		
+		if (purple_strequal(id, sa->primary_member_name)) {
+			g_free(sa->self_display_name);
+			sa->self_display_name = g_strdup(display_name);
+		}
+	}
+	
+	if (users_to_fetch)
+	{
+		teams_get_friend_profiles(sa, users_to_fetch);
+		teams_subscribe_to_contact_status(sa, users_to_fetch);
+		g_slist_free(users_to_fetch);
+	}
+}
+
+static void
+teams_get_buddylist_cb(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	JsonObject *obj;
+	JsonArray *values;
+	PurpleGroup *group = teams_get_blist_group(sa);
+	GSList *users_to_fetch = NULL;
+	guint index, length;
+
+	if (node == NULL)
+		return;
+
+	obj = json_node_get_object(node);
+	values = json_object_get_array_member(obj, "value");
+	length = json_array_get_length(values);
+	
+	for(index = 0; index < length; index++)
+	{
+		JsonObject *buddygroup = json_array_get_object_element(values, index);
+		//TODO  groupType, displayName
+		JsonArray *buddies = json_object_get_array_member(buddygroup, "buddies");
+		guint buddy_index, buddy_length = json_array_get_length(buddies);
+
+		for(buddy_index = 0; buddy_index < buddy_length; buddy_index++)
+		{
+			JsonObject *contact = json_array_get_object_element(buddies, buddy_index);
+			const gchar *mri = json_object_get_string_member(contact, "mri");
+			const gchar *display_name = json_object_get_string_member(contact, "displayName");
+		
+			PurpleBuddy *buddy;
+			const gchar *id;
+		
+			id = teams_strip_user_prefix(mri);
+			if (!id || !*id) continue;
+			
+			buddy = purple_blist_find_buddy(sa->account, id);
+			if (!buddy)
+			{
+				buddy = purple_buddy_new(sa->account, id, display_name);
+				purple_blist_add_buddy(buddy, NULL, group, NULL);
+			}
+
+			TeamsBuddy *sbuddy = purple_buddy_get_protocol_data(buddy);
+			if (sbuddy == NULL) {
+				sbuddy = g_new0(TeamsBuddy, 1);
+				sbuddy->skypename = g_strdup(id);
+				sbuddy->sa = sa;
+				
+				sbuddy->buddy = buddy;
+				purple_buddy_set_protocol_data(buddy, sbuddy);
+			}
+		
+			if (display_name && *display_name) {
+				g_free(sbuddy->display_name);
+				sbuddy->display_name = g_strdup(display_name);
+				
+				if (!purple_strequal(purple_buddy_get_local_alias(buddy), sbuddy->display_name)) {
+					purple_serv_got_alias(sa->pc, id, sbuddy->display_name);
+				}
+			}
+
+			teams_get_icon(buddy);
+			
+			// if (blocked == TRUE) {
+				// purple_account_privacy_deny_add(sa->account, id, TRUE);
+			// } else {
+				users_to_fetch = g_slist_prepend(users_to_fetch, sbuddy->skypename);
+			// }
+			
+			if (purple_strequal(id, sa->primary_member_name)) {
+				g_free(sa->self_display_name);
+				sa->self_display_name = g_strdup(display_name);
+			}
+		}
+	}
+		
+	if (users_to_fetch)
+	{
+		teams_get_friend_profiles(sa, users_to_fetch);
+		teams_subscribe_to_contact_status(sa, users_to_fetch);
+		g_slist_free(users_to_fetch);
+	}
+}
+
+
+
+#ifdef ENABLE_TEAMS_PERSONAL
+/* Personal/TFL: parse the classic Skype contacts service response
+ * (contacts.skype.com/contacts/v2/users/SELF). For consumer/Teams-for-Life
+ * accounts this — NOT the mt/beta buddylist (which is empty) — is where the real
+ * contacts live. Schema (verified live):
+ *   {"contacts":[{"mri":"8:live:.cid.xxxxxxxx","display_name":"…","authorized":true,
+ *                 "blocked":false,"profile":{…}}, …],"blocklist":[],"groups":[]}  */
+static void
+teams_got_skype_contacts_cb(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	JsonObject *obj;
+	JsonArray *contacts;
+	PurpleGroup *group = teams_get_blist_group(sa);
+	GSList *users_to_fetch = NULL;
+	guint index, length;
+
+	if (node == NULL || json_node_get_node_type(node) != JSON_NODE_OBJECT) {
+		/* webOS diag: buddies=0 traced here - the skype contacts response wasn't a JSON object
+		 * (empty body / HTTP error / different shape). */
+		purple_debug_warning("teams", "skype_contacts: response is not a JSON object (node=%p) - 0 buddies\n", node);
+		return;
+	}
+	obj = json_node_get_object(node);
+	if (!json_object_has_member(obj, "contacts")) {
+		GList *mk = json_object_get_members(obj), *it;
+		GString *keys = g_string_new("");
+		for (it = mk; it; it = it->next) g_string_append_printf(keys, "%s ", (const gchar *) it->data);
+		purple_debug_warning("teams", "skype_contacts: no 'contacts' member - 0 buddies; top-level keys: [%s]\n", keys->str);
+		g_string_free(keys, TRUE);
+		g_list_free(mk);
+		return;
+	}
+	contacts = json_object_get_array_member(obj, "contacts");
+	length = json_array_get_length(contacts);
+	purple_debug_info("teams", "skype_contacts: %u contact(s) in response\n", length);
+
+	for (index = 0; index < length; index++) {
+		JsonObject *contact = json_array_get_object_element(contacts, index);
+		const gchar *mri = json_object_has_member(contact, "mri") ?
+			json_object_get_string_member(contact, "mri") : NULL;
+		const gchar *display_name = json_object_has_member(contact, "display_name") ?
+			json_object_get_string_member(contact, "display_name") : NULL;
+		gboolean blocked = json_object_has_member(contact, "blocked") &&
+			json_object_get_boolean_member(contact, "blocked");
+		PurpleBuddy *buddy;
+		TeamsBuddy *sbuddy;
+		const gchar *id;
+
+		if (!mri || !*mri)
+			continue;
+		id = teams_strip_user_prefix(mri);
+		if (!id || !*id)
+			continue;
+		/* never add ourselves */
+		if (purple_strequal(id, sa->primary_member_name))
+			continue;
+
+		buddy = purple_blist_find_buddy(sa->account, id);
+		if (!buddy) {
+			buddy = purple_buddy_new(sa->account, id, display_name);
+			purple_blist_add_buddy(buddy, NULL, group, NULL);
+		}
+
+		sbuddy = purple_buddy_get_protocol_data(buddy);
+		if (sbuddy == NULL) {
+			sbuddy = g_new0(TeamsBuddy, 1);
+			sbuddy->skypename = g_strdup(id);
+			sbuddy->sa = sa;
+			sbuddy->buddy = buddy;
+			purple_buddy_set_protocol_data(buddy, sbuddy);
+		}
+
+		if (display_name && *display_name) {
+			g_free(sbuddy->display_name);
+			sbuddy->display_name = g_strdup(display_name);
+			if (!purple_strequal(purple_buddy_get_local_alias(buddy), sbuddy->display_name))
+				purple_serv_got_alias(sa->pc, id, sbuddy->display_name);
+		}
+
+		teams_get_icon(buddy);
+
+		if (blocked) {
+			purple_account_privacy_deny_add(sa->account, id, TRUE);
+		} else {
+			users_to_fetch = g_slist_prepend(users_to_fetch, sbuddy->skypename);
+		}
+	}
+
+	if (users_to_fetch) {
+		teams_get_friend_profiles(sa, users_to_fetch);
+		teams_subscribe_to_contact_status(sa, users_to_fetch);
+		g_slist_free(users_to_fetch);
+	}
+}
+
+void
+teams_get_skype_contacts(TeamsAccount *sa)
+{
+	if (!PURPLE_IS_CONNECTION(sa->pc))
+		return;
+	teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, TEAMS_NEW_CONTACTS_HOST,
+		"/contacts/v2/users/SELF?delta=&reason=default", NULL,
+		teams_got_skype_contacts_cb, NULL, TRUE);
+}
+
+/* Pre-login variant: add the buddies to the blist, THEN report CONNECTED (via
+ * teams_do_all_the_things) so the transport's login-time buddy-list consolidation
+ * sees a populated roster. Runs teams_do_all_the_things even on fetch failure (node
+ * NULL) so a network hiccup can't wedge the login. */
+static void
+teams_skype_contacts_before_login_cb(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	teams_got_skype_contacts_cb(sa, node, user_data);
+	teams_do_all_the_things(sa);
+}
+
+/* teams_post_or_get invokes NEITHER callback when it receives a non-empty but
+ * unparseable body (e.g. an HTML proxy/auth error page). Without an error callback
+ * that would stall login forever, so advance login regardless. */
+static void
+teams_skype_contacts_before_login_err_cb(TeamsAccount *sa, const gchar *data, gssize len, gpointer user_data)
+{
+	teams_do_all_the_things(sa);
+}
+
+static void
+teams_get_skype_contacts_before_login(TeamsAccount *sa)
+{
+	if (!PURPLE_IS_CONNECTION(sa->pc)) {
+		teams_do_all_the_things(sa);
+		return;
+	}
+	teams_post_or_get_with_error(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, TEAMS_NEW_CONTACTS_HOST,
+		"/contacts/v2/users/SELF?delta=&reason=default", NULL,
+		teams_skype_contacts_before_login_cb, teams_skype_contacts_before_login_err_cb, NULL, TRUE);
+}
+#endif /* ENABLE_TEAMS_PERSONAL */
+
+gboolean
+teams_get_friend_list(TeamsAccount *sa)
+{
+	PurpleConnection *pc = sa->pc;
+	if (!PURPLE_IS_CONNECTION(pc)) {
+		return FALSE;
+	}
+
+#ifdef ENABLE_TEAMS_PERSONAL
+	/* Personal/TFL: consumer/TFL contacts come from the classic Skype contacts
+	 * service, not the (empty) mt/beta buddylist. Fetch them. */
+	teams_get_skype_contacts(sa);
+#endif
+
+	// Remove any meeting chats that were persisted from previous sessions
+	teams_purge_meeting_chats_from_blist(sa);
+
+	const gchar *url = TEAMS_PROFILES_PREFIX "users/searchV2?includeDLs=true&includeBots=true&enableGuest=true&source=newChat&skypeTeamsInfo=true";
+	
+	//TODO
+	// get tenants: https://teams.microsoft.com/api/mt/apac/beta/users/tenants or https://teams.microsoft.com/api/mt/part/au-01/beta/users/tenantsv2
+	// https://teams.microsoft.com/api/mt/part/au-01/beta/contactsv3/?pageSize=500
+	
+	// Do a search for all users with . in their email addresses - doesn't work for Guests
+	teams_post_or_get(sa, TEAMS_METHOD_POST | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, url, ".", teams_get_friend_list_cb, NULL, TRUE);
+	
+	// Fetch a list of teams and chats we're part of - doesn't include users for Guests
+	url = "/api/csa/api/v1/teams/users/me?isPrefetch=false&enableMembershipSummary=true";
+	teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, url, NULL, teams_get_friend_list_teams_cb, NULL, TRUE);
+	
+	// Search all of office for suggestions
+	// needs auth with scope of https://substrate.office.com
+	url = "/search/api/v1/suggestions?scenario=";
+	const gchar *postdata = "{\"EntityRequests\":[{\"EntityType\":\"People\",\"Fields\":[\"DisplayName\",\"MRI\",\"GivenName\",\"Surname\"],\"Query\":{\"QueryString\":\"\",\"DisplayQueryString\":\"\"},\"Provenances\":[\"Mailbox\",\"Directory\"],\"Filter\":{\"And\":[{\"Or\":[{\"Term\":{\"PeopleType\":\"Person\"}},{\"Term\":{\"PeopleType\":\"Other\"}}]},{\"Or\":[{\"Term\":{\"PeopleSubtype\":\"OrganizationUser\"}},{\"Term\":{\"PeopleSubtype\":\"Guest\"}}]}]},\"Size\":500,\"From\":0}],\"Cvid\":\"12345678-1234-4321-1234-123412341234\",\"AppName\":\"Microsoft Teams\",\"Scenario\":{\"Name\":\"peoplecache\"}}";
+	teams_post_or_get(sa, TEAMS_METHOD_POST | TEAMS_METHOD_SSL, "substrate.office.com", url, postdata, teams_get_friend_suggestions_cb, NULL, TRUE);
+
+	// Search org chart for people you work with
+	gchar *search_url = g_strconcat("/api/v1/workingwith?teamsMri=", purple_url_encode(sa->primary_member_name), "&personaType=User&limit=50", NULL);
+	teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, "aus.loki.delve.office.com", search_url, NULL, teams_get_workingwith_cb, NULL, TRUE);
+	g_free(search_url);
+
+	// The mt/beta endpoints need the MT bearer token, which may not have arrived yet
+	// on the first pass; teams_mt_oauth_cb() re-runs just these once it has.
+	teams_get_mt_beta_contacts(sa);
+
+	// Look up all the contacts in the buddy list
+	teams_lookup_buddy_list_contacts(sa);
+
+	return FALSE;
+}
+
+/* The two mt/beta contact endpoints (People app contactsv3 + the personal buddy
+ * list) are the only friend-list calls that depend on sa->mt_access_token. Split
+ * them out so teams_mt_oauth_cb() can retry ONLY these when the MT token arrives,
+ * instead of re-running the whole ~7-call teams_get_friend_list() pipeline. */
+void
+teams_get_mt_beta_contacts(TeamsAccount *sa)
+{
+	const gchar *url;
+
+	if (!PURPLE_IS_CONNECTION(sa->pc))
+		return;
+
+	// Search the People app
+	url = "/api/mt/beta/contactsv3/";
+	teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, url, NULL, teams_get_friend_list_cb, NULL, TRUE);
+
+	// Teams personal has a buddy list?!@
+	url = "/api/mt/beta/contacts/buddylist?migrationRequested=true&federatedContactsSupported=true";
+	teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, url, NULL, teams_get_buddylist_cb, NULL, TRUE);
+}
+
+typedef struct {
+	TeamsAccount *sa;
+	gchar *chatname;
+	gchar *teams_join_link;
+	gchar *subject;
+} TeamsCalendarNotificationData;
+
+gboolean
+teams_calendar_timer_cb(gpointer user_data)
+{
+	TeamsCalendarNotificationData *data = user_data;
+	TeamsAccount *sa = data->sa;
+	PurpleConnection *pc = sa->pc;
+
+	if (PURPLE_IS_CONNECTION(pc)) {
+		gchar *chatname = data->chatname;
+		PurpleChatConversation *chatconv = purple_conversations_find_chat_with_account(chatname, sa->account);
+		if (!chatconv) {
+			chatconv = purple_serv_got_joined_chat(pc, g_str_hash(chatname), chatname);
+			purple_conversation_set_data(PURPLE_CONVERSATION(chatconv), "chatname", g_strdup(chatname));
+
+			if (data->subject && *data->subject) {
+				purple_chat_conversation_set_topic(chatconv, NULL, data->subject);
+			}
+			
+			teams_get_conversation_history(sa, chatname);
+			teams_get_thread_users(sa, chatname);
+		}
+
+		gchar *html = g_strdup_printf("%s <a href=\"%s\">%s</a>", _("Reminder: You have a Teams meeting starting soon"), data->teams_join_link, _("Join Teams Meeting"));
+		purple_conversation_write_system_message(PURPLE_CONVERSATION(chatconv), html, PURPLE_MESSAGE_NO_LOG | PURPLE_MESSAGE_NOTIFY | PURPLE_MESSAGE_RECV);
+		g_free(html);
+	}
+	
+	g_free(data->subject);
+	g_free(data->chatname);
+	g_free(data->teams_join_link);
+	g_free(data);
+	return FALSE;
+}
+
+static void
+teams_got_calendar(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	JsonObject *obj;
+	JsonArray *events;
+	guint index, length;
+	
+	if (node == NULL)
+		return;
+	obj = json_node_get_object(node);
+	events = json_object_get_array_member(obj, "value");
+	length = json_array_get_length(events);
+	
+	gint calendar_notify_minutes = purple_account_get_int(sa->account, "calendar_notify_minutes", 0);
+	gint calendar_notify_seconds = calendar_notify_minutes * 60;
+	
+	for(index = 0; index < length; index++)
+	{
+		JsonObject *event = json_array_get_object_element(events, index);
+		gboolean isOnlineMeeting = json_object_get_boolean_member(event, "isOnlineMeeting");
+
+		if (!isOnlineMeeting) {
+			continue;
+		}
+
+		const gchar *iCalUID = json_object_get_string_member(event, "iCalUID");
+		if (g_hash_table_contains(sa->calendar_reminder_timeouts, iCalUID)) {
+			continue;
+		}
+		
+		const gchar *skypeTeamsMeetingUrl = json_object_get_string_member(event, "skypeTeamsMeetingUrl");
+		JsonObject *skypeTeamsDataObject = json_object_get_object_member(event, "skypeTeamsDataObject");
+		const gchar *chatname = json_object_get_string_member(skypeTeamsDataObject, "cid");
+		const gchar *subject = json_object_get_string_member(event, "subject");
+		const gchar *startTime = json_object_get_string_member(event, "startTime");
+		time_t event_timestamp = purple_str_to_time(startTime, TRUE, NULL, NULL, NULL);
+		gint seconds_until_event = event_timestamp - time(NULL);
+
+		purple_debug_info("teams", "Teams meeting %s for chat %s starting at %s\n", subject && *subject ? subject : "", chatname, startTime);
+
+		if (seconds_until_event <= calendar_notify_seconds) {
+			continue;
+		}
+
+		TeamsCalendarNotificationData *data = g_new0(TeamsCalendarNotificationData, 1);
+		data->sa = sa;
+		data->chatname = g_strdup(chatname);
+		data->subject = g_strdup(subject);
+		data->teams_join_link = g_strdup(skypeTeamsMeetingUrl);
+		
+		// Set a timer to go off at X minutes before the start time to write a message to the conversation
+		guint timer = purple_timeout_add_seconds(seconds_until_event - calendar_notify_seconds, teams_calendar_timer_cb, data);
+		g_hash_table_insert(sa->calendar_reminder_timeouts, g_strdup(iCalUID), GUINT_TO_POINTER(timer));
+	}
+}
+
+
+gboolean
+teams_check_calendar(TeamsAccount *sa)
+{
+	PurpleConnection *pc = sa->pc;
+	if (!PURPLE_IS_CONNECTION(pc)) {
+		return FALSE;
+	}
+
+	gint calendar_notify_minutes = purple_account_get_int(sa->account, "calendar_notify_minutes", 0);
+	if (calendar_notify_minutes > 0) {
+		struct tm *tm;
+		time_t start_time = time(NULL);
+		tm = localtime(&start_time);
+		gchar *start_date = g_strdup(purple_url_encode(purple_utf8_strftime("%Y-%m-%dT%H:%M:%S%z", tm)));
+
+		time_t end_time = time(NULL) + TEAMS_CALENDAR_REFRESH_MINUTES * 60;
+		tm = localtime(&end_time);
+		gchar *end_date = g_strdup(purple_url_encode(purple_utf8_strftime("%Y-%m-%dT%H:%M:%S%z", tm)));
+		
+		gchar *url = g_strconcat("/api/mt/part/au-01/v2.0/me/calendars/default/calendarView?StartDate=", start_date, "&EndDate=", end_date, "&shouldDecryptData=true", NULL);
+
+		teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, url, NULL, teams_got_calendar, NULL, TRUE);
+
+		g_free(start_date);
+		g_free(end_date);
+		g_free(url);
+	}
+	return TRUE;
+}
+
+
+
+void
+teams_auth_accept_cb(
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+	const gchar *who,
+#endif
+	gpointer sender)
+{
+	PurpleBuddy *buddy = sender;
+	TeamsAccount *sa;
+	gchar *url = NULL;
+	gchar *buddy_name;
+	
+	sa = purple_connection_get_protocol_data(purple_account_get_connection(purple_buddy_get_account(buddy)));
+	buddy_name = g_strdup(purple_buddy_get_name(buddy));
+	
+	url = g_strdup_printf("/contacts/v2/users/SELF/invites/%s%s/accept", teams_user_url_prefix(buddy_name), purple_url_encode(buddy_name));
+	teams_post_or_get(sa, TEAMS_METHOD_PUT | TEAMS_METHOD_SSL, TEAMS_NEW_CONTACTS_HOST, url, NULL, NULL, NULL, TRUE);
+	g_free(url);
+	
+	// Subscribe to status/message updates
+	teams_subscribe_to_single_contact_status(sa, buddy_name);
+	g_free(buddy_name);
+	teams_get_icon_now(buddy);
+}
+
+void
+teams_auth_reject_cb(
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+	const gchar *who,
+#endif
+	gpointer sender)
+{
+	PurpleBuddy *buddy = sender;
+	TeamsAccount *sa;
+	gchar *url = NULL;
+	gchar *buddy_name;
+	
+	sa = purple_connection_get_protocol_data(purple_account_get_connection(purple_buddy_get_account(buddy)));
+	buddy_name = g_strdup(purple_buddy_get_name(buddy));
+	
+	url = g_strdup_printf("/contacts/v2/users/SELF/invites/%s%s/decline", teams_user_url_prefix(buddy_name), purple_url_encode(buddy_name));
+	
+	teams_post_or_get(sa, TEAMS_METHOD_PUT | TEAMS_METHOD_SSL, TEAMS_NEW_CONTACTS_HOST, url, NULL, NULL, NULL, TRUE);
+	
+	g_free(url);
+	g_free(buddy_name);
+}
+
+static void
+teams_got_authrequests(TeamsAccount *sa, JsonNode *node, gpointer user_data)
+{
+	JsonObject *requests;
+	JsonArray *invite_list;
+	guint index, length;
+	time_t latest_timestamp = 0;
+
+	if (node == NULL)
+		return;
+
+	requests = json_node_get_object(node);
+	invite_list = json_object_get_array_member(requests, "invite_list");
+	length = json_array_get_length(invite_list);
+	for(index = 0; index < length; index++)
+	{
+		JsonObject *invite = json_array_get_object_element(invite_list, index);
+		JsonArray *invites = json_object_get_array_member(invite, "invites");
+		const gchar *event_time_iso = json_object_get_string_member(json_array_get_object_element(invites, 0), "time");
+		time_t event_timestamp = purple_str_to_time(event_time_iso, TRUE, NULL, NULL, NULL);
+		const gchar *sender = json_object_get_string_member(invite, "mri");
+		const gchar *greeting = json_object_get_string_member(invite, "greeting");
+		if (!greeting)
+			greeting = json_object_get_string_member(json_array_get_object_element(invites, 0), "message");
+		const gchar *displayname = json_object_get_string_member(invite, "displayname");
+		
+		latest_timestamp = MAX(latest_timestamp, event_timestamp);
+		if (sa->last_authrequest && latest_timestamp <= sa->last_authrequest)
+			continue;
+		
+		if (sender == NULL)
+			continue;
+		sender = teams_strip_user_prefix(sender);
+		
+		purple_account_request_authorization(
+				sa->account, sender, NULL,
+				displayname, greeting, FALSE,
+				teams_auth_accept_cb, teams_auth_reject_cb, purple_buddy_new(sa->account, sender, displayname));
+		
+	}
+	
+	sa->last_authrequest = latest_timestamp;
+}
+
+gboolean
+teams_check_authrequests(TeamsAccount *sa)
+{
+	//TODO
+	return FALSE;
+	
+	teams_post_or_get(sa, TEAMS_METHOD_GET | TEAMS_METHOD_SSL, TEAMS_NEW_CONTACTS_HOST, "/contacts/v2/users/SELF/invites", NULL, teams_got_authrequests, NULL, TRUE);
+	return TRUE;
+}
+
+
+void
+teams_add_buddy_with_invite(PurpleConnection *pc, PurpleBuddy *buddy, PurpleGroup *group, const char *message)
+{
+	TeamsAccount *sa = purple_connection_get_protocol_data(pc);
+	gchar *postdata;
+	const gchar *url = "/contacts/v2/users/SELF/contacts";
+	JsonObject *obj;
+	gchar *buddy_name, *mri;
+	
+	//https://contacts.skype.com/contacts/v2/users/SELF/contacts
+	// POST {"mri":"2:eionrobb@dequis.onmicrosoft.com","greeting":"Hi, eionrobb@dequis.onmicrosoft.com, I'd like to add you as a contact."}
+	
+	buddy_name = g_strdup(purple_buddy_get_name(buddy));
+	mri = g_strconcat(teams_user_url_prefix(buddy_name), buddy_name, NULL);
+	
+	obj = json_object_new();
+	
+	json_object_set_string_member(obj, "mri", mri);
+	json_object_set_string_member(obj, "greeting", message ? message : _("Please authorize me so I can add you to my buddy list."));
+	postdata = teams_jsonobj_to_string(obj);
+	
+	teams_post_or_get(sa, TEAMS_METHOD_POST | TEAMS_METHOD_SSL, TEAMS_NEW_CONTACTS_HOST, url, postdata, NULL, NULL, TRUE);
+	
+	g_free(mri);
+	g_free(postdata);
+	json_object_unref(obj);
+	
+	// Subscribe to status/message updates
+	teams_subscribe_to_single_contact_status(sa, buddy_name);
+	g_free(buddy_name);
+	teams_get_icon_now(buddy);
+}
+
+void 
+teams_add_buddy(PurpleConnection *pc, PurpleBuddy *buddy, PurpleGroup *group)
+{
+	teams_add_buddy_with_invite(pc, buddy, group, NULL);
+}
+
+void
+teams_buddy_remove(PurpleConnection *pc, PurpleBuddy *buddy, PurpleGroup *group)
+{
+	TeamsAccount *sa = purple_connection_get_protocol_data(pc);
+	gchar *url;
+	const gchar *buddy_name = purple_buddy_get_name(buddy);
+	
+	url = g_strdup_printf("/contacts/v2/users/SELF/contacts/%s%s", teams_user_url_prefix(buddy_name), purple_url_encode(buddy_name));
+	
+	teams_post_or_get(sa, TEAMS_METHOD_DELETE | TEAMS_METHOD_SSL, TEAMS_NEW_CONTACTS_HOST, url, NULL, NULL, NULL, TRUE);
+	
+	g_free(url);
+	
+	teams_unsubscribe_from_contact_status(sa, buddy_name);
+}
+
+void
+teams_buddy_block(PurpleConnection *pc, const char *name)
+{
+	TeamsAccount *sa = purple_connection_get_protocol_data(pc);
+	gchar *url;
+	gchar *postdata;
+	
+	// Old skype (teams personal?)
+	url = g_strdup_printf("/contacts/v2/users/SELF/contacts/blocklist/%s%s", teams_user_url_prefix(name), purple_url_encode(name));
+	postdata = g_strdup("{\"report_abuse\":\"false\",\"ui_version\":\"skype.com\"}");
+	
+	teams_post_or_get(sa, TEAMS_METHOD_PUT | TEAMS_METHOD_SSL, TEAMS_NEW_CONTACTS_HOST, url, postdata, NULL, NULL, TRUE);
+
+	g_free(url);
+	g_free(postdata);
+	
+	// New teams
+	url = g_strdup(TEAMS_PROFILES_PREFIX "userSettings/blocklist/manage");
+	postdata = g_strdup_printf("{\"add\":[\"%s%s\"]}", teams_user_url_prefix(name), name);
+	
+	teams_post_or_get(sa, TEAMS_METHOD_POST | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, url, postdata, NULL, NULL, TRUE);
+
+	g_free(url);
+	g_free(postdata);
+}
+
+void
+teams_buddy_unblock(PurpleConnection *pc, const char *name)
+{
+	TeamsAccount *sa = purple_connection_get_protocol_data(pc);
+	gchar *url;
+	gchar *postdata;
+	
+	// Old skype (teams personal?)
+	url = g_strdup_printf("/contacts/v2/users/SELF/contacts/blocklist/%s%s", teams_user_url_prefix(name), purple_url_encode(name));
+	
+	teams_post_or_get(sa, TEAMS_METHOD_DELETE | TEAMS_METHOD_SSL, TEAMS_NEW_CONTACTS_HOST, url, NULL, NULL, NULL, TRUE);
+
+	g_free(url);
+	
+	// New teams
+	url = g_strdup(TEAMS_PROFILES_PREFIX "userSettings/blocklist/manage");
+	postdata = g_strdup_printf("{\"remove\":[\"%s%s\"]}", teams_user_url_prefix(name), name);
+	
+	teams_post_or_get(sa, TEAMS_METHOD_POST | TEAMS_METHOD_SSL, TEAMS_BASE_ORIGIN_HOST, url, postdata, NULL, NULL, TRUE);
+
+	g_free(url);
+	g_free(postdata);
+}
+
+// TODO
+// add_allow
+// POST https://teams.microsoft.com/api/mt/beta/userSettings/acceptlist/manage
+// {
+//	"add": ["8:orgid:...."]
+//}
+// or is it
+// POST https://teams.live.com/api/mt/beta/contacts/buddylist/TflContacts/managebuddies?migrationRequested=true&federatedContactsSupported=true&ggEnabled=true&skipBuddylistFetch=true
+// {"add":[{"mri":"8:live:....","displayName":"...."}]}
+
+
+void
+teams_set_mood_message(TeamsAccount *sa, const gchar *mood)
+{
+	JsonObject *obj;
+	gchar *post;
+	
+	obj = json_object_new();
+	
+	// mood should be HTML
+	json_object_set_string_member(obj, "message", mood ? mood : "");
+	json_object_set_string_member(obj, "expiry", "9999-12-31T00:00:00.000Z");
+	
+	post = teams_jsonobj_to_string(obj);
+	
+	// TODO maybe url changed? https://teams.microsoft.com/ups/apac/v1/me/publishnote
+	teams_post_or_get(sa, TEAMS_METHOD_PUT | TEAMS_METHOD_SSL, TEAMS_PRESENCE_HOST, "/v1/me/publishnote", post, NULL, NULL, TRUE);
+	
+	g_free(post);
+	json_object_unref(obj);
+}
+
+gchar *
+teams_chat_get_cb_alias(PurpleConnection *gc, int id, const char *who)
+{
+	TeamsAccount *sa = purple_connection_get_protocol_data(gc);
+	PurpleBuddy *buddy = purple_blist_find_buddy(sa->account, who);
+	if (buddy)
+	{
+		TeamsBuddy *sbuddy = purple_buddy_get_protocol_data(buddy);
+		if (sbuddy && sbuddy->display_name) {
+			return g_strdup(sbuddy->display_name);
+		}
+	}
+
+	PurpleChatConversation *chat = purple_conversations_find_chat(gc, id);
+	if (chat == NULL) {
+		return NULL;
+	}
+	PurpleChatUser *cb = purple_chat_conversation_find_user(chat, who);
+	if (cb == NULL) {
+		return NULL;
+	}
+	
+	return g_strdup(cb->alias);
+}

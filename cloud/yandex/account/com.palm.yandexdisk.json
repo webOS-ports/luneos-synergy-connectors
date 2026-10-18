@@ -1,0 +1,39 @@
+{
+	"templateId": "com.palm.yandexdisk",
+	"loc_name": "Yandex Disk",
+	"loc_usernameLabel": "EMAIL ADDRESS",
+	"icon": {
+		"loc_32x32": "images/yandexdisk-32x32.png",
+		"loc_48x48": "images/yandexdisk-48x48.png"
+	},
+
+	"__comment": "OAuth2 replaces the dead username/password validator. customUI hosts the consent webview (like com.palm.eas / com.palm.skype); it loads OAuth2.buildAuthorizeUrl(), captures ?code= from the redirect to Config.REDIRECT_URI, then calls exchangeCode which returns the stored token credentials. Yandex Disk provides BOTH DOCUMENTS and PHOTO.UPLOAD (photo source + device->cloud upload).",
+	"validator": {
+		"customUI": { "appId": "com.palm.app.cloud-auth", "name": "oauth.html" },
+		"address":  "palm://com.palm.service.yandexdisk/exchangeCode"
+	},
+	"onCredentialsChanged": "palm://com.palm.service.yandexdisk/checkCredentials",
+
+	"__comment2": "com.palm.app.cloud-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists (accounts/handlers/create.js -> Utils.hasPermission). Working templates (teams/telegram/skype) list their own auth app, not com.palm.app.accounts.",
+	"__comment3": "com.palm.service.yandexdisk is in read+writePermissions so the service itself can readCredentials(accountId) for file ops and writeCredentials back after a token refresh (accounts/handlers/credentials.js checks these lists).",
+	"readPermissions":  ["com.quickoffice.webos", "com.quickoffice.ar", "com.palm.app.cloud-auth", "com.palm.app.yandexdisk-files", "com.palm.app.photos", "com.palm.service.yandexdisk", "com.palm.service.photos"],
+	"writePermissions": ["com.palm.app.cloud-auth", "com.palm.app.yandexdisk-files", "com.palm.app.photos", "com.palm.service.yandexdisk", "com.palm.service.photos"],
+
+	"capabilityProviders": [
+		{
+			"capability": "DOCUMENTS",
+			"id": "com.palm.yandexdisk.documents",
+			"implementation": "palm://com.palm.service.yandexdisk/",
+			"__comment": "No longer bound to QuickOffice (closed/dead). The file-picker app and the QuickOffice reroute (mxId 'yandex') consume listFolder/downloadFile/uploadFile."
+		},
+		{
+			"capability": "PHOTO.UPLOAD",
+			"id": "com.palm.yandexdisk.photos",
+			"implementation": "palm://com.palm.service.photos",
+			"onEnabled": "palm://com.palm.service.photos/onEnabled",
+			"onDelete": "palm://com.palm.service.photos/onDelete",
+			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
+			"__comment": "Makes the Yandex Disk account a photo source (and device->cloud upload target). implementation/hooks point at the stock Photos AGGREGATOR (com.palm.service.photos), which discovers PHOTO.UPLOAD accounts and - via the templateId->serviceName fall-through in its Utils.js (see ../photos-integration/) - calls com.palm.service.yandexdisk/listAlbums+listPhotos, then downloads bytes with the curl-patched Sync-Manager. One folder is surfaced as one album: Yandex's own camera-uploads folder (system_folders.photostream) when it exists, else Config.PHOTO_ALBUM_NAME ('Pictures'). Like Dropbox, src_big/src_small are short-lived signed /resources/download hrefs (self-authenticating, so the curl -L fetch needs no auth header)."
+		}
+	]
+}

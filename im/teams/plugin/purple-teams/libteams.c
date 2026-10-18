@@ -1,0 +1,1481 @@
+/*
+ * Teams Plugin for libpurple/Pidgin
+ * Copyright (c) 2014-2020 Eion Robb
+ * 
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "libteams.h"
+#include "teams_contacts.h"
+#include "teams_login.h"
+#include "teams_messages.h"
+#include "teams_util.h"
+#include "teams_trouter.h"
+#ifdef TEAMS_WEBOS_CALL
+#include "teams_call_luna.h"
+#endif
+
+#ifdef ENABLE_TEAMS_PERSONAL
+/* Personal/TFL: real-time message delivery via Trouter push does not work for
+ * consumer (Teams-for-Life) accounts — new messages arrive as neither a /messaging
+ * EventMessage nor a trouter.message_loss (only presence pushes route through). So we
+ * poll for new messages on a timer; teams_get_offline_history() fetches conversations
+ * since the advancing cursor, and process_message_resource() dedups by server id so
+ * re-fetched messages are never re-delivered. */
+static gboolean
+teams_poll_messages(gpointer user_data)
+{
+	TeamsAccount *sa = user_data;
+
+	if (!PURPLE_CONNECTION_IS_VALID(sa->pc)) {
+		sa->poll_timeout = 0;
+		return G_SOURCE_REMOVE;
+	}
+
+	/* Don't stack fetches: if the previous poll's conversations request hasn't
+	 * completed (slow network), skip this tick. teams_got_all_convs() and the fetch
+	 * error callback clear the flag, so a failed request can't wedge polling. */
+	if (sa->poll_in_flight) {
+		purple_debug_info("teams", "poll: previous fetch still in flight, skipping tick\n");
+		return G_SOURCE_CONTINUE;
+	}
+	sa->poll_in_flight = TRUE;
+	teams_get_offline_history(sa);
+	return G_SOURCE_CONTINUE;
+}
+#endif /* ENABLE_TEAMS_PERSONAL */
+
+void
+teams_do_all_the_things(TeamsAccount *sa)
+{
+	// teams_get_vdms_token(sa);
+
+	if (!sa->endpoint) {
+		// Prevent running out of endpoints aka "Endpoint limit exceeded"
+		const gchar *endpoint = purple_account_get_string(sa->account, "endpoint", NULL);
+		if (!endpoint || !*endpoint) {
+			sa->endpoint = purple_uuid_random();
+			purple_account_set_string(sa->account, "endpoint", sa->endpoint);
+		} else {
+			sa->endpoint = g_strdup(endpoint);
+		}
+	}
+
+	if (!sa->username) {
+		teams_get_self_details(sa);
+	} else {
+		teams_get_self_details(sa);
+		
+		if (sa->authcheck_timeout)
+			g_source_remove(sa->authcheck_timeout);
+		teams_check_authrequests(sa);
+		sa->authcheck_timeout = g_timeout_add_seconds(120, (GSourceFunc)teams_check_authrequests, sa);
+		purple_connection_set_state(sa->pc, PURPLE_CONNECTION_CONNECTED);
+		/* Personal/TFL: mark full setup done so the async teams_get_self_details
+		 * callback below (teams_got_self_details) does not recurse into this function
+		 * again. Replaces the old IS_CONNECTED re-entry guard, which our early-connect
+		 * fix would otherwise have tripped early (skipping this whole block). */
+		sa->logged_in = TRUE;
+
+		teams_get_friend_list(sa);
+		teams_trouter_begin(sa);
+
+#ifdef TEAMS_WEBOS_CALL
+		/* Register the com.palm.teams.call LS2 bridge so the stock Phone app can
+		 * ring/drive NGC voice calls (webOS build only; needs luna-service2). */
+		teams_call_luna_init(sa);
+#endif
+
+		teams_get_offline_history(sa);
+
+#ifdef ENABLE_TEAMS_PERSONAL
+		/* Personal/TFL: periodic message poll (real-time Trouter push is
+		 * dead for consumer accounts). Dedup in process_message_resource() keeps
+		 * re-fetches from duplicating already-shown messages. */
+		if (sa->poll_timeout)
+			g_source_remove(sa->poll_timeout);
+		sa->poll_timeout = g_timeout_add_seconds(TEAMS_MESSAGE_POLL_SECONDS, teams_poll_messages, sa);
+#endif /* ENABLE_TEAMS_PERSONAL */
+
+		teams_set_status(sa->account, purple_account_get_active_status(sa->account));
+		teams_idle_update(sa);
+		if (sa->idle_timeout) 
+			g_source_remove(sa->idle_timeout);
+		sa->idle_timeout = g_timeout_add_seconds(120, (GSourceFunc)teams_idle_update, sa);
+
+		teams_check_calendar(sa);
+		if (sa->calendar_poll_timeout) 
+			g_source_remove(sa->calendar_poll_timeout);
+		sa->calendar_poll_timeout = g_timeout_add_seconds(TEAMS_CALENDAR_REFRESH_MINUTES * 60, (GSourceFunc)teams_check_calendar, sa);
+	}
+
+
+}
+
+
+/******************************************************************************/
+/* PRPL functions */
+/******************************************************************************/
+
+static const char *
+teams_list_icon(PurpleAccount *account, PurpleBuddy *buddy)
+{
+	if (buddy != NULL) {
+		const gchar *buddy_name = purple_buddy_get_name(buddy);
+		if (buddy_name != NULL) {
+			if (TEAMS_BUDDY_IS_MSN(buddy_name)) {
+				return "msn";
+			} else if (TEAMS_BUDDY_IS_SKYPE(buddy_name)) {
+				return "skype";
+			}
+		}
+	}
+
+	return "teams";
+}
+
+#ifdef ENABLE_TEAMS_PERSONAL
+static const char *
+teams_personal_list_icon(PurpleAccount *account, PurpleBuddy *buddy)
+{
+	return "teams_personal";
+}
+#endif /* ENABLE_TEAMS_PERSONAL */
+
+static gchar *
+teams_status_text(PurpleBuddy *buddy)
+{
+	TeamsBuddy *sbuddy = purple_buddy_get_protocol_data(buddy);
+
+	if (sbuddy && sbuddy->mood && *(sbuddy->mood))
+	{
+		gchar *stripped = purple_markup_strip_html(sbuddy->mood);
+		gchar *escaped = g_markup_printf_escaped("%s", stripped);
+		
+		g_free(stripped);
+		
+		return escaped;
+	}
+
+	return NULL;
+}
+
+void
+teams_tooltip_text(PurpleBuddy *buddy, PurpleNotifyUserInfo *user_info, gboolean full)
+{
+	TeamsBuddy *sbuddy = purple_buddy_get_protocol_data(buddy);
+	PurplePresence *presence;
+	PurpleStatus *status;
+
+	presence = purple_buddy_get_presence(buddy);
+	status = purple_presence_get_active_status(presence);
+	purple_notify_user_info_add_pair_html(user_info, _("Status"), purple_status_get_name(status));
+	if (sbuddy && sbuddy->mood && *sbuddy->mood) {
+		gchar *stripped = purple_markup_strip_html(sbuddy->mood);
+		gchar *escaped = g_markup_printf_escaped("%s", stripped);
+		
+		purple_notify_user_info_add_pair_html(user_info, _("Message"), escaped);
+		
+		g_free(stripped);
+		g_free(escaped);
+	} else {
+		const gchar *note = purple_status_get_attr_string(status, "message");
+		if (note && *note) {
+			gchar *escaped = g_markup_printf_escaped("%s", note);
+			purple_notify_user_info_add_pair_html(user_info, _("Message"), escaped);
+			g_free(escaped);
+		}
+	}
+		
+	if (sbuddy && sbuddy->display_name && *sbuddy->display_name) {
+		gchar *escaped = g_markup_printf_escaped("%s", sbuddy->display_name);
+		purple_notify_user_info_add_pair_html(user_info, _("Alias"), escaped);
+		g_free(escaped);
+	}
+	if (sbuddy && sbuddy->fullname && *sbuddy->fullname) {
+		gchar *escaped = g_markup_printf_escaped("%s", sbuddy->fullname);
+		purple_notify_user_info_add_pair_html(user_info, _("Full Name"), escaped);
+		g_free(escaped);
+	}
+	if (sbuddy && sbuddy->tenant && *sbuddy->tenant) {
+		gchar *escaped = g_markup_printf_escaped("%s", sbuddy->tenant);
+		purple_notify_user_info_add_pair_html(user_info, _("Tenant"), escaped);
+		g_free(escaped);
+	}
+#ifndef ENABLE_TEAMS_PERSONAL
+	if (sbuddy && sbuddy->user_type && *sbuddy->user_type) {
+		gchar *escaped = g_markup_printf_escaped("%s", sbuddy->user_type);
+		purple_notify_user_info_add_pair_html(user_info, _("User Type"), escaped);
+		g_free(escaped);
+	}
+#endif // !ENABLE_TEAMS_PERSONAL
+
+	PurpleStatus *out_of_office_status = purple_presence_get_status(presence, TEAMS_OOO_STATUS_ID);
+	if (out_of_office_status && purple_status_is_active(out_of_office_status)) {
+		const gchar *ooo_message = purple_status_get_attr_string(out_of_office_status, "message");
+		if (ooo_message && *ooo_message) {
+			gchar *escaped = g_markup_printf_escaped("%s", ooo_message);
+			purple_notify_user_info_add_pair_html(user_info, _("Out Of Office Note"), escaped);
+			g_free(escaped);
+		} else {
+			purple_notify_user_info_add_pair_html(user_info, _("Out Of Office"), _("Yes"));
+		}
+	}
+
+	PurpleStatus *work_location_status = purple_presence_get_status(presence, TEAMS_WORK_LOCATION_STATUS_ID);
+	if (work_location_status && purple_status_is_active(work_location_status)) {
+		const gchar *work_location = purple_status_get_attr_string(work_location_status, "location");
+		if (work_location && *work_location) {
+			gchar *escaped = g_markup_printf_escaped("%s", work_location);
+			purple_notify_user_info_add_pair_html(user_info, _("Work Location"), escaped);
+			g_free(escaped);
+		}
+		const gchar *work_location_name = purple_status_get_attr_string(work_location_status, "location_name");
+		if (work_location_name && *work_location_name) {
+			gchar *escaped = g_markup_printf_escaped("%s", work_location_name);
+			purple_notify_user_info_add_pair_html(user_info, _("Work Location Name"), escaped);
+			g_free(escaped);
+		}
+	}
+}
+
+const gchar *
+teams_list_emblem(PurpleBuddy *buddy)
+{
+	if (buddy != NULL) {
+#ifndef ENABLE_TEAMS_PERSONAL
+		TeamsBuddy *sbuddy = purple_buddy_get_protocol_data(buddy);
+#endif // !ENABLE_TEAMS_PERSONAL
+		const gchar *buddy_name = purple_buddy_get_name(buddy);
+		
+		if (buddy_name && TEAMS_BUDDY_IS_BOT(buddy_name)) {
+			return "bot";
+#ifndef ENABLE_TEAMS_PERSONAL
+		} else if (sbuddy && sbuddy->user_type && *sbuddy->user_type) {
+			if (purple_strequal(sbuddy->user_type, "Federated")) {
+				return "external";
+			} else if (purple_strequal(sbuddy->user_type, "BOT")) {
+				return "bot";
+			}
+#endif // !ENABLE_TEAMS_PERSONAL
+		}
+	}
+	return NULL;
+}
+
+GList *
+teams_status_types(PurpleAccount *account)
+{
+	GList *types = NULL;
+	PurpleStatusType *status;
+	
+	status = purple_status_type_new_full(PURPLE_STATUS_OFFLINE, NULL, NULL, FALSE, FALSE, FALSE);
+	types = g_list_append(types, status);
+	
+	status = purple_status_type_new_with_attrs(PURPLE_STATUS_AVAILABLE, "Available", _("Available"), TRUE, TRUE, FALSE, "message", _("Message"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	types = g_list_append(types, status);
+	status = purple_status_type_new_with_attrs(PURPLE_STATUS_AWAY, "Away", _("Away"), TRUE, TRUE, FALSE, "message", _("Message"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	types = g_list_append(types, status);
+	status = purple_status_type_new_with_attrs(PURPLE_STATUS_EXTENDED_AWAY, "BeRightBack", _("Be Right Back"), TRUE, TRUE, FALSE, "message", _("Message"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	types = g_list_append(types, status);
+	status = purple_status_type_new_with_attrs(PURPLE_STATUS_UNAVAILABLE, "Busy", _("Busy"), TRUE, TRUE, FALSE, "message", _("Message"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	types = g_list_append(types, status);
+	status = purple_status_type_new_with_attrs(PURPLE_STATUS_UNAVAILABLE, "DoNotDisturb", _("Do Not Disturb"), TRUE, TRUE, FALSE, "message", _("Message"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	types = g_list_append(types, status);
+	// status = purple_status_type_new_with_attrs(PURPLE_STATUS_INVISIBLE, "Offline", _("Appear offline"), TRUE, TRUE, FALSE, "message", _("Message"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	// types = g_list_append(types, status);
+	status = purple_status_type_new_with_attrs(PURPLE_STATUS_OFFLINE, "Offline", _("Offline"), TRUE, TRUE, FALSE, "message", _("Message"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	types = g_list_append(types, status);
+
+	// User unsettable but still over the wire
+	status = purple_status_type_new_with_attrs(PURPLE_STATUS_AVAILABLE, "AvailableIdle", _("Available (Idle)"), FALSE, FALSE, FALSE, "message", _("Message"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	types = g_list_append(types, status);
+	status = purple_status_type_new_with_attrs(PURPLE_STATUS_UNAVAILABLE, "BusyIdle", _("Busy (Idle)"), FALSE, FALSE, FALSE, "message", _("Message"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	types = g_list_append(types, status);
+	status = purple_status_type_new_with_attrs(PURPLE_STATUS_OFFLINE, "PresenceUnknown", _("Unknown"), FALSE, FALSE, FALSE, "message", _("Message"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	types = g_list_append(types, status);
+
+	// Independent statuses
+	status = purple_status_type_new_with_attrs(PURPLE_STATUS_INVISIBLE, TEAMS_OOO_STATUS_ID, _("Out Of Office"), FALSE, FALSE, TRUE, "message", _("Note"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	types = g_list_append(types, status);
+	status = purple_status_type_new_with_attrs(PURPLE_STATUS_TUNE, TEAMS_WORK_LOCATION_STATUS_ID, _("Work Location"), FALSE, FALSE, TRUE, "location", _("Location"), purple_value_new(PURPLE_TYPE_STRING), "location_name", _("Name"), purple_value_new(PURPLE_TYPE_STRING), NULL);
+	types = g_list_append(types, status);
+	
+	return types;
+}
+
+
+static GList *
+teams_chat_info(PurpleConnection *gc)
+{
+	GList *m = NULL;
+	PurpleProtocolChatEntry *pce;
+
+	pce = g_new0(PurpleProtocolChatEntry, 1);
+	pce->label = _("Teams Name");
+	pce->identifier = "chatname";
+	pce->required = TRUE;
+	m = g_list_append(m, pce);
+	
+	/*pce = g_new0(PurpleProtocolChatEntry, 1);
+	pce->label = _("Password");
+	pce->identifier = "password";
+	pce->required = FALSE;
+	m = g_list_append(m, pce);*/
+	
+	return m;
+}
+
+static GHashTable *
+teams_chat_info_defaults(PurpleConnection *gc, const char *chatname)
+{
+	GHashTable *defaults;
+	defaults = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, g_free);
+	if (chatname != NULL)
+	{
+		g_hash_table_insert(defaults, "chatname", g_strdup(chatname));
+	}
+	return defaults;
+}
+
+static gchar *
+teams_get_chat_name(GHashTable *data)
+{
+	gchar *temp;
+
+	if (data == NULL)
+		return NULL;
+	
+	temp = g_hash_table_lookup(data, "chatname");
+
+	if (temp == NULL)
+		return NULL;
+
+	return g_strdup(temp);
+}
+
+
+static void
+teams_join_chat(PurpleConnection *pc, GHashTable *data)
+{
+	TeamsAccount *sa = purple_connection_get_protocol_data(pc);
+	gchar *chatname;
+	gchar *post;
+	GString *url;
+	PurpleChatConversation *chatconv;
+	
+	chatname = (gchar *)g_hash_table_lookup(data, "chatname");
+	if (chatname == NULL)
+	{
+		return;
+	}
+	
+	chatconv = purple_conversations_find_chat_with_account(chatname, sa->account);
+	if (chatconv != NULL && !purple_chat_conversation_has_left(chatconv)) {
+		purple_conversation_present(PURPLE_CONVERSATION(chatconv));
+		return;
+	}
+	
+	url = g_string_new("/v1/threads/");
+	g_string_append_printf(url, "%s", purple_url_encode(chatname));
+	g_string_append(url, "/members/");
+	g_string_append_printf(url, "8:%s", purple_url_encode(sa->username));
+	
+	/* Specifying the role does not seem to be required and often result in a users role being
+	 * downgraded from admin to user
+	 * post = "{\"role\":\"User\"}"; */
+	post = "{}";
+	
+	//TODO find new endpoint
+	//teams_post_or_get(sa, TEAMS_METHOD_PUT | TEAMS_METHOD_SSL, sa->messages_host, url->str, post, NULL, NULL, TRUE);
+	(void) post;
+	
+	g_string_free(url, TRUE);
+	
+	teams_get_conversation_history(sa, chatname);
+	teams_get_thread_users(sa, chatname);
+	
+	chatconv = purple_serv_got_joined_chat(pc, g_str_hash(chatname), chatname);
+	purple_conversation_set_data(PURPLE_CONVERSATION(chatconv), "chatname", g_strdup(chatname));
+	
+	purple_conversation_present(PURPLE_CONVERSATION(chatconv));
+}
+
+void
+teams_buddy_free(PurpleBuddy *buddy)
+{
+	TeamsBuddy *sbuddy = purple_buddy_get_protocol_data(buddy);
+	if (sbuddy != NULL)
+	{
+		purple_buddy_set_protocol_data(buddy, NULL);
+
+		g_free(sbuddy->skypename); sbuddy->skypename = NULL;
+		g_free(sbuddy->fullname); sbuddy->fullname = NULL;
+		g_free(sbuddy->display_name); sbuddy->display_name = NULL;
+		g_free(sbuddy->avatar_url); sbuddy->avatar_url = NULL;
+		g_free(sbuddy->mood); sbuddy->mood = NULL;
+		g_free(sbuddy->tenant); sbuddy->tenant = NULL;
+		g_free(sbuddy->user_type); sbuddy->user_type = NULL;
+		
+		g_free(sbuddy);
+	}
+}
+
+void
+teams_fake_group_buddy(PurpleConnection *pc, const char *who, const char *old_group, const char *new_group)
+{
+	// Do nothing to stop the remove+add behaviour
+}
+void
+teams_fake_group_rename(PurpleConnection *pc, const char *old_name, PurpleGroup *group, GList *moved_buddies)
+{
+	// Do nothing to stop the remove+add behaviour
+}
+
+static GList *
+teams_node_menu(PurpleBlistNode *node)
+{
+	GList *m = NULL;
+	PurpleMenuAction *act;
+	PurpleBuddy *buddy;
+	TeamsAccount *sa = NULL;
+	
+	if(PURPLE_IS_BUDDY(node))
+	{
+		buddy = PURPLE_BUDDY(node);
+		if (purple_buddy_get_protocol_data(buddy)) {
+			TeamsBuddy *sbuddy = purple_buddy_get_protocol_data(buddy);
+			sa = sbuddy->sa;
+		}
+		if (sa == NULL) {
+			PurpleConnection *pc = purple_account_get_connection(purple_buddy_get_account(buddy));
+			sa = purple_connection_get_protocol_data(pc);
+		}
+		
+		if (sa != NULL) {
+			act = purple_menu_action_new(_("Initiate _Chat"),
+								PURPLE_CALLBACK(teams_initiate_chat_from_node),
+								sa, NULL);
+			m = g_list_append(m, act);
+		}
+	}
+	
+	return m;
+}
+
+static gulong conversation_updated_signal = 0;
+static gulong chat_conversation_typing_signal = 0;
+static gulong im_conversation_created_signal = 0;
+static gulong send_reaction_signal = 0;
+
+static void
+teams_im_conversation_created(PurpleConversation *conv)
+{
+	PurpleConnection *pc;
+	TeamsAccount *sa;
+	PurpleAccount *account;
+	const gchar *buddyname;
+	const gchar *convname;
+	gint history_days;
+	gint since;
+
+	if (!PURPLE_IS_IM_CONVERSATION(conv))
+		return;
+
+	pc = purple_conversation_get_connection(conv);
+	if (!PURPLE_CONNECTION_IS_CONNECTED(pc))
+		return;
+
+	if (!purple_strequal(purple_protocol_get_id(purple_connection_get_protocol(pc)), TEAMS_PLUGIN_ID))
+		return;
+
+	account = purple_connection_get_account(pc);
+
+	if (!purple_account_get_bool(account, "fetch-history", TRUE))
+		return;
+
+	history_days = purple_account_get_int(account, "history-days", 7);
+	if (history_days <= 0)
+		return;
+
+	sa = purple_connection_get_protocol_data(pc);
+
+	buddyname = purple_conversation_get_name(conv);
+	convname = g_hash_table_lookup(sa->buddy_to_chat_lookup, buddyname);
+
+	if (convname == NULL || *convname == '\0')
+		return;
+
+	since = (gint)(time(NULL) - (time_t)history_days * 86400);
+	teams_fetch_conv_history_paginated(sa, convname, since);
+}
+
+// webOS: purple-teams fires many async HTTP requests carrying `sa` as user_data. On this
+// consumer/personal account the connection FLAPS (re-login every few minutes); teams_close frees
+// `sa`, but an in-flight request from the OLD connection can still complete afterwards and run its
+// handler against the freed sa -- whose zeroed memory makes sa->*_hash read NULL, so the dedup loops
+// in process_message_resource / process_conversation_resource FLOOD thousands of
+// "g_hash_table_insert/contains: assertion 'hash_table != NULL' failed" criticals in milliseconds,
+// pegging the CPU and HANGING the device (purple_http_conn_cancel_all(pc) in teams_close does not
+// always catch every request). Track live TeamsAccount pointers in a global set so the batch
+// processors can bail on a dead sa -- checked by POINTER, never dereferencing the freed sa.
+static GHashTable *teams_live_accounts = NULL;
+
+gboolean
+teams_account_is_live(TeamsAccount *sa)
+{
+	return sa != NULL && teams_live_accounts != NULL && g_hash_table_contains(teams_live_accounts, sa);
+}
+
+static void
+teams_account_mark_live(TeamsAccount *sa)
+{
+	if (teams_live_accounts == NULL)
+		teams_live_accounts = g_hash_table_new(g_direct_hash, g_direct_equal);
+	g_hash_table_add(teams_live_accounts, sa);
+}
+
+static void
+teams_account_mark_dead(TeamsAccount *sa)
+{
+	if (teams_live_accounts != NULL)
+		g_hash_table_remove(teams_live_accounts, sa);
+}
+
+static void
+teams_login(PurpleAccount *account)
+{
+	PurpleConnection *pc = purple_account_get_connection(account);
+	TeamsAccount *sa = g_new0(TeamsAccount, 1);
+	PurpleConnectionFlags flags;
+	const gchar *tenant;
+	const gchar *password = purple_connection_get_password(pc);
+
+	/* Found+fixed 2026-08-05: libpurple core's own auto-away (driven by the SAME physical
+	 * touchscreen/keyboard idle clock teams_set_idle's comment already documents as idle almost
+	 * permanently on this always-on-bridge device) periodically fires the standard
+	 * prpl_info->set_status callback (teams_set_status) with an "Away" status, independent of and
+	 * in addition to anything this plugin does on its own. CAPTURED LIVE: even with
+	 * teams_idle_update's 120s periodic re-publish of "Available" already in place (see
+	 * teams_messages.c), the account still visibly flipped back to "Away" ~40s after a periodic
+	 * refresh - core auto-away firing in the gap between our own refreshes and undoing them, with
+	 * up to ~80s of real "Away" exposure to peers (and, per teams_set_idle's own comment, broken
+	 * incoming call routing) each cycle. This is a process-global libpurple pref, not
+	 * Teams-specific, but harmless to set redundantly if another connector later does the same;
+	 * setting it here (once per Teams login) is enough to stop it firing for this account. */
+	purple_prefs_set_bool("/purple/away/away_when_idle", FALSE);
+
+	purple_connection_set_protocol_data(pc, sa);
+	teams_account_mark_live(sa);
+
+	flags = purple_connection_get_flags(pc);
+	flags |= PURPLE_CONNECTION_FLAG_HTML | PURPLE_CONNECTION_FLAG_NO_BGCOLOR | PURPLE_CONNECTION_FLAG_NO_FONTSIZE;
+	purple_connection_set_flags(pc, flags);
+	
+	if (!TEAMS_BUDDY_IS_MSN(purple_account_get_username(account))) {
+		sa->username = g_ascii_strdown(purple_account_get_username(account), -1);
+	}
+	sa->account = account;
+	sa->pc = pc;
+	sa->cookie_jar = purple_http_cookie_jar_new();
+	sa->sent_messages_hash = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	sa->received_messages_hash = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	sa->quote_meta_hash = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	sa->buddy_to_chat_lookup = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	sa->chat_to_buddy_lookup = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	sa->calendar_reminder_timeouts = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	sa->subscribed_contacts = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	sa->fetched_profiles = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	sa->presence_etag_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	sa->pending_subscription_contacts = g_queue_new();
+	sa->subscription_flush_timer = 0;
+	sa->pending_presences = g_queue_new();
+	sa->presence_drain_source = 0;
+	sa->presence_mri_index = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	sa->keepalive_pool = purple_http_keepalive_pool_new();
+	purple_http_keepalive_pool_set_limit_per_host(sa->keepalive_pool, TEAMS_MAX_CONNECTIONS);
+	sa->conns = purple_http_connection_set_new();
+	sa->processed_event_messages = g_queue_new();
+	
+#ifdef ENABLE_TEAMS_PERSONAL
+	tenant = TEAMS_PERSONAL_TENANT_ID;
+#else
+	tenant = purple_account_get_string(account, "tenant", NULL);
+#endif // ENABLE_TEAMS_PERSONAL
+	if (tenant != NULL) {
+		sa->tenant = g_strdup(tenant);
+	}
+	
+	if (password && *password && !purple_strequal(password, "devicecode")
+			&& !g_str_has_prefix(password, "webauth:")) {
+		sa->refresh_token = g_strdup(password);
+		purple_connection_update_progress(pc, _("Authenticating"), 1, 3);
+		teams_oauth_refresh_token(sa);
+	} else {
+		/* Credential is the "devicecode" sentinel, empty, or a "webauth:<redirect
+		 * URL>" captured by an embedding OAuth browser. (Some transports reject an
+		 * EMPTY stored password before login is even called, so accounts may store a
+		 * non-empty sentinel instead.)
+		 *
+		 * Personal/TFL priority: (1) a refresh_token persisted from a previous
+		 * successful login -> silent refresh (this also means a one-shot "webauth:"
+		 * auth code is never replayed after it has been exchanged once); else
+		 * (2) a "webauth:" auth-code URL -> exchange it for tokens; else
+		 * (3) the interactive device-code flow. */
+		gchar *saved_refresh = teams_load_refresh_token_password(account);
+		if (saved_refresh && *saved_refresh) {
+			sa->refresh_token = saved_refresh; /* take ownership */
+			purple_debug_info("teams", "Using persisted refresh_token for silent login\n");
+			purple_connection_update_progress(pc, _("Authenticating"), 1, 3);
+			teams_oauth_refresh_token(sa);
+		} else if (password && g_str_has_prefix(password, "webauth:")) {
+			g_free(saved_refresh);
+			purple_debug_info("teams", "Using webauth auth-code from OAuth browser\n");
+			teams_do_authcode_login(sa, password + strlen("webauth:"));
+		} else {
+			g_free(saved_refresh);
+			teams_do_devicecode_login(sa);
+		}
+	}
+	
+	if (!conversation_updated_signal) {
+		conversation_updated_signal = purple_signal_connect(purple_conversations_get_handle(), "conversation-updated", purple_connection_get_protocol(pc), PURPLE_CALLBACK(teams_mark_conv_seen), NULL);
+	}
+	if (!chat_conversation_typing_signal) {
+		chat_conversation_typing_signal = purple_signal_connect(purple_conversations_get_handle(), "chat-conversation-typing", purple_connection_get_protocol(pc), PURPLE_CALLBACK(teams_conv_send_typing), NULL);
+		if (!chat_conversation_typing_signal) {
+			// Typing signal doesn't exist in this libpurple version
+			chat_conversation_typing_signal = G_MAXULONG;
+		}
+	}
+	if (!im_conversation_created_signal) {
+		im_conversation_created_signal = purple_signal_connect(purple_conversations_get_handle(), "conversation-created", purple_connection_get_protocol(pc), PURPLE_CALLBACK(teams_im_conversation_created), NULL);
+	}
+	// webOS reactions (SEND): connect once, process-wide, to the transport's send-reaction
+	// signal. It fires for every account; teams_send_reaction_signal_cb filters to ours. The
+	// transport registers this signal at init (before any account logs in); on non-webOS
+	// libpurple the signal doesn't exist and purple_signal_connect harmlessly returns 0.
+	if (!send_reaction_signal) {
+		send_reaction_signal = purple_signal_connect(purple_conversations_get_handle(), "webos-im-send-reaction", purple_get_core(), PURPLE_CALLBACK(teams_send_reaction_signal_cb), NULL);
+		if (!send_reaction_signal) {
+			// Signal not registered (non-webOS build); don't retry every login.
+			send_reaction_signal = G_MAXULONG;
+		}
+	}
+	// Setup callbacks for the preferences.
+	// handle = purple_proxy_get_handle();
+	// purple_prefs_connect_callback(handle, "/purple/proxy/type", proxy_pref_cb, NULL);
+	// purple_prefs_connect_callback(handle, "/purple/proxy/host", proxy_pref_cb, NULL);
+	// purple_prefs_connect_callback(handle, "/purple/proxy/port", proxy_pref_cb, NULL);
+	// purple_prefs_connect_callback(handle, "/purple/proxy/username", proxy_pref_cb, NULL);
+	// purple_prefs_connect_callback(handle, "/purple/proxy/password", proxy_pref_cb, NULL);
+	//
+	// static void
+	// proxy_pref_cb(const char *name, PurplePrefType type, gconstpointer value, gpointer data)
+	// purple_signal_emit(pidgin_account_get_handle(), "account-modified", account);
+
+}
+
+static void
+teams_close(PurpleConnection *pc)
+{
+	TeamsAccount *sa;
+	GSList *buddies;
+	GList *convs;
+	
+	g_return_if_fail(pc != NULL);
+#if !PURPLE_VERSION_CHECK(3, 0, 0)
+	purple_connection_set_state(pc, PURPLE_CONNECTION_DISCONNECTING);
+#endif
+	
+	sa = purple_connection_get_protocol_data(pc);
+	g_return_if_fail(sa != NULL);
+
+	// Flush pending icon downloads for this account before cancelling
+	// HTTP connections. Otherwise the queue timer may fire after sa is
+	// freed and dereference a dangling sbuddy->sa pointer.
+	teams_flush_icon_queue_for_account(sa->account);
+
+	if (sa->calendar_poll_timeout)            g_source_remove(sa->calendar_poll_timeout);
+	if (sa->authcheck_timeout)                g_source_remove(sa->authcheck_timeout);
+	if (sa->poll_timeout)                     g_source_remove(sa->poll_timeout);
+	if (sa->watchdog_timeout)                 g_source_remove(sa->watchdog_timeout);
+	if (sa->refresh_token_timeout)            g_source_remove(sa->refresh_token_timeout);
+	if (sa->idle_timeout)                     g_source_remove(sa->idle_timeout);
+	if (sa->login_device_code_expires_timeout) g_source_remove(sa->login_device_code_expires_timeout);
+	if (sa->login_device_code_timeout)        g_source_remove(sa->login_device_code_timeout);
+	if (sa->presence_drain_source)            { g_source_remove(sa->presence_drain_source); sa->presence_drain_source = 0; }
+	if (sa->subscription_flush_timer)         { g_source_remove(sa->subscription_flush_timer); sa->subscription_flush_timer = 0; }
+	// Trouter timeouts handled in teams_trouter_stop()
+
+	teams_logout(sa);
+	
+	purple_debug_info("teams", "destroying incomplete connections\n");
+
+	purple_http_connection_set_destroy(sa->conns);
+	sa->conns = NULL;
+	purple_http_conn_cancel_all(pc);
+	purple_http_keepalive_pool_unref(sa->keepalive_pool);
+	purple_http_cookie_jar_unref(sa->cookie_jar);
+
+	teams_trouter_stop(sa);
+
+	buddies = purple_blist_find_buddies(sa->account, NULL);
+	while (buddies != NULL) {
+		PurpleBuddy *buddy = buddies->data;
+		teams_buddy_free(buddy);
+		purple_buddy_set_protocol_data(buddy, NULL);
+		buddies = g_slist_delete_link(buddies, buddies);
+	}
+
+	convs = purple_get_conversations();
+	while (convs != NULL) {
+		PurpleConversation *conv = convs->data;
+		if(purple_conversation_get_account(conv) == sa->account) {
+			g_free(purple_conversation_get_data(conv, "last_teams_id"));
+			g_free(purple_conversation_get_data(conv, "last_teams_clientmessageid"));
+			g_free(purple_conversation_get_data(conv, "chatname"));
+		}
+		convs = g_list_next(convs);
+	}
+
+	// Don't use g_queue_free_full() since that's too-new for Windows
+	while (!g_queue_is_empty(sa->processed_event_messages)) {
+		gpointer event_message = g_queue_pop_head(sa->processed_event_messages);
+		g_free(event_message);
+	}
+	g_queue_free(sa->processed_event_messages);
+	
+	g_hash_table_destroy(sa->sent_messages_hash);
+	g_hash_table_destroy(sa->received_messages_hash);
+	g_hash_table_destroy(sa->quote_meta_hash);
+	g_hash_table_destroy(sa->buddy_to_chat_lookup);
+	g_hash_table_destroy(sa->chat_to_buddy_lookup);
+	g_hash_table_destroy(sa->calendar_reminder_timeouts);
+	g_hash_table_destroy(sa->subscribed_contacts);
+	g_hash_table_destroy(sa->fetched_profiles);
+	g_hash_table_destroy(sa->presence_etag_cache);
+	if (sa->subscription_flush_timer != 0) {
+		g_source_remove(sa->subscription_flush_timer);
+		sa->subscription_flush_timer = 0;
+	}
+	while (!g_queue_is_empty(sa->pending_subscription_contacts)) {
+		GSList *l = g_queue_pop_head(sa->pending_subscription_contacts);
+		g_slist_free_full(l, g_free);
+	}
+	g_queue_free(sa->pending_subscription_contacts);
+	if (sa->presence_drain_source != 0) {
+		g_source_remove(sa->presence_drain_source);
+		sa->presence_drain_source = 0;
+	}
+	while (!g_queue_is_empty(sa->pending_presences)) {
+		gpointer presence = g_queue_pop_head(sa->pending_presences);
+		g_free(presence);
+	}
+	g_queue_free(sa->pending_presences);
+	g_hash_table_destroy(sa->presence_mri_index);
+	
+	g_free(sa->login_device_code);
+	g_free(sa->substrate_access_token);
+	g_free(sa->csa_access_token);
+	g_free(sa->presence_access_token);
+	g_free(sa->id_token);
+	g_free(sa->refresh_token);
+	g_free(sa->region);
+	g_free(sa->messages_cursor);
+	g_free(sa->tenant);
+	
+	g_free(sa->vdms_token);
+	g_free(sa->skype_token);
+	g_free(sa->registration_token);
+	g_free(sa->endpoint);
+	g_free(sa->primary_member_name);
+	g_free(sa->self_display_name);
+	g_free(sa->username);
+	teams_account_mark_dead(sa); // webOS: stop late async handlers from touching this freed sa (hash-flood hang)
+	g_free(sa);
+}
+
+gboolean
+teams_offline_message(const PurpleBuddy *buddy)
+{
+	return TRUE;
+}
+
+static PurpleCmdRet
+teams_cmd_list(PurpleConversation *conv, const gchar *cmd, gchar **args, gchar **error, void *data)
+{
+	purple_roomlist_show_with_account(purple_conversation_get_account(conv));
+	
+	return PURPLE_CMD_RET_OK;
+}
+
+static PurpleCmdRet
+teams_cmd_leave(PurpleConversation *conv, const gchar *cmd, gchar **args, gchar **error, void *data)
+{
+	PurpleConnection *pc = NULL;
+	int id = -1;
+	TeamsAccount *sa;
+	
+	pc = purple_conversation_get_connection(conv);
+	id = purple_chat_conversation_get_id(PURPLE_CHAT_CONVERSATION(conv));
+	
+	if (pc == NULL || id == -1)
+		return PURPLE_CMD_RET_FAILED;
+	
+	sa = purple_connection_get_protocol_data(pc);
+	if (sa == NULL)
+		return PURPLE_CMD_RET_FAILED;
+	
+	teams_chat_kick(pc, id, sa->username);
+	
+	return PURPLE_CMD_RET_OK;
+}
+
+static PurpleCmdRet
+teams_cmd_kick(PurpleConversation *conv, const gchar *cmd, gchar **args, gchar **error, void *data)
+{
+	PurpleConnection *pc = NULL;
+	int id = -1;
+	
+	pc = purple_conversation_get_connection(conv);
+	id = purple_chat_conversation_get_id(PURPLE_CHAT_CONVERSATION(conv));
+	
+	if (pc == NULL || id == -1)
+		return PURPLE_CMD_RET_FAILED;
+	
+	teams_chat_kick(pc, id, args[0]);
+	
+	return PURPLE_CMD_RET_OK;
+}
+
+static PurpleCmdRet
+teams_cmd_invite(PurpleConversation *conv, const gchar *cmd, gchar **args, gchar **error, void *data)
+{
+	PurpleConnection *pc = NULL;
+	int id = -1;
+	
+	pc = purple_conversation_get_connection(conv);	
+	id = purple_chat_conversation_get_id(PURPLE_CHAT_CONVERSATION(conv));
+	
+	if (pc == NULL || id == -1)
+		return PURPLE_CMD_RET_FAILED;
+	
+	teams_chat_invite(pc, id, NULL, args[0]);
+	
+	return PURPLE_CMD_RET_OK;
+}
+
+static PurpleCmdRet
+teams_cmd_topic(PurpleConversation *conv, const gchar *cmd, gchar **args, gchar **error, void *data)
+{
+	PurpleConnection *pc = NULL;
+	PurpleChatConversation *chat;
+	int id = -1;
+	
+	pc = purple_conversation_get_connection(conv);
+	chat = PURPLE_CHAT_CONVERSATION(conv);
+	id = purple_chat_conversation_get_id(chat);
+	
+	if (pc == NULL || id == -1)
+		return PURPLE_CMD_RET_FAILED;
+
+	if (!args || !args[0]) {
+		gchar *buf;
+		const gchar *topic = purple_chat_conversation_get_topic(chat);
+
+		if (topic) {
+			gchar *tmp, *tmp2;
+			tmp = g_markup_escape_text(topic, -1);
+			tmp2 = purple_markup_linkify(tmp);
+			buf = g_strdup_printf(_("current topic is: %s"), tmp2);
+			g_free(tmp);
+			g_free(tmp2);
+		} else {
+			buf = g_strdup(_("No topic is set"));
+		}
+		
+		purple_conversation_write_system_message(conv, buf, PURPLE_MESSAGE_NO_LOG);
+		
+		g_free(buf);
+		return PURPLE_CMD_RET_OK;
+	}
+	
+	teams_chat_set_topic(pc, id, args[0]);
+	
+	return PURPLE_CMD_RET_OK;
+}
+
+static PurpleCmdRet
+teams_cmd_call(PurpleConversation *conv, const gchar *cmd, gchar **args, gchar **error, void *data)
+{
+	PurpleConnection *pc = NULL;
+	TeamsAccount *sa;
+	const gchar *convname = NULL;
+	
+	pc = purple_conversation_get_connection(conv);
+	if (pc == NULL)
+		return PURPLE_CMD_RET_FAILED;
+	sa = purple_connection_get_protocol_data(pc);
+	
+	convname = purple_conversation_get_data(conv, "chatname");
+	if (!convname) {
+		convname = purple_conversation_get_name(conv);
+	
+		if (PURPLE_IS_IM_CONVERSATION(conv)) {
+			if (!TEAMS_BUDDY_IS_NOTIFICATIONS(convname)) {
+				convname = g_hash_table_lookup(sa->buddy_to_chat_lookup, convname);
+			}
+		}
+	}
+	
+	if (!convname)
+		return PURPLE_CMD_RET_FAILED;
+	
+	gchar *message = g_strconcat("https://" TEAMS_BASE_ORIGIN_HOST "/l/meetup-join/", purple_url_encode(convname), "/0", NULL);
+	
+	PurpleMessage *msg = purple_message_new_system(message, 0);
+	purple_conversation_write_message(conv, msg);
+	purple_message_destroy(msg);
+	
+	g_free(message);
+	
+	return PURPLE_CMD_RET_OK;
+}
+
+/******************************************************************************/
+/* Plugin functions */
+/******************************************************************************/
+
+static gboolean
+teams_uri_handler(const char *proto, const char *cmd, GHashTable *params)
+{
+	//PurpleAccount *account;
+	//PurpleConnection *pc;
+	
+	if (!g_str_equal(proto, "msteams"))
+		return FALSE;
+	
+	// msteams:/1/channel/19%3a.....%40thread.skype/{nameofchannel}?groupId={groupId}&tenantId={tenantId}
+	
+	//we don't know how to handle this
+	return FALSE;
+}
+
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+	typedef struct _TeamsProtocol
+	{
+		PurpleProtocol parent;
+	} TeamsProtocol;
+
+	typedef struct _TeamsProtocolClass
+	{
+		PurpleProtocolClass parent_class;
+	} TeamsProtocolClass;
+
+	G_MODULE_EXPORT GType teams_protocol_get_type(void);
+	#define TEAMS_TYPE_PROTOCOL             (teams_protocol_get_type())
+	#define TEAMS_PROTOCOL(obj)             (G_TYPE_CHECK_INSTANCE_CAST((obj), TEAMS_TYPE_PROTOCOL, TeamsProtocol))
+	#define TEAMS_PROTOCOL_CLASS(klass)     (G_TYPE_CHECK_CLASS_CAST((klass), TEAMS_TYPE_PROTOCOL, TeamsProtocolClass))
+	#define TEAMS_IS_PROTOCOL(obj)          (G_TYPE_CHECK_INSTANCE_TYPE((obj), TEAMS_TYPE_PROTOCOL))
+	#define TEAMS_IS_PROTOCOL_CLASS(klass)  (G_TYPE_CHECK_CLASS_TYPE((klass), TEAMS_TYPE_PROTOCOL))
+	#define TEAMS_PROTOCOL_GET_CLASS(obj)   (G_TYPE_INSTANCE_GET_CLASS((obj), TEAMS_TYPE_PROTOCOL, TeamsProtocolClass))
+
+	static PurpleProtocol *teams_protocol;
+#else
+	
+// Normally set in core.c in purple3
+void _purple_socket_init(void);
+void _purple_socket_uninit(void);
+
+#endif
+
+
+static gboolean
+plugin_load(PurplePlugin *plugin
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+, GError **error
+#endif
+)
+{
+	
+#if !PURPLE_VERSION_CHECK(3, 0, 0)
+	_purple_socket_init();
+	purple_http_init();
+#endif
+	
+	
+	//leave
+	purple_cmd_register("leave", "", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
+						TEAMS_PLUGIN_ID, teams_cmd_leave,
+						_("leave:  Leave the group chat"), NULL);
+	//kick
+	purple_cmd_register("kick", "s", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY,
+						TEAMS_PLUGIN_ID, teams_cmd_kick,
+						_("kick &lt;user&gt;:  Kick a user from the group chat."),
+						NULL);
+	//add
+	purple_cmd_register("add", "s", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY,
+						TEAMS_PLUGIN_ID, teams_cmd_invite,
+						_("add &lt;user&gt;:  Add a user to the group chat."),
+						NULL);
+	//topic
+	purple_cmd_register("topic", "s", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
+						TEAMS_PLUGIN_ID, teams_cmd_topic,
+						_("topic [&lt;new topic&gt;]:  View or change the topic"),
+						NULL);
+	/*
+	//call, as in call person
+	//kickban
+	purple_cmd_register("kickban", "s", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY,
+						TEAMS_PLUGIN_ID, teams_cmd_kickban,
+						_("kickban &lt;user&gt; [room]:  Kick and ban a user from the room."),
+						NULL);
+	//setrole
+	purple_cmd_register("setrole", "ss", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY,
+						TEAMS_PLUGIN_ID, teams_cmd_setrole,
+						_("setrole &lt;user&gt; &lt;MASTER | USER | ADMIN&gt;:  Change the role of a user."),
+						NULL);
+	*/
+	
+	purple_cmd_register("list", "", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_IM,
+						TEAMS_PLUGIN_ID, teams_cmd_list,
+						_("list: Display a list of multi-chat group chats you are in."),
+						NULL);
+	
+	purple_cmd_register("call", "", PURPLE_CMD_P_PLUGIN, PURPLE_CMD_FLAG_CHAT |
+						PURPLE_CMD_FLAG_PROTOCOL_ONLY | PURPLE_CMD_FLAG_IM,
+						TEAMS_PLUGIN_ID, teams_cmd_call,
+						_("call: Create a URL link to start a voice/video call in the browser."),
+						NULL);
+	
+	purple_signal_connect(purple_get_core(), "uri-handler", plugin, PURPLE_CALLBACK(teams_uri_handler), NULL);
+
+#ifdef TEAMS_WEBOS_CALL
+	/* Register com.palm.teams.call at plugin LOAD - NOT at login. The stock Phone app's CallSynergizer
+	 * subscribes to every PHONE transport's callStateQuery ONCE at its own launch (device boot) and does
+	 * not reliably re-subscribe if a transport was absent then. Binding registration to teams login
+	 * (teams_login.c -> teams_call_luna_init) means a slow Teams login (trouter/websocket) can leave
+	 * com.palm.teams.call off the bus at boot -> CallSynergizer gets "not running", never retries, and
+	 * incoming Teams calls never ring the Phone app. Registering here puts the service on the bus first.
+	 * teams_call_luna_init(NULL) leaves g_sa NULL (callStateQuery returns empty lines until an account
+	 * connects); the login path calls it again to bind the TeamsAccount (idempotent). Mirrors the Signal
+	 * fix in purple-presage init.c. */
+	teams_call_luna_init(NULL);
+#endif
+
+	return TRUE;
+}
+
+static gboolean
+plugin_unload(PurplePlugin *plugin
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+, GError **error
+#endif
+)
+{
+#if !PURPLE_VERSION_CHECK(3, 0, 0)
+	_purple_socket_uninit();
+	purple_http_uninit();
+#endif
+	purple_signals_disconnect_by_handle(plugin);
+	
+	return TRUE;
+}
+
+static GList *
+teams_actions(
+#if !PURPLE_VERSION_CHECK(3, 0, 0)
+PurplePlugin *plugin, gpointer context
+#else
+PurpleConnection *pc
+#endif
+)
+{
+	GList *m = NULL;
+	PurpleProtocolAction *act;
+
+	act = purple_protocol_action_new(_("Search for Teams Contacts"), teams_search_users);
+	m = g_list_append(m, act);
+
+	act = purple_protocol_action_new(_("Set work location"), teams_set_work_location_action);
+	m = g_list_append(m, act);
+
+	return m;
+}
+
+#if !PURPLE_VERSION_CHECK(2, 8, 0)
+#	define OPT_PROTO_INVITE_MESSAGE 0x00000800
+#endif
+
+// Add forwards-compatibility for newer libpurple's when compiling on older ones
+typedef struct 
+{
+	PurplePluginProtocolInfo parent;
+
+	#if !PURPLE_VERSION_CHECK(2, 6, 0)
+		gboolean (*initiate_media)(PurpleAccount *account, const char *who, PurpleMediaSessionType type);
+		PurpleMediaCaps (*get_media_caps)(PurpleAccount *account, const char *who);
+	#endif
+	#if !PURPLE_VERSION_CHECK(2, 7, 0)
+		PurpleMood *(*get_moods)(PurpleAccount *account);
+		void (*set_public_alias)(PurpleConnection *gc, const char *alias, PurpleSetPublicAliasSuccessCallback success_cb, PurpleSetPublicAliasFailureCallback failure_cb);
+		void (*get_public_alias)(PurpleConnection *gc, PurpleGetPublicAliasSuccessCallback success_cb, PurpleGetPublicAliasFailureCallback failure_cb);
+	#endif
+	#if !PURPLE_VERSION_CHECK(2, 8, 0)
+		void (*add_buddy_with_invite)(PurpleConnection *pc, PurpleBuddy *buddy, PurpleGroup *group, const char *message);
+		void (*add_buddies_with_invite)(PurpleConnection *pc, GList *buddies, GList *groups, const char *message);
+	#endif
+	#if !PURPLE_VERSION_CHECK(2, 14, 0)
+		char *(*get_cb_alias)(PurpleConnection *gc, int id, const char *who);
+		gboolean (*chat_can_receive_file)(PurpleConnection *, int id);
+		void (*chat_send_file)(PurpleConnection *, int id, const char *filename);
+	#endif
+} PurplePluginProtocolInfoExt;
+
+#if !PURPLE_VERSION_CHECK(3, 0, 0)
+static void
+plugin_init(PurplePlugin *plugin)
+{
+	PurplePluginInfo *info = g_new0(PurplePluginInfo, 1);
+	PurplePluginProtocolInfoExt *prpl_info_ext = g_new0(PurplePluginProtocolInfoExt, 1);
+	PurplePluginProtocolInfo *prpl_info = (PurplePluginProtocolInfo *) prpl_info_ext;
+#endif
+
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+static void 
+teams_protocol_init(PurpleProtocol *prpl_info) 
+{
+	PurpleProtocol *info = prpl_info;
+#endif
+	PurpleAccountOption *opt;
+	PurpleBuddyIconSpec icon_spec = {"jpeg", 0, 0, 96, 96, 0, PURPLE_ICON_SCALE_DISPLAY};
+
+	//PurpleProtocol
+	info->id = TEAMS_PLUGIN_ID;
+	info->name = "Teams (Work and School)";
+	prpl_info->options = OPT_PROTO_NO_PASSWORD | OPT_PROTO_CHAT_TOPIC /*| OPT_PROTO_INVITE_MESSAGE*/ | OPT_PROTO_IM_IMAGE;
+
+#if !PURPLE_VERSION_CHECK(3, 0, 0)
+#	define TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt) prpl_info->protocol_options = g_list_append(prpl_info->protocol_options, (opt));
+	prpl_info->icon_spec = icon_spec;
+#else
+#	define TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt) prpl_info->account_options = g_list_append(prpl_info->account_options, (opt));
+	prpl_info->icon_spec = &icon_spec;
+#endif
+	
+#ifndef ENABLE_TEAMS_PERSONAL
+	opt = purple_account_option_string_new(_("Tenant"), "tenant", "");
+	TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt);
+#endif
+	
+	opt = purple_account_option_bool_new(_("Set global status"), "set-global-status", TRUE);
+	TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt);
+	
+	opt = purple_account_option_bool_new(_("Collapse Teams threads into a single chat window"), "should_collapse_threads", TRUE);
+	TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt);
+	
+	opt = purple_account_option_bool_new(_("Hide meeting chats from buddy list"), "hide_meeting_chats", FALSE);
+	TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt);
+	
+	opt = purple_account_option_int_new(_("Notify me before meeting begins (minutes)"), "calendar_notify_minutes", -1);
+	TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt);
+	
+	opt = purple_account_option_bool_new(_("Fetch conversation history when opening IM window"), "fetch-history", TRUE);
+	TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt);
+	
+	opt = purple_account_option_int_new(_("Days of history to fetch"), "history-days", 7);
+	TEAMS_PRPL_APPEND_ACCOUNT_OPTION(opt);
+
+#undef TEAMS_PRPL_APPEND_ACCOUNT_OPTION
+	
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+}
+
+static void 
+teams_protocol_class_init(PurpleProtocolClass *prpl_info) 
+{
+#endif
+	//PurpleProtocolClass
+	prpl_info->login = teams_login;
+	prpl_info->close = teams_close;
+	prpl_info->status_types = teams_status_types;
+	prpl_info->list_icon = teams_list_icon;
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+}
+
+static void 
+teams_protocol_client_iface_init(PurpleProtocolClientIface *prpl_info) 
+{
+	PurpleProtocolClientIface *info = prpl_info;
+#endif
+	
+	//PurpleProtocolClientIface
+#if !PURPLE_VERSION_CHECK(3, 0, 0)
+	info->actions = teams_actions;
+#else
+	info->get_actions = teams_actions;
+#endif
+	prpl_info->list_emblem = teams_list_emblem;
+	prpl_info->status_text = teams_status_text;
+	prpl_info->tooltip_text = teams_tooltip_text;
+	prpl_info->blist_node_menu = teams_node_menu;
+	prpl_info->buddy_free = teams_buddy_free;
+	prpl_info->normalize = purple_normalize_nocase;
+	prpl_info->offline_message = teams_offline_message;
+	prpl_info->get_account_text_table = NULL; // teams_get_account_text_table;
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+}
+
+static void 
+teams_protocol_server_iface_init(PurpleProtocolServerIface *prpl_info) 
+{
+#endif
+	
+	//PurpleProtocolServerIface
+	prpl_info->get_info = teams_get_info;
+	prpl_info->set_status = teams_set_status;
+	prpl_info->set_idle = teams_set_idle;
+#if !PURPLE_VERSION_CHECK(3, 0, 0)
+	prpl_info->add_buddy = teams_add_buddy;
+#else
+	prpl_info->add_buddy = teams_add_buddy_with_invite;
+#endif
+	prpl_info->remove_buddy = teams_buddy_remove;
+	prpl_info->group_buddy = teams_fake_group_buddy;
+	prpl_info->rename_group = teams_fake_group_rename;
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+}
+
+static void 
+teams_protocol_im_iface_init(PurpleProtocolIMIface *prpl_info) 
+{
+#endif
+	
+	//PurpleProtocolIMIface
+#if !PURPLE_VERSION_CHECK(3, 0, 0)
+	prpl_info->send_im = teams_send_im;
+#else
+	prpl_info->send = teams_send_im;
+#endif
+	prpl_info->send_typing = teams_send_typing;
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+}
+
+static void 
+teams_protocol_chat_iface_init(PurpleProtocolChatIface *prpl_info) 
+{
+#endif
+	
+	//PurpleProtocolChatIface
+#if !PURPLE_VERSION_CHECK(3, 0, 0)
+	prpl_info->chat_info = teams_chat_info;
+	prpl_info->chat_info_defaults = teams_chat_info_defaults;
+	prpl_info->join_chat = teams_join_chat;
+	prpl_info->get_chat_name = teams_get_chat_name;
+	prpl_info->chat_invite = teams_chat_invite;
+	prpl_info->chat_leave =	NULL; //teams_chat_fake_leave;
+	prpl_info->chat_send = teams_chat_send;
+	prpl_info->set_chat_topic = teams_chat_set_topic;
+	#if PURPLE_VERSION_CHECK(2, 14, 0)
+		//prpl_info->get_cb_alias = teams_chat_get_cb_alias;
+	#else
+		//prpl_info_ext->get_cb_alias = teams_chat_get_cb_alias;
+	#endif
+#else
+	prpl_info->info = teams_chat_info;
+	prpl_info->info_defaults = teams_chat_info_defaults;
+	prpl_info->join = teams_join_chat;
+	prpl_info->get_name = teams_get_chat_name;
+	prpl_info->invite = teams_chat_invite;
+	prpl_info->leave =	NULL; //teams_chat_fake_leave;
+	prpl_info->send = teams_chat_send;
+	prpl_info->set_topic = teams_chat_set_topic;
+#endif
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+}
+
+static void 
+teams_protocol_privacy_iface_init(PurpleProtocolPrivacyIface *prpl_info) 
+{
+#endif
+
+	//PurpleProtocolPrivacyIface
+	prpl_info->add_deny = teams_buddy_block;
+	prpl_info->rem_deny = teams_buddy_unblock;
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+}
+
+static void 
+teams_protocol_xfer_iface_init(PurpleProtocolXferInterface *prpl_info) 
+{
+#endif
+	
+	//PurpleProtocolXferInterface
+	prpl_info->new_xfer = teams_new_xfer;
+	prpl_info->send_file = teams_send_file;
+#if !PURPLE_VERSION_CHECK(3, 0, 0)
+	prpl_info->can_receive_file = teams_can_receive_file;
+#else
+	prpl_info->can_receive = teams_can_receive_file;
+#endif
+	#if PURPLE_VERSION_CHECK(2, 14, 0)
+		// prpl_info->chat_send_file = teams_chat_send_file;
+		prpl_info->chat_can_receive_file = teams_chat_can_receive_file;
+	#else
+		// prpl_info_ext->chat_send_file = teams_chat_send_file;
+		prpl_info_ext->chat_can_receive_file = teams_chat_can_receive_file;
+	#endif
+	
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+}
+
+static void 
+teams_protocol_roomlist_iface_init(PurpleProtocolRoomlistIface *prpl_info) 
+{
+#endif
+	
+	//PurpleProtocolRoomlistIface
+#if !PURPLE_VERSION_CHECK(3, 0, 0)
+	prpl_info->roomlist_get_list = teams_roomlist_get_list;
+#else
+	prpl_info->get_list = teams_roomlist_get_list;
+#endif
+	
+#if !PURPLE_VERSION_CHECK(3, 0, 0)
+	// Plugin info
+	info->magic = PURPLE_PLUGIN_MAGIC;
+	info->major_version = 2;
+	info->minor_version = 5;
+	info->type = PURPLE_PLUGIN_PROTOCOL;
+	info->priority = PURPLE_PRIORITY_DEFAULT;
+	info->version = TEAMS_PLUGIN_VERSION;
+	info->summary = N_("Teams Protocol Plugin");
+	info->description = N_("Teams Protocol Plugin");
+	info->author = "Eion Robb <eionrobb@gmail.com>";
+	info->homepage = "http://github.com/EionRobb/purple-teams";
+	info->load = plugin_load;
+	info->unload = plugin_unload;
+	info->extra_info = prpl_info;
+	
+	// Protocol info
+	prpl_info->struct_size = sizeof(PurplePluginProtocolInfoExt);
+	#if PURPLE_MINOR_VERSION >= 8
+		prpl_info->add_buddy_with_invite = teams_add_buddy_with_invite;
+	#else
+		prpl_info_ext->add_buddy_with_invite = teams_add_buddy_with_invite;
+	#endif
+	
+	plugin->info = info;
+
+#ifdef ENABLE_TEAMS_PERSONAL
+	/* Personal/TFL: build the personal/consumer flavour (Skype/live.com
+	 * endpoints + personal OAuth client id) for personal Microsoft accounts —
+	 * the work/school build hits "Guest user OID is missing. User is not
+	 * redeemed." at teams.microsoft.com for these. Use the distinct personal
+	 * prpl id so this can run side by side with the work build; downstreams that
+	 * need a specific id (e.g. webOS) override TEAMS_PERSONAL_PLUGIN_ID at build time. */
+	plugin->info->id = TEAMS_PERSONAL_PLUGIN_ID;
+	plugin->info->name = "Teams (Personal/Free)";
+	prpl_info->list_icon = teams_personal_list_icon;
+#endif // ENABLE_TEAMS_PERSONAL
+
+#endif
+	
+}
+
+#if PURPLE_VERSION_CHECK(3, 0, 0)
+
+
+PURPLE_DEFINE_TYPE_EXTENDED(
+	TeamsProtocol, teams_protocol, PURPLE_TYPE_PROTOCOL, 0,
+
+	PURPLE_IMPLEMENT_INTERFACE_STATIC(PURPLE_TYPE_PROTOCOL_CLIENT_IFACE,
+	                                  teams_protocol_client_iface_init)
+
+	PURPLE_IMPLEMENT_INTERFACE_STATIC(PURPLE_TYPE_PROTOCOL_SERVER_IFACE,
+	                                  teams_protocol_server_iface_init)
+
+	PURPLE_IMPLEMENT_INTERFACE_STATIC(PURPLE_TYPE_PROTOCOL_IM_IFACE,
+	                                  teams_protocol_im_iface_init)
+
+	PURPLE_IMPLEMENT_INTERFACE_STATIC(PURPLE_TYPE_PROTOCOL_CHAT_IFACE,
+	                                  teams_protocol_chat_iface_init)
+
+	PURPLE_IMPLEMENT_INTERFACE_STATIC(PURPLE_TYPE_PROTOCOL_PRIVACY_IFACE,
+	                                  teams_protocol_privacy_iface_init)
+
+	PURPLE_IMPLEMENT_INTERFACE_STATIC(PURPLE_TYPE_PROTOCOL_ROOMLIST_IFACE,
+	                                  teams_protocol_roomlist_iface_init)
+
+	PURPLE_IMPLEMENT_INTERFACE_STATIC(PURPLE_TYPE_PROTOCOL_XFER,
+	                                  teams_protocol_xfer_iface_init)
+);
+
+static gboolean
+libpurple3_plugin_load(PurplePlugin *plugin, GError **error)
+{
+	teams_protocol_register_type(plugin);
+	teams_protocol = purple_protocols_add(TEAMS_TYPE_PROTOCOL, error);
+	if (!teams_protocol)
+		return FALSE;
+	
+	return plugin_load(plugin, error);
+}
+
+static gboolean
+libpurple3_plugin_unload(PurplePlugin *plugin, GError **error)
+{
+	if (!plugin_unload(plugin, error))
+		return FALSE;
+
+	if (!purple_protocols_remove(teams_protocol, error))
+		return FALSE;
+
+	return TRUE;
+}
+
+static PurplePluginInfo *
+plugin_query(GError **error)
+{
+	return purple_plugin_info_new(
+		"id",           TEAMS_PLUGIN_ID,
+		"name",         "Teams Protocol",
+		"version",      TEAMS_PLUGIN_VERSION,
+		"category",     N_("Protocol"),
+		"summary",      N_("Teams Protocol Plugin"),
+		"description",  N_("Teams Protocol Plugin"),
+		"website",      "http://github.com/EionRobb/purple-teams",
+		"abi-version",  PURPLE_ABI_VERSION,
+		"flags",        PURPLE_PLUGIN_INFO_FLAGS_INTERNAL |
+		                PURPLE_PLUGIN_INFO_FLAGS_AUTO_LOAD,
+		NULL
+	);
+}
+
+
+PURPLE_PLUGIN_INIT(teams, plugin_query, libpurple3_plugin_load, libpurple3_plugin_unload);
+#else
+	
+static PurplePluginInfo aLovelyBunchOfCoconuts;
+PURPLE_INIT_PLUGIN(teams, plugin_init, aLovelyBunchOfCoconuts);
+#endif
+

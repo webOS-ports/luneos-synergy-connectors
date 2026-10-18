@@ -1,0 +1,30 @@
+{
+	"templateId": "com.palm.gdrive",
+	"loc_name": "Google Drive",
+	"loc_usernameLabel": "EMAIL ADDRESS",
+	"icon": {
+		"loc_32x32": "images/gdrive-32x32.png",
+		"loc_48x48": "images/gdrive-48x48.png"
+	},
+
+	"__comment": "OAuth2 replaces the dead username/password validator. customUI hosts the consent webview (like com.palm.eas / com.palm.skype); it loads OAuth2.buildAuthorizeUrl(), captures ?code= from the redirect to Config.REDIRECT_URI, then calls exchangeCode which returns the stored token credentials. DOCUMENTS-only: Google Photos is not reachable headlessly, so there is no PHOTO.UPLOAD provider.",
+	"validator": {
+		"customUI": { "appId": "com.palm.app.cloud-auth", "name": "oauth.html" },
+		"address":  "palm://com.palm.service.gdrive/exchangeCode"
+	},
+	"onCredentialsChanged": "palm://com.palm.service.gdrive/checkCredentials",
+
+	"__comment2": "com.palm.app.cloud-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists (accounts/handlers/create.js -> Utils.hasPermission). Working templates (teams/telegram/skype) list their own auth app, not com.palm.app.accounts.",
+	"__comment3": "com.palm.service.gdrive is in read+writePermissions so the service itself can readCredentials(accountId) for file ops and writeCredentials back after a token refresh (accounts/handlers/credentials.js checks these lists). Google does NOT rotate the refresh token, but the write path still runs when an access token is renewed.",
+	"readPermissions":  ["com.quickoffice.webos", "com.quickoffice.ar", "com.palm.app.cloud-auth", "com.palm.app.gdrive-files", "com.palm.service.gdrive"],
+	"writePermissions": ["com.palm.app.cloud-auth", "com.palm.app.gdrive-files", "com.palm.service.gdrive"],
+
+	"capabilityProviders": [
+		{
+			"capability": "DOCUMENTS",
+			"id": "com.palm.gdrive.documents",
+			"implementation": "palm://com.palm.service.gdrive/",
+			"__comment": "The file-picker app consumes listFolder/downloadFile/uploadFile. Google-native docs (Docs/Sheets/Slides) are exported to Office/PDF on download; plain files transfer as-is. Not bound to the dead QuickOffice/Google-Docs proxy."
+		}
+	]
+}

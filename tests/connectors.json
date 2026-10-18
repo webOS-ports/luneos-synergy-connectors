@@ -1,0 +1,35 @@
+{
+  "__comment": "Per-connector facts an account template does not carry. Template ids, capability ids, validator apps and bus URIs are read from the templates themselves (harness/manifest.py). plugin = the libpurple .so under /usr/lib/purple-2 that implements the network (purple-synergy.inc recipes, messaging docs). auth = how an account signs in, which decides what an L2 run needs in creds.local.json. package = the ipk that installs the connector on LuneOS (null = no LuneOS recipe yet).",
+  "connectors": {
+    "com.palm.teams":       {"key": "teams",      "family": "im", "plugin": "libteams-personal.so", "service_name": "type_teams",     "auth": "devicecode",      "package": "purple-teams"},
+    "com.palm.telegram":    {"key": "telegram",   "family": "im", "plugin": "libtelegram-tdlib.so", "service_name": "type_telegram",  "auth": "phone+code",      "package": "tdlib-purple"},
+    "com.palm.signal":      {"key": "signal",     "family": "im", "plugin": "libpresage.so",        "service_name": "type_signal",    "auth": "link-qr",         "package": "purple-presage"},
+    "com.palm.whatsapp":    {"key": "whatsapp",   "family": "im", "plugin": "libwhatsmeow.so",      "service_name": "type_whatsapp",  "auth": "link-qr",         "package": "purple-combined"},
+    "com.palm.gometa":      {"key": "facebook",   "family": "im", "plugin": "libwhatsmeow.so",      "service_name": "type_gometa",    "auth": "password+2fa",    "package": "purple-combined", "name": "Facebook (E2EE)"},
+    "com.palm.discord":     {"key": "discord",    "family": "im", "plugin": "libdiscord.so",        "service_name": "type_discord",   "auth": "password",        "package": "purple-discord"},
+    "com.palm.googlechat":  {"key": "googlechat", "family": "im", "plugin": "libgooglechat.so",     "service_name": "type_googlechat","auth": "cookie",          "package": "purple-googlechat"},
+
+    "com.palm.dropbox":     {"key": "dropbox",    "family": "cloud", "service": "com.palm.service.dropbox",    "auth": "oauth2",     "package": null},
+    "com.palm.boxnet":      {"key": "box",        "family": "cloud", "service": "com.palm.service.boxnet",     "auth": "oauth2",     "package": null},
+    "com.palm.onedrive":    {"key": "onedrive",   "family": "cloud", "service": "com.palm.service.onedrive",   "auth": "oauth2",     "package": null},
+    "com.palm.gdrive":      {"key": "gdrive",     "family": "cloud", "service": "com.palm.service.gdrive",     "auth": "oauth2",     "package": null, "photos": false},
+    "com.palm.pcloud":      {"key": "pcloud",     "family": "cloud", "service": "com.palm.service.pcloud",     "auth": "oauth2",     "package": null},
+    "com.palm.yandexdisk":  {"key": "yandex",     "family": "cloud", "service": "com.palm.service.yandexdisk", "auth": "oauth2",     "package": null},
+    "com.palm.kdrive":      {"key": "kdrive",     "family": "cloud", "service": "com.palm.service.kdrive",     "auth": "token",      "package": null},
+    "com.palm.mega":        {"key": "mega",       "family": "cloud", "service": "com.palm.service.mega",       "auth": "login",      "package": null},
+    "com.palm.koofr":       {"key": "koofr",      "family": "cloud", "service": "com.palm.service.koofr",      "auth": "oauth2",     "package": null},
+    "com.palm.hidrive":     {"key": "hidrive",    "family": "cloud", "service": "com.palm.service.hidrive",    "auth": "oauth2",     "package": null},
+    "com.palm.s3":          {"key": "s3",         "family": "cloud", "service": "com.palm.service.s3",         "auth": "login",      "package": null},
+    "com.palm.flickr":      {"key": "flickr",     "family": "cloud", "service": "com.palm.service.flickr",     "auth": "oauth1",     "package": null, "documents": false},
+
+    "org.webosports.app.music.spotify":    {"key": "spotify",    "family": "music", "provider": "spotify",    "auth": "spotify-oauth", "package": null},
+    "org.webosports.app.music.apple":      {"key": "apple",      "family": "music", "provider": "apple",      "auth": "apple-token",   "package": null},
+    "org.webosports.app.music.deezer":     {"key": "deezer",     "family": "music", "provider": "deezer",     "auth": "arl",           "package": null, "anonymous_search": true},
+    "org.webosports.app.music.tidal":      {"key": "tidal",      "family": "music", "provider": "tidal",      "auth": "tidal-token",   "package": null},
+    "org.webosports.app.music.qobuz":      {"key": "qobuz",      "family": "music", "provider": "qobuz",      "auth": "password",      "package": null},
+    "org.webosports.app.music.soundcloud": {"key": "soundcloud", "family": "music", "provider": "soundcloud", "auth": "none",          "package": null, "anonymous_search": true},
+    "org.webosports.app.music.jamendo":    {"key": "jamendo",    "family": "music", "provider": "jamendo",    "auth": "none",          "package": null, "anonymous_search": true},
+    "org.webosports.app.music.archive":    {"key": "archive",    "family": "music", "provider": "archive",    "auth": "none",          "package": null, "anonymous_search": true},
+    "org.webosports.app.music.youtube":    {"key": "youtube",    "family": "music", "provider": "youtube",    "auth": "none",          "package": null, "anonymous_search": true, "template": false, "name": "YouTube Music"}
+  }
+}

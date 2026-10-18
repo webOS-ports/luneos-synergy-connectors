@@ -1,0 +1,33 @@
+/*
+ * This header defines aliases to overcome inconsistencies in purple's naming scheme.
+ */
+
+#pragma once
+
+// connection
+#define purple_connection_error purple_connection_error_reason
+#define PURPLE_CONNECTION_FLAG_NO_BGCOLOR PURPLE_CONNECTION_NO_BGCOLOR
+#define PURPLE_CONNECTION_FLAG_NO_FONTSIZE PURPLE_CONNECTION_NO_FONTSIZE
+#define PURPLE_CONNECTION_FLAG_NO_IMAGES PURPLE_CONNECTION_NO_IMAGES
+#define purple_connection_get_flags(pc) ((pc)->flags)
+#define purple_connection_set_flags(pc, f) ((pc)->flags = (f))
+#define PURPLE_CONNECTION_STATE_CONNECTED PURPLE_CONNECTED
+#define PURPLE_CONNECTION_STATE_CONNECTING PURPLE_CONNECTING
+#define PURPLE_CONNECTION_STATE_DISCONNECTED PURPLE_DISCONNECTED
+
+// protocol
+#define purple_protocol_got_user_status purple_prpl_got_user_status
+
+// serv
+#define purple_serv_got_im serv_got_im
+#define purple_serv_got_chat_in serv_got_chat_in
+#define purple_serv_got_alias serv_got_alias
+
+// blist
+#define purple_blist_find_buddy purple_find_buddy
+#define purple_blist_find_buddies purple_find_buddies
+#define purple_blist_find_group purple_find_group
+#define purple_blist_chat_new purple_chat_new
+
+// xfer
+#define PURPLE_XFER_TYPE_SEND PURPLE_XFER_SEND

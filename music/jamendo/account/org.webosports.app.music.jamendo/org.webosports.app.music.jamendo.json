@@ -1,0 +1,41 @@
+[
+    {
+        "templateId": "org.webosports.app.music.jamendo",
+        "loc_name": "Jamendo",
+        "icon": {
+            "loc_32x32": "images/jamendo-32x32.png",
+            "loc_48x48": "images/jamendo-48x48.png"
+        },
+        "validator": {
+            "customUI": {
+                "appId": "org.webosports.app.musicauth",
+                "name": "validator.html"
+            }
+        },
+        "loc_usernameLabel": "JAMENDO",
+        "readPermissions": [
+            "org.webosports.app.music.service",
+            "org.webosports.app.music",
+            "org.webosports.app.musicauth"
+        ],
+        "writePermissions": [
+            "org.webosports.app.music.service",
+            "org.webosports.app.music",
+            "org.webosports.app.musicauth"
+        ],
+        "capabilityProviders": [
+            {
+                "capability": "Music",
+                "capabilitySubtype": "STREAMING",
+                "id": "org.webosports.app.music.jamendo.streaming",
+                "alwaysOn": true,
+                "loc_shortName": "Jamendo",
+                "icon": {
+                    "loc_32x32": "images/jamendo-32x32.png",
+                    "loc_48x48": "images/jamendo-48x48.png",
+                    "splitter": "images/jamendo-32x32.png"
+                }
+            }
+        ]
+    }
+]

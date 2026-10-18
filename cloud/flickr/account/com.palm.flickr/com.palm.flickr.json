@@ -1,0 +1,33 @@
+{
+	"templateId": "com.palm.flickr",
+	"loc_name": "Flickr",
+	"loc_usernameLabel": "USERNAME",
+	"icon": {
+		"loc_32x32": "images/flickr-32x32.png",
+		"loc_48x48": "images/flickr-48x48.png"
+	},
+
+	"__comment": "OAuth 1.0a (HMAC-SHA1) replaces any username/password validator. customUI hosts the consent webview (like com.palm.eas / com.palm.skype); getAuthorizeUrl runs OAuth leg 1 (request_token) and returns the authorize URL + request token/secret, Atlas captures oauth_verifier from the redirect to Config.CALLBACK_URL, then exchangeCode runs leg 3 (access_token) and returns the stored token credentials. Flickr is a PHOTO source only - no DOCUMENTS capability, no files app.",
+	"validator": {
+		"customUI": { "appId": "com.palm.app.flickr-auth", "name": "oauth.html" },
+		"address":  "palm://com.palm.service.flickr/exchangeCode"
+	},
+	"onCredentialsChanged": "palm://com.palm.service.flickr/checkCredentials",
+
+	"__comment2": "com.palm.app.flickr-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists (accounts/handlers/create.js -> Utils.hasPermission). Working templates (teams/telegram/skype/dropbox) list their own auth app, not com.palm.app.accounts.",
+	"__comment3": "com.palm.service.flickr is in read+writePermissions so the service itself can readCredentials(accountId) to sign photo-provider calls. Flickr OAuth 1.0a tokens do NOT expire/rotate, so writeCredentials is effectively unused after create (kept for symmetry).",
+	"readPermissions":  ["com.palm.app.flickr-auth", "com.palm.app.photos", "com.palm.service.flickr", "com.palm.service.photos"],
+	"writePermissions": ["com.palm.app.flickr-auth", "com.palm.app.photos", "com.palm.service.flickr", "com.palm.service.photos"],
+
+	"capabilityProviders": [
+		{
+			"capability": "PHOTO.UPLOAD",
+			"id": "com.palm.flickr.photos",
+			"implementation": "palm://com.palm.service.photos",
+			"onEnabled": "palm://com.palm.service.photos/onEnabled",
+			"onDelete": "palm://com.palm.service.photos/onDelete",
+			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
+			"__comment": "Makes the Flickr account a photo source. implementation/hooks point at the stock Photos AGGREGATOR (com.palm.service.photos), which discovers PHOTO.UPLOAD accounts and (via a templateId->serviceName case in its Utils.js - added by photos-integration) calls com.palm.service.flickr/listAlbums+listPhotos, then downloads bytes with the curl-patched Sync-Manager. src_big is a live.staticflickr.com static URL (the id_secret pair is the capability; the curl -L fetch needs no auth header)."
+		}
+	]
+}

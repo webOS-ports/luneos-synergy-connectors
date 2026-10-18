@@ -1,0 +1,16 @@
+{
+    "id": "com.palm.app.whatsapp",
+    "version": "0.9.0",
+    "vendor": "WebOS Ports",
+    "maintainer": "Herman van Hazendonk <github.com@herrie.org>",
+    "type": "web",
+    "main": "validator.html",
+    "title": "WhatsApp",
+    "visible": false,
+    "icon": "images/header-icon.png",
+    "splashicon": "images/icon-256x256.png",
+    "noWindow": true,
+    "uiRevision": 2,
+    "keywords": ["WhatsApp", "IM"],
+    "requiredPermissions": ["accountsservice.management", "accountsservice.operation", "imlibpurple-service.operation", "networkconnection.query"]
+}

@@ -1,0 +1,26 @@
+{
+	"description": "HiDrive Service - OAuth2 / REST 2.1",
+	"commandTimeout": 30,
+	"activityTimeout": 30,
+	"engine": "node",
+	"services": [
+		{
+			"name": "com.palm.service.hidrive",
+			"description": "HiDrive Service",
+			"assistant": "CloudService",
+			"globalized": true,
+			"commands": [
+				{ "name": "getAuthorizeUrl",  "assistant": "GetAuthorizeUrlCommandAssistant",  "public": true },
+				{ "name": "exchangeCode",     "assistant": "ExchangeCodeCommandAssistant",     "public": true },
+				{ "name": "checkCredentials", "assistant": "CheckCredentialsCommandAssistant", "public": true },
+				{ "name": "listFolder",       "assistant": "ListFolderCommandAssistant",       "public": true },
+				{ "name": "uploadFile",       "assistant": "UploadFileCommandAssistant",       "public": true },
+				{ "name": "downloadFile",     "assistant": "DownloadFileCommandAssistant",     "public": true },
+				{ "name": "listAlbums",       "assistant": "ListAlbumsCommandAssistant",       "public": true, "commandTimeout": 300 },
+				{ "name": "listPhotos",       "assistant": "ListPhotosCommandAssistant",       "public": true, "commandTimeout": 300 },
+				{ "name": "upload",           "assistant": "UploadPhotoCommandAssistant",       "public": true, "commandTimeout": 300 },
+				{ "name": "deletePhoto",      "assistant": "DeletePhotoCommandAssistant",       "public": true, "commandTimeout": 300 }
+			]
+		}
+	]
+}

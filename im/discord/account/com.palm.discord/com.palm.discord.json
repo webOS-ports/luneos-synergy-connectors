@@ -1,0 +1,72 @@
+[{
+    "templateId": "com.palm.discord",
+    "loc_name": "Discord",
+    "icon": {
+        "loc_32x32": "images/discord-32x32.png",
+        "loc_48x48": "images/discord-48x48.png"
+    },
+    "validator": {
+        "customUI": {
+            "appId": "com.palm.app.discord",
+            "name": "validator.html"
+        }
+    },
+    "loc_usernameLabel": "USERNAME",
+    "readPermissions": [
+        "com.palm.imlibpurple",
+        "com.palm.app.messaging",
+        "org.webosports.app.messaging",
+        "com.palm.app.contacts",
+        "com.palm.service.contacts",
+        "com.palm.service.contacts.linker"
+    ],
+    "writePermissions": [
+        "com.palm.app.contacts",
+        "com.palm.service.contacts",
+        "com.palm.service.contacts.linker",
+        "com.palm.app.messaging",
+        "org.webosports.app.messaging"
+    ],
+    "capabilityProviders": [
+        {
+            "capability": "MESSAGING",
+            "capabilitySubtype": "IM",
+            "id": "com.palm.discord.im",
+            "alwaysOn": true,
+            "loc_shortName": "Discord",
+            "icon": {
+                "loc_32x32": "images/discord-32x32.png",
+                "loc_48x48": "images/discord-48x48.png",
+                "splitter": "images/discord-32x32.png"
+            },
+            "implementation": "palm://com.palm.imlibpurple/",
+            "onEnabled": "palm://com.palm.imlibpurple/onEnabled",
+            "onDelete": "palm://com.palm.imlibpurple/onDelete",
+            "serviceName": "type_discord",
+            "dbkinds": {
+                "immessage": "com.palm.immessage.libpurple:1",
+                "imcommand": "com.palm.imcommand.libpurple:1"
+            },
+            "invites": {
+                "supportsCustomMessage": false
+            },
+            "groupChat": {
+                "supported": true,
+                "topicsSupported": true,
+                "invitesSupportMessages": false
+            },
+            "chatWithNonBuddies": true
+        },
+        {
+            "capability": "CONTACTS",
+            "id": "com.palm.discord.contacts",
+            "alwaysOn": true,
+            "implementation": "palm://com.palm.imlibpurple/",
+            "sync": "palm://com.palm.imlibpurple/sync",
+            "readOnlyData": true,
+            "db_kinds": {
+                "contact": "com.palm.contact.libpurple:1"
+            }
+        }
+    ]
+}]

@@ -1,0 +1,14 @@
+/* Minimal styling for the generic S3 auth validator. Header/toolbar reuse the shared
+   accounts-* classes from $enyo-lib/accounts. */
+.accounts-header {
+	height: 48px;
+}
+.accounts-header-icon {
+	width: 32px;
+	height: 32px;
+	margin-right: 8px;
+}
+.accounts-body-text {
+	color: #333333;
+	font-size: 16px;
+}

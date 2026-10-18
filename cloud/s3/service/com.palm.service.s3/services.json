@@ -1,0 +1,25 @@
+{
+	"description": "Generic S3-compatible Storage Service - SigV4 signed REST",
+	"commandTimeout": 30,
+	"activityTimeout": 30,
+	"engine": "node",
+	"services": [
+		{
+			"name": "com.palm.service.s3",
+			"description": "S3 Storage Service",
+			"assistant": "CloudService",
+			"globalized": true,
+			"commands": [
+				{ "name": "login",            "assistant": "LoginCommandAssistant",            "public": true, "commandTimeout": 60 },
+				{ "name": "checkCredentials", "assistant": "CheckCredentialsCommandAssistant", "public": true },
+				{ "name": "listFolder",       "assistant": "ListFolderCommandAssistant",       "public": true, "commandTimeout": 120 },
+				{ "name": "uploadFile",       "assistant": "UploadFileCommandAssistant",       "public": true, "commandTimeout": 300 },
+				{ "name": "downloadFile",     "assistant": "DownloadFileCommandAssistant",     "public": true, "commandTimeout": 300 },
+				{ "name": "listAlbums",       "assistant": "ListAlbumsCommandAssistant",       "public": true, "commandTimeout": 300 },
+				{ "name": "listPhotos",       "assistant": "ListPhotosCommandAssistant",       "public": true, "commandTimeout": 300 },
+				{ "name": "upload",           "assistant": "UploadPhotoCommandAssistant",      "public": true, "commandTimeout": 300 },
+				{ "name": "deletePhoto",      "assistant": "DeletePhotoCommandAssistant",      "public": true, "commandTimeout": 300 }
+			]
+		}
+	]
+}

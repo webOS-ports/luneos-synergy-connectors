@@ -1,0 +1,30 @@
+{
+	"templateId": "com.palm.flickr",
+	"loc_name": "Flickr",
+	"loc_usernameLabel": "USERNAME",
+	"icon": {
+		"loc_32x32": "images/flickr-32x32.png",
+		"loc_48x48": "images/flickr-48x48.png"
+	},
+
+	"__comment": "en locale override (a full copy - locale files WIN over the base, so the whole template incl. capabilityProviders must be repeated here). Flickr is a PHOTO source only. See the base com.palm.flickr.json for the rationale comments.",
+	"validator": {
+		"customUI": { "appId": "com.palm.app.flickr-auth", "name": "oauth.html" },
+		"address":  "palm://com.palm.service.flickr/exchangeCode"
+	},
+	"onCredentialsChanged": "palm://com.palm.service.flickr/checkCredentials",
+
+	"readPermissions":  ["com.palm.app.flickr-auth", "com.palm.app.photos", "com.palm.service.flickr", "com.palm.service.photos"],
+	"writePermissions": ["com.palm.app.flickr-auth", "com.palm.app.photos", "com.palm.service.flickr", "com.palm.service.photos"],
+
+	"capabilityProviders": [
+		{
+			"capability": "PHOTO.UPLOAD",
+			"id": "com.palm.flickr.photos",
+			"implementation": "palm://com.palm.service.photos",
+			"onEnabled": "palm://com.palm.service.photos/onEnabled",
+			"onDelete": "palm://com.palm.service.photos/onDelete",
+			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged"
+		}
+	]
+}

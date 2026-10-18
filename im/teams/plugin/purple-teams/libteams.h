@@ -1,0 +1,329 @@
+/*
+ * Teams Plugin for libpurple/Pidgin
+ * Copyright (c) 2014-2020 Eion Robb
+ * 
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#ifndef LIBTEAMS_H
+#define LIBTEAMS_H
+
+#ifndef PURPLE_PLUGINS
+#	define PURPLE_PLUGINS
+#endif
+
+/* Maximum number of simultaneous connections to a server */
+#define TEAMS_MAX_CONNECTIONS 16
+
+#include <glib.h>
+
+#include <inttypes.h>
+#include <errno.h>
+#include <string.h>
+#include <glib/gi18n.h>
+#include <sys/types.h>
+#ifdef __GNUC__
+	#include <sys/time.h>
+	#include <unistd.h>
+#endif
+
+#ifndef G_GNUC_NULL_TERMINATED
+#	if __GNUC__ >= 4
+#		define G_GNUC_NULL_TERMINATED __attribute__((__sentinel__))
+#	else
+#		define G_GNUC_NULL_TERMINATED
+#	endif /* __GNUC__ >= 4 */
+#endif /* G_GNUC_NULL_TERMINATED */
+
+// workaround for MinGW32 which doesn't support "%zu"; see also https://stackoverflow.com/a/44383330
+#ifdef _WIN32
+#  ifdef _WIN64
+#    define PRI_SIZET PRIu64
+#  else
+#    define PRI_SIZET PRIu32
+#  endif
+#else
+#  define PRI_SIZET "zu"
+#endif
+
+#include "purplecompat.h"
+#include "glibcompat.h"
+
+#ifdef _WIN32
+#	include <windows.h>
+#	define dlopen(a,b)  GetModuleHandleA(a)
+#	define RTLD_LAZY    0x0001
+#	define dlsym(a,b)   GetProcAddress(a,b)
+#	define dlclose(a)   FreeLibrary(a)
+#else
+#	include <arpa/inet.h>
+#	include <dlfcn.h>
+#	include <netinet/in.h>
+#	include <sys/socket.h>
+#endif
+
+#include <json-glib/json-glib.h>
+
+#define json_object_get_int_member(JSON_OBJECT, MEMBER) \
+	((JSON_OBJECT) && json_object_has_member((JSON_OBJECT), (MEMBER)) ? json_object_get_int_member((JSON_OBJECT), (MEMBER)) : 0)
+#define json_object_get_string_member(JSON_OBJECT, MEMBER) \
+	((JSON_OBJECT) && json_object_has_member((JSON_OBJECT), (MEMBER)) ? json_object_get_string_member((JSON_OBJECT), (MEMBER)) : NULL)
+#define json_object_get_array_member(JSON_OBJECT, MEMBER) \
+	((JSON_OBJECT) && json_object_has_member((JSON_OBJECT), (MEMBER)) ? json_object_get_array_member((JSON_OBJECT), (MEMBER)) : NULL)
+#define json_object_get_object_member(JSON_OBJECT, MEMBER) \
+	((JSON_OBJECT) && json_object_has_member((JSON_OBJECT), (MEMBER)) ? json_object_get_object_member((JSON_OBJECT), (MEMBER)) : NULL)
+#define json_object_get_boolean_member(JSON_OBJECT, MEMBER) \
+	((JSON_OBJECT) && json_object_has_member((JSON_OBJECT), (MEMBER)) ? json_object_get_boolean_member((JSON_OBJECT), (MEMBER)) : FALSE)
+#define json_array_get_length(JSON_ARRAY) \
+	((JSON_ARRAY) ? json_array_get_length(JSON_ARRAY) : 0)
+#define json_node_get_array(JSON_NODE) \
+	((JSON_NODE) && JSON_NODE_TYPE(JSON_NODE) == (JSON_NODE_ARRAY) ? json_node_get_array(JSON_NODE) : NULL)
+
+#include "accountopt.h"
+#include "core.h"
+#include "cmds.h"
+#include "connection.h"
+#include "debug.h"
+#include "http.h"
+#include "image.h"
+#include "image-store.h"
+#include "plugins.h"
+#include "proxy.h"
+#include "request.h"
+#include "roomlist.h"
+#include "savedstatuses.h"
+#include "sslconn.h"
+#include "util.h"
+#include "version.h"
+
+	
+#if GLIB_MAJOR_VERSION >= 2 && GLIB_MINOR_VERSION >= 12
+#	define atoll(a) g_ascii_strtoll(a, NULL, 0)
+#endif
+
+#define TEAMS_CALENDAR_REFRESH_MINUTES 15
+/* Personal/TFL: how often to poll for new messages (real-time Trouter push is
+ * dead for consumer accounts, so this drives message delivery latency). */
+#define TEAMS_MESSAGE_POLL_SECONDS 8
+#define TEAMS_MAX_MSG_RETRY 2
+#define TEAMS_MAX_PROCESSED_EVENT_BUFFER 10
+/* Cap the in-session received-message dedup cache. The poll only re-fetches recent
+ * messages, so keys past this many are never queried again — bounding memory. */
+#define TEAMS_MAX_DEDUP_CACHE 4096
+
+/* Keep the established plugin ids so existing accounts keep resolving and the
+ * work/personal builds can run side by side. Both are overridable at build time
+ * (e.g. the webOS transport derives the prpl id from the service name and expects
+ * "prpl-teams", so that port builds with -DTEAMS_PERSONAL_PLUGIN_ID='"prpl-teams"'). */
+#ifndef TEAMS_PLUGIN_ID
+#define TEAMS_PLUGIN_ID "prpl-eionrobb-msteams"
+#endif
+#define TEAMS_PLUGIN_VERSION "1.0"
+
+#ifndef TEAMS_PERSONAL_PLUGIN_ID
+#define TEAMS_PERSONAL_PLUGIN_ID "prpl-eionrobb-msteams-personal"
+#endif
+
+/* The protocol id THIS build registers (see teams_protocol_init / plugin init): the
+ * personal build overrides info->id to the personal id. Reaction signal handlers use this
+ * to filter the process-wide "webos-im-send-reaction" signal to our own accounts. */
+#ifdef ENABLE_TEAMS_PERSONAL
+#define TEAMS_THIS_PLUGIN_ID TEAMS_PERSONAL_PLUGIN_ID
+#else
+#define TEAMS_THIS_PLUGIN_ID TEAMS_PLUGIN_ID
+#endif
+
+#define TEAMS_LOCKANDKEY_APPID "msmsgs@msnmsgr.com"
+#define TEAMS_LOCKANDKEY_SECRET "Q1P7W2E4J9R8U3S5"
+
+#ifdef ENABLE_TEAMS_PERSONAL
+#	define TEAMS_BASE_ORIGIN_HOST "teams.live.com"
+#	define TEAMS_CONTACTS_HOST "teams.live.com"
+#	define TEAMS_CONTACTS_PATH_PREFIX "/api/chatsvc/consumer"
+#else
+#	define TEAMS_BASE_ORIGIN_HOST "teams.microsoft.com"
+#	define TEAMS_CONTACTS_HOST "apac.ng.msg.teams.microsoft.com"
+#	define TEAMS_CONTACTS_PATH_PREFIX ""
+#endif
+
+#define TEAMS_PRESENCE_HOST "presence." TEAMS_BASE_ORIGIN_HOST
+
+#define TEAMS_NEW_CONTACTS_HOST "contacts.skype.com"
+#define TEAMS_LOGIN_HOST "login.skype.com"
+#define TEAMS_VIDEOMAIL_HOST "vm.skype.com"
+#define TEAMS_XFER_HOST "api.asm.skype.com"
+#define TEAMS_GRAPH_HOST "skypegraph.skype.com"
+#define TEAMS_STATIC_HOST "static.asm.skype.com"
+#define TEAMS_STATIC_CDN_HOST "static-asm.secure.skypeassets.com"
+#define TEAMS_DEFAULT_CONTACT_SUGGESTIONS_HOST "peoplerecommendations.skype.com"
+
+#ifdef ENABLE_TEAMS_PERSONAL
+#	define TEAMS_PROFILES_PREFIX "/api/mt/beta/"
+#else
+#	define TEAMS_PROFILES_PREFIX "/api/mt/apac/beta/"
+#endif
+
+#define TEAMS_VDMS_TTL 300
+
+#define TEAMS_CLIENTINFO_NAME "skypeteams"
+#ifdef ENABLE_TEAMS_PERSONAL
+#	define TEAMS_CLIENTINFO_VERSION "1415/26010401241"
+#else
+#	define TEAMS_CLIENTINFO_VERSION "49/25113001312"
+#endif
+#define TEAMS_USER_AGENT "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0 Teams/24165.1410.2974.6689/49"
+
+
+
+#define TEAMS_BUDDY_IS_MSN(a) G_UNLIKELY((a) != NULL && strchr((a), '@') != NULL)
+#define TEAMS_BUDDY_IS_PHONE(a) G_UNLIKELY((a) != NULL && *(a) == '+')
+#define TEAMS_BUDDY_IS_S4B(a) G_UNLIKELY((a) != NULL && g_str_has_prefix((a), "2:"))
+#define TEAMS_BUDDY_IS_BOT(a) G_UNLIKELY((a) != NULL && g_str_has_prefix((a), "28:"))
+#define TEAMS_BUDDY_IS_NOTIFICATIONS(a) G_UNLIKELY((a) != NULL && g_str_has_prefix((a), "48:"))
+#define TEAMS_BUDDY_IS_SKYPE(a) G_UNLIKELY((a) != NULL && g_str_has_prefix((a), "8:") && !g_str_has_prefix((a), "8:orgid:"))
+#define TEAMS_BUDDY_IS_TEAMS(a) G_LIKELY((a) != NULL && g_str_has_prefix((a), "8:orgid:"))
+
+#define TEAMS_CHAT_IS_MEETING(a) G_LIKELY((a) != NULL && g_str_has_prefix((a), "19:meeting_"))
+
+#define TEAMS_OOO_STATUS_ID "OutOfOffice"
+#define TEAMS_WORK_LOCATION_STATUS_ID "WorkLocation"
+
+typedef struct _TeamsAccount TeamsAccount;
+typedef struct _TeamsBuddy TeamsBuddy;
+
+typedef void (*TeamsFunc)(TeamsAccount *swa);
+
+struct _TeamsAccount {
+	gchar *username;
+	gchar *primary_member_name;
+	gchar *self_display_name;
+
+	PurpleAccount *account;
+	PurpleConnection *pc;
+	PurpleHttpKeepalivePool *keepalive_pool;
+	PurpleHttpConnectionSet *conns;
+	PurpleHttpCookieJar *cookie_jar;
+	
+	GHashTable *sent_messages_hash;
+	/* Personal/TFL: dedup incoming messages by server id (+edit marker) so the
+	 * periodic poll / offline-history re-fetch never re-delivers an already-shown
+	 * message. See process_message_resource() and teams_poll_messages(). */
+	GHashTable *received_messages_hash;
+	/* webOS replies: message id -> "authorMRI\x1fauthorname\x1fcomposetime\x1fconversation\x1fplaintext",
+	 * so an outgoing reply can rebuild the full inline <quote> block Teams needs. Bounded by size. */
+	GHashTable *quote_meta_hash;
+	guint poll_timeout;
+	gboolean poll_in_flight; /* a poll's conversations fetch is outstanding; skip overlapping ticks */
+	guint watchdog_timeout;
+	
+	guint authcheck_timeout;
+	time_t last_authrequest;
+	guint idle_timeout;
+
+	time_t last_typing_time;
+	guint last_typing_channel_hash;
+	
+	//old skypeweb
+	gchar *skype_token;
+	gchar *registration_token;
+	gchar *vdms_token;
+	gchar *endpoint;
+	gint registration_expiry;
+	gint vdms_expiry;
+	gchar *region;
+	
+	//teams
+	gchar *id_token;
+	/* Personal/TFL: personal (TFL) mt/beta endpoints (teams.live.com/api/mt/beta:
+	 * searchV2, contactsv3, contacts/buddylist) reject the primary id_token (audience
+	 * mtsvc.fl.teams.microsoft.com) with HTTP 401. This holds a token for a resource
+	 * those endpoints accept, fetched separately in teams_oauth_refresh_services and
+	 * used as the mt/beta Bearer (connection.c). NULL -> fall back to id_token. */
+	gchar *mt_access_token;
+	gchar *refresh_token;
+	gchar *messages_cursor;
+	gchar *tenant;
+	GHashTable *buddy_to_chat_lookup;
+	GHashTable *chat_to_buddy_lookup;
+	gint refresh_token_timeout;
+	gchar *substrate_access_token;
+	gchar *csa_access_token;
+	gchar *presence_access_token;
+	struct _TeamsConnection *poll_conn;
+	GHashTable *calendar_reminder_timeouts;
+	guint calendar_poll_timeout;
+	GQueue *processed_event_messages;
+	GHashTable *subscribed_contacts;
+	GHashTable *fetched_profiles;
+	GHashTable *presence_etag_cache;
+	GQueue *pending_subscription_contacts;
+	guint subscription_flush_timer;
+	GQueue *pending_presences;
+	guint presence_drain_source;
+	GHashTable *presence_mri_index;
+	
+	struct _PurpleWebsocket *trouter_socket;
+	gchar *trouter_surl;
+	guint trouter_ping_timeout;
+	guint trouter_command_count;
+	guint trouter_registration_timeout;
+	guint trouter_reconnect_timeout;   /* webOS: backoff timer for trouter reconnect (anti-storm) */
+	guint trouter_reconnect_backoff;   /* webOS: current backoff seconds, doubles on repeat failure */
+	JsonObject *trouter_socket_obj;
+
+	/* NGC voice calling (teams_calling.c): the account's current call, or NULL. Typed
+	 * gpointer to avoid pulling teams_calling.h into every TU that includes libteams.h. */
+	gpointer active_call;
+
+	//devicecode login
+	gchar *login_device_code;
+	guint login_device_code_timeout;
+	guint login_device_code_expires_timeout;
+
+	/* Personal/TFL: set TRUE once teams_do_all_the_things() has run the full
+	 * post-login setup (friend list, trouter, etc). Used to gate that setup instead
+	 * of PURPLE_CONNECTION_IS_CONNECTED, because our early-CONNECTED watchdog fix
+	 * (teams_login.c) makes IS_CONNECTED true during the device-code wait -> the
+	 * old `if (!IS_CONNECTED)` guard in teams_got_self_details would skip the buddy-
+	 * list fetch entirely. */
+	gboolean logged_in;
+};
+
+struct _TeamsBuddy {
+	TeamsAccount *sa;
+	PurpleBuddy *buddy;
+	
+	/** Contact info */
+	gchar *skypename;
+	gchar *fullname;
+	gchar *display_name;
+	gboolean authorized;
+	gboolean blocked;
+	gchar *tenant;
+	gchar *user_type; // "Federated", "ADUser", "BOT", "TFLUser", "SkypeUser"
+	
+	/** Profile info */
+	gchar *avatar_url;
+	gchar *mood;
+};
+
+void teams_buddy_free(PurpleBuddy *buddy);
+
+// webOS: TRUE while `sa` is a live (logged-in, not-yet-freed) account. Async HTTP handlers that fire
+// after a re-login flap must check this before touching sa, to avoid the freed-sa hash-flood hang.
+gboolean teams_account_is_live(TeamsAccount *sa);
+
+void teams_do_all_the_things(TeamsAccount *sa);
+
+#endif /* LIBTEAMS_H */

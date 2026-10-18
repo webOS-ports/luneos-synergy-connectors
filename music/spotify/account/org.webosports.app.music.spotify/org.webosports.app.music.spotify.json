@@ -1,0 +1,39 @@
+[{
+    "templateId": "org.webosports.app.music.spotify",
+    "loc_name": "Spotify",
+    "icon": {
+        "loc_32x32": "images/spotify-32x32.png",
+        "loc_48x48": "images/spotify-48x48.png"
+    },
+    "validator": {
+        "customUI": {
+            "appId": "org.webosports.app.musicauth",
+            "name": "validator.html"
+        }
+    },
+    "loc_usernameLabel": "SPOTIFY ACCOUNT",
+    "readPermissions": [
+        "org.webosports.app.music.service",
+        "org.webosports.app.music",
+        "org.webosports.app.musicauth"
+    ],
+    "writePermissions": [
+        "org.webosports.app.music.service",
+        "org.webosports.app.music",
+        "org.webosports.app.musicauth"
+    ],
+    "capabilityProviders": [
+        {
+            "capability": "Music",
+            "capabilitySubtype": "STREAMING",
+            "id": "org.webosports.app.music.spotify.streaming",
+            "alwaysOn": true,
+            "loc_shortName": "Spotify",
+            "icon": {
+                "loc_32x32": "images/spotify-32x32.png",
+                "loc_48x48": "images/spotify-48x48.png",
+                "splitter": "images/spotify-32x32.png"
+            }
+        }
+    ]
+}]

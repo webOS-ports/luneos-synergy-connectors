@@ -1,0 +1,39 @@
+{
+	"templateId": "com.palm.hidrive",
+	"loc_name": "HiDrive",
+	"loc_usernameLabel": "EMAIL ADDRESS",
+	"icon": {
+		"loc_32x32": "images/hidrive-32x32.png",
+		"loc_48x48": "images/hidrive-48x48.png"
+	},
+
+	"__comment": "OAuth2 replaces the dead username/password validator. The shared customUI app com.palm.app.cloud-auth hosts the HiDrive consent webview; it loads OAuth2.buildAuthorizeUrl(), captures ?code= from the redirect to Config.REDIRECT_URI, then calls exchangeCode which returns the stored token credentials. HiDrive provides BOTH DOCUMENTS and PHOTO.UPLOAD.",
+	"validator": {
+		"customUI": { "appId": "com.palm.app.cloud-auth", "name": "oauth.html" },
+		"address":  "palm://com.palm.service.hidrive/exchangeCode"
+	},
+	"onCredentialsChanged": "palm://com.palm.service.hidrive/checkCredentials",
+
+	"__comment2": "com.palm.app.cloud-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists.",
+	"__comment3": "com.palm.service.hidrive is in read+writePermissions so the service can readCredentials(accountId) for file ops and writeCredentials back after a token refresh (HiDrive access tokens expire hourly; the refresh token renews them).",
+	"readPermissions":  ["com.quickoffice.webos", "com.quickoffice.ar", "com.palm.app.cloud-auth", "com.palm.app.hidrive-files", "com.palm.app.photos", "com.palm.service.hidrive", "com.palm.service.photos"],
+	"writePermissions": ["com.palm.app.cloud-auth", "com.palm.app.hidrive-files", "com.palm.app.photos", "com.palm.service.hidrive", "com.palm.service.photos"],
+
+	"capabilityProviders": [
+		{
+			"capability": "DOCUMENTS",
+			"id": "com.palm.hidrive.documents",
+			"implementation": "palm://com.palm.service.hidrive/",
+			"__comment": "The file-picker app and the account-derived QuickOffice reroute consume listFolder/downloadFile/uploadFile. Locators are absolute HiDrive paths under the account home; the root sentinel 'home' maps to /users/<user>."
+		},
+		{
+			"capability": "PHOTO.UPLOAD",
+			"id": "com.palm.hidrive.photos",
+			"implementation": "palm://com.palm.service.photos",
+			"onEnabled": "palm://com.palm.service.photos/onEnabled",
+			"onDelete": "palm://com.palm.service.photos/onDelete",
+			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
+			"__comment": "Makes the HiDrive account a photo source. The Photos aggregator calls com.palm.service.hidrive/listAlbums+listPhotos; one folder ('Camera Uploads' under home) is surfaced as one album. src_big is a '/file?path=..&access_token=..' URL fetched by the aggregator's curl (see adapter.getTemporaryLink)."
+		}
+	]
+}

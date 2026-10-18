@@ -1,0 +1,174 @@
+A Pidgin/libpurple protocol plug-in for Signal using [presage](https://github.com/whisperfish/presage).
+
+Contains code from [flare](https://gitlab.com/schmiddi-on-mobile/flare) by [Schmiddi](https://github.com/Schmiddiii).
+
+![Screenshot](screenshot.png?raw=true "Screenshot showing the Signal App and a Pidgin conversation window")
+
+## Download
+
+See the Releases section on github.
+
+## Set-up
+
+1. Create a new Pidgin account. Enter your Signal account UUID as username. In case you do not know your UUID, just enter anything. The plug-in will tell you what to use.
+2. Enable the connection. A window with the QR-code should pop-up. Scan it with your master device. Wait for the window to close.
+
+Note: bitlbee users will receive the login QR-code in form of a URI from a system contact "Logon QR Code". You may need to allow unsolicited messages from unknown contacts in your client. The URI can be converted using any tool like a local [`qrencode`](https://www.shellhacks.com/qr-code-generator-windows-linux-macos/) or [online services](https://www.the-qrcode-generator.com/) (use at your own risk).
+
+## Configuration
+
+* `startup-delay-seconds` int  
+  Tells the plug-in to wait the specified amount of seconds (default: 1) between spawning the native thread for the rust runtime and actually starting the rust runtime. This magically alleviates database locking issues.
+
+* `attachment-path-template` string  
+  This is a template for specifying a path to a local file-name. Setting this to a non-empty value will enable the automated downloader which stores attachments immediately, completely bypassing libpurple's file transfer mechanism. This can be useful for message bridges with limited resources. Also it can help with maintaining the order of messages. Sub-directories will be created as needed.
+
+  Default value is the empty string.
+
+  The template is passed through `strftime` and accepts time and date format parameters such as `%Y-%m-%d_%H:%M:%S`. The result may not be longer than 128 bytes! Then the replacements are done:
+
+    * `$home`: User directory (same as `~`).
+    * `$purple`: Purple configuration directory (usually `~/.purple`).
+    * `$direction`: Whether this attachment was "received" (sent by a contact) or "sent" (other device on the own account).
+    * `$chat`: The UUID of the contact or key group chat this attachment has been posted to.
+    * `$sender`: The UUID of the contact who posted this attachment to the group chat. Empty if not posted in a group chat.
+    * `$hash`: The file's SHA256 (useful for avoiding clashes and for de-duplication).
+    * `$filename`: The sender-supplied file-name (only for Document messages, otherwise empty). Does not contain the extension.
+    * `$extension`: A file-name extension fitting the mime-type. Includes the dot.
+
+  Example: `$purple/presage/attachments/$chat/$filename$hash$extension`
+
+  There is no shell expansion (`~` will not become the home directory). Relative paths are resolved to the application's working directory. Using an absolute path is recommended.
+
+## Features
+
+### Present
+
+* Can link as secondary device via QR-Code.
+* Receives a styled (bold, italic, strikethrough, monospace) text message from a contact or a group.
+* Displays quotes, reactions and incoming calls.
+* Resolves mentioned group chat participants by their local alias.
+* Receives attachments. Special handling for images, stickers and long text messages.
+* Can send a simple text message. 
+* Can reply to a specific message via "@searchstring:".
+* Can send an attachment.
+* Will add buddies to contact list unconditionally.
+* Uses special handling of login procedure for bitlbee.
+* Some very basic support for Spectrum.
+
+### Missing
+
+#### To Be Done Soon™
+
+* Forward all errors to front-end properly.
+
+#### On Hold
+
+* Display names of contacts and groups. This is blocked by a regression in presage, see [#303](https://github.com/whisperfish/presage/issues/303). In fact, the list of contacts is currently empty.
+* Mark messages as "read". This is currently not implemented in back-end, see [#141](https://github.com/whisperfish/presage/issues/141). At time of writing, notifications on main device are deleted after answering via linked device. So that is working alright.
+* The maximum allowed length of a text-message is unknown.
+
+#### "Contributions Welcome"
+
+* Configuration option whether to add contacts to buddy list or not
+* Use the hostname (or a user-defined string) as a device name
+* Reasonable generation of C headers and rust constants
+* Properly process message extensions, e.g. containing a contact
+* Display typing notifications
+* Display receipts (not important)
+* Support for alternative host applications (Bitlbee, Spectrum)
+* Support for adding contact via phone number
+
+These lists are not exhaustive.
+
+### Known Issues
+
+* When an error occurs while downloading an attachment, the UI may freeze for a couple of seconds before finally displaying the error message.
+* Contact information of the own account is not transferred to the buddy list and therefore not resolved in group chats.
+* Usage with Spectrum and bitlbee is largely untested. Please keep an eye on your system and check the logs frequently. Issue reports are welcome.
+* On Windows, the font Noto Emoji does not work. The monochrome Segoe UI Emoji font does work.
+
+## Building
+
+### Linux
+
+Note: The GNU Linker emits this warning:
+
+    missing .note.GNU-stack section implies executable stack
+
+It originates from the [sha2-asm](https://docs.rs/sha2-asm/0.6.4/sha2_asm/) crate. An upstream update is expected.
+
+#### Install Dependencies
+
+If your distribution is rolling or very new, the rust compiler might be recent enough. If not, install rust according to [the rustup instructions](https://www.rust-lang.org/tools/install).
+
+##### Ubuntu and Debian 
+
+    sudo apt install libpurple-dev libqrencode-dev protobuf-compiler gcc clang
+    
+`protoc` is required by libsignal-svrb. Both `gcc` and `clang` are needed by boring-sys call to bindgen.
+
+##### Alpine
+
+    doas apk add rust pidgin-dev libqrencode-dev protoc
+
+#### Build
+
+    git clone --recurse-submodules https://github.com/hoehermann/purple-presage purple-presage
+    cmake -S purple-presage -B build
+    cmake --build build
+    sudo cmake --install build
+
+or
+
+    git clone https://github.com/hoehermann/purple-presage .
+    make
+    sudo make install
+
+### Windows
+
+This is going to get wild, hold on tight…
+
+#### MSVC Toolchain
+
+On Windows, the GNU Toolchain cannot be used as it is not supported by the dependency [boring](https://github.com/cloudflare/boring/issues/71).
+
+#### MSVC Toolchain
+
+purple-presage is known to compile with MSVC 19.30 and rust 1.97.0. You need at least the version of rust mentioned in [libsignal-service-rs](https://github.com/whisperfish/libsignal-service-rs/tree/main#note-on-supported-rust-versions) and [sqlx](https://github.com/transact-rs/sqlx/commit/75bc048). A newer version will probably work, too. Using the "x86 Native Tools Command Prompt for VS 2022" is recommended.
+
+1.91.1 was the last rust version to supports Windows 7. Consequently, there is no support for Windows 7 or earlier.
+
+##### Dependencies
+
+Install dependencies via vcpkg:
+
+    vcpkg.exe install --triplet x86-windows-static libqrencode openssl
+
+openssl is required by a libsqlite3/sqlcipher crate somewhere deep in the dependency tree of presage.
+
+protoc needs to be in your PATH. You can install it with any method you like, including vcpkg:
+
+    vcpkg.exe install protobuf
+
+##### Build
+
+Same as Linux build instructions, but may need to modify the configuration:
+
+1. Generate MSBuild project:
+
+        cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_GENERATOR_PLATFORM=WIN32 -DCMAKE_TOOLCHAIN_FILE="…/vcpkg/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x86-windows-static -DRust_CARGO_TARGET="i686-pc-windows-msvc" -S purple-presage -B build
+
+    If necessary, the rust tool-chain version can be specified via `-DRust_TOOLCHAIN="1.91.1-i686-pc-windows-msvc"`.
+
+2. Build, Install and Run:
+
+        cmake --build build
+        cmake --install build --config Release
+        cmake --build build --target run
+
+When using the "Debug" configuration, the linker complains about mismatching configurations. The implications of this are unknown.
+
+##### Notes
+
+Needs a whooping 12 GB of disk space during build! 😳 And, depending on the amount of concurrency, several gigabytes of RAM, too.
