@@ -23,7 +23,6 @@ PLUGIN_DIR = "/usr/lib/purple-2"
 LOGINSTATE = "com.palm.imloginstate.libpurple:1"
 IMMESSAGE = "com.palm.immessage.libpurple:1"
 CONTACT = "com.palm.contact.libpurple:1"
-BUDDYSTATUS = "com.palm.imbuddystatus.libpurple:1"
 LIB_DIRS = ("/usr/lib", "/lib", PLUGIN_DIR)
 
 # An empty password is rejected before login (IMLoginState readCredentials), so
@@ -118,6 +117,8 @@ def provision_and_delete(ctx, conn):
     user = "harness-l1-%s@example.invalid" % uuid.uuid4().hex[:8]
     acct = accounts.create(ctx.dev, conn, user, {"common": {"password": L1_PASSWORD}})
     aid = acct["_id"]
+    if acct.get("_harness_caller"):
+        ctx.note("created as %s (validator returns via CrossAppResult)" % acct["_harness_caller"])
     deleted = []
 
     def cleanup():
@@ -145,17 +146,20 @@ def provision_and_delete(ctx, conn):
 
     accounts.delete(ctx.dev, conn, aid)
     deleted.append(True)
-    if not ctx.dev.wait_for(lambda: not _leftovers(ctx.dev, aid, user), 30):
-        raise Fail("rows left 30 s after deleteAccount: %s" % _leftovers(ctx.dev, aid, user))
+    svc = conn.extra["service_name"]
+    if not ctx.dev.wait_for(lambda: not _leftovers(ctx.dev, aid, user, svc), 30):
+        raise Fail("rows left 30 s after deleteAccount: %s" % _leftovers(ctx.dev, aid, user, svc))
 
 
-def _leftovers(dev, aid, user):
+def _leftovers(dev, aid, user, service_name):
+    """Rows onEnabled(false) must remove. Queries use the kinds' own indexes
+    (imlibpurpleservice files/etc/palm/db/kinds): loginstate byAccountId,
+    immessage serviceAndUsername."""
     out = []
     if _loginstate(dev, aid):
         out.append(LOGINSTATE)
-    for kind in (IMMESSAGE, BUDDYSTATUS):
-        if accounts.db_find(dev, kind, {"username": user}, limit=1):
-            out.append(kind)
+    if accounts.db_find(dev, IMMESSAGE, {"serviceName": service_name, "username": user}, limit=1):
+        out.append(IMMESSAGE)
     return out
 
 

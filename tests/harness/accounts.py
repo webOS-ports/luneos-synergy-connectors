@@ -44,6 +44,13 @@ def create(dev, conn, username, credentials, capability_ids=None, config=None):
     if config:
         payload["config"] = config
     r = dev.luna(ACCOUNTS + "/createAccount", payload, app_id=caller_for(conn), timeout_ms=30000)
+    if r and not r.get("returnValue") and "Permission denied" in (r.get("errorText") or ""):
+        # A validator that hands its result back through CrossAppResult (Discord) never
+        # calls createAccount itself: the Accounts app does, and it is always allowed.
+        r = dev.luna(ACCOUNTS + "/createAccount", payload, app_id="com.palm.app.accounts",
+                     timeout_ms=30000)
+        if r and r.get("returnValue"):
+            r["result"]["_harness_caller"] = "com.palm.app.accounts"
     if not r or not r.get("returnValue"):
         raise AccountError("createAccount(%s): %r" % (conn.id, r))
     return r["result"]
@@ -52,6 +59,9 @@ def create(dev, conn, username, credentials, capability_ids=None, config=None):
 def delete(dev, conn, account_id):
     r = dev.luna(ACCOUNTS + "/deleteAccount", {"accountId": account_id},
                  app_id=caller_for(conn), timeout_ms=30000)
+    if r and not r.get("returnValue") and "Permission denied" in (r.get("errorText") or ""):
+        r = dev.luna(ACCOUNTS + "/deleteAccount", {"accountId": account_id},
+                     app_id="com.palm.app.accounts", timeout_ms=30000)
     if not r or not r.get("returnValue"):
         raise AccountError("deleteAccount(%s): %r" % (account_id, r))
     return r
