@@ -113,7 +113,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8730", "listen address (localhost only)")
 	librespotName := flag.String("librespot-name", "webOS", "Connect device name to target for playback")
 	clientID := flag.String("client-id", "", "Spotify app client id (for the in-backend OAuth PKCE flow)")
-	clientIDFile := flag.String("client-id-file", spotifyDataDir+"/spotify-client-id", "file to read the client id from if -client-id is empty")
+	clientIDFile := flag.String("client-id-file", "", "file to read the client id from if -client-id is empty (default: "+strings.Join(configPaths("spotify-client-id"), ", then ")+")")
 	redirect := flag.String("redirect", "http://127.0.0.1:8730/auth/callback", "OAuth redirect URL (must be registered on the Spotify app)")
 	tokenFile := flag.String("token-file", tokenPath, "where to persist the OAuth token (survives restarts)")
 	flag.Parse()
@@ -121,13 +121,16 @@ func main() {
 	sess.librespotName = *librespotName
 	cfg.clientID = *clientID
 	cfg.redirectURL = *redirect
-	if cfg.clientID == "" && *clientIDFile != "" {
-		if b, err := os.ReadFile(*clientIDFile); err == nil {
-			cfg.clientID = strings.TrimSpace(string(b))
+	clientIDFrom := "-client-id"
+	if cfg.clientID == "" {
+		paths := configPaths("spotify-client-id")
+		if *clientIDFile != "" {
+			paths = []string{*clientIDFile}
 		}
+		cfg.clientID, clientIDFrom = readFirstNonEmpty(paths...)
 	}
 	if cfg.clientID != "" {
-		log.Printf("OAuth client id loaded (%d chars); redirect=%s", len(cfg.clientID), cfg.redirectURL)
+		log.Printf("OAuth client id loaded (%d chars) from %s; redirect=%s", len(cfg.clientID), clientIDFrom, cfg.redirectURL)
 	} else {
 		log.Printf("no client id set — /auth/login will 412 until you provide one")
 	}
