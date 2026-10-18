@@ -14,16 +14,26 @@
 /* Adapter calls are made from inside Future callbacks. A synchronous throw there (a
  * credential field missing, a provider reply of an unexpected shape) is caught by
  * Foundations and parked on that inner Future, which nothing reads again: the command
- * never replies and the caller waits out its whole timeout. Wrap every Adapter method
- * once, here, so such a throw comes back as a failed Future instead - the shape every
- * command already turns into an error reply. sources.json loads adapter.js before this
- * file in every _cloudcore connector.
+ * never replies and the caller waits out its whole timeout. Wrap the adapter's entry
+ * points once, here, so such a throw comes back as a failed Future instead - the shape
+ * every command already turns into an error reply. sources.json loads adapter.js before
+ * this file in every _cloudcore connector.
+ *
+ * Only the entry points of the adapter interface are wrapped, the methods the commands
+ * call and that return a Future by contract. Adapters' own helpers (_parse, _check, URL
+ * builders...) throw on purpose for their caller to catch; turning those throws into a
+ * returned Future made _get store it as a successful result, so a rejected token passed
+ * checkCredentials.
  */
 var CloudGuard = {
+	ENTRY_POINTS: ["listFolder", "downloadFile", "uploadFile", "uploadReplace",
+		"getAccountInfo", "deletePhoto", "ensureAlbumFolder"],
+
 	wrap: function (adapter) {
-		var name;
+		var i, name;
 		if (!adapter || adapter.__cloudGuarded) { return; }
-		for (name in adapter) {
+		for (i = 0; i < CloudGuard.ENTRY_POINTS.length; i++) {
+			name = CloudGuard.ENTRY_POINTS[i];
 			if (adapter.hasOwnProperty(name) && typeof adapter[name] === "function") {
 				adapter[name] = CloudGuard._guard(name, adapter[name]);
 			}

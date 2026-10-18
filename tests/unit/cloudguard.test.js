@@ -57,12 +57,38 @@ test("normal returns and this are untouched", () => {
 });
 
 test("non-function properties are left alone and wrapping happens once", () => {
-	const adapter = { NAME: "x", f() { throw new Error("boom"); } };
+	const adapter = { NAME: "x", listFolder() { throw new Error("boom"); } };
 	const { ctx } = load(adapter);
-	const once = adapter.f;
+	const once = adapter.listFolder;
 	ctx.CloudGuard.wrap(adapter);
-	assert.strictEqual(adapter.f, once);
+	assert.strictEqual(adapter.listFolder, once);
 	assert.strictEqual(adapter.NAME, "x");
+});
+
+test("helpers outside the entry points keep throwing for their caller", () => {
+	// kDrive/pCloud: _parse throws on a rejected token and _get relies on that throw.
+	const rejected = { returnValue: false, errorCode: "PCLOUD_API_ERROR" };
+	const adapter = {
+		_parse() { throw rejected; },
+		contentUrl() { throw new Error("bad id"); },
+		getAccountInfo() {
+			try { this._parse(); } catch (e) { return { caught: e }; }
+			return { caught: null };
+		},
+	};
+	load(adapter);
+	assert.throws(() => adapter._parse(), (e) => e === rejected);
+	assert.throws(() => adapter.contentUrl(), /bad id/);
+	assert.strictEqual(adapter.getAccountInfo().caught, rejected);
+});
+
+test("every entry point present is wrapped", () => {
+	const names = ["listFolder", "downloadFile", "uploadFile", "uploadReplace",
+		"getAccountInfo", "deletePhoto", "ensureAlbumFolder"];
+	const adapter = {};
+	names.forEach((n) => { adapter[n] = () => { throw new TypeError(n); }; });
+	load(adapter);
+	names.forEach((n) => assert.strictEqual(adapter[n]().exception.errorCode, "CONNECTOR_EXCEPTION", n));
 });
 
 test("no Adapter (flickr-style standalone service) is not an error", () => {
