@@ -16,8 +16,8 @@
 
 	"__comment2": "com.palm.app.cloud-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists.",
 	"__comment3": "com.palm.service.hidrive is in read+writePermissions so the service can readCredentials(accountId) for file ops and writeCredentials back after a token refresh (HiDrive access tokens expire hourly; the refresh token renews them).",
-	"readPermissions":  ["com.palm.app.cloud-auth", "com.palm.service.hidrive", "org.webosports.app.documents", "org.webosports.app.documents-*", "org.webosports.app.photos", "org.webosports.app.photos-*"],
-	"writePermissions": ["com.palm.app.cloud-auth", "com.palm.service.hidrive"],
+	"readPermissions":  ["com.palm.app.cloud-auth", "com.palm.service.hidrive", "org.webosports.app.documents", "org.webosports.app.documents-*", "org.webosports.app.photos", "org.webosports.app.photos-*", "com.palm.service.photos"],
+	"writePermissions": ["com.palm.app.cloud-auth", "com.palm.service.hidrive", "com.palm.service.photos"],
 
 	"capabilityProviders": [
 		{
@@ -29,7 +29,11 @@
 		{
 			"capability": "PHOTO.UPLOAD",
 			"id": "com.palm.hidrive.photos",
-			"__comment": "PHOTO.UPLOAD marks the account as a photo source. The hooks of webOS 3.0.5 (implementation/onEnabled/onDelete/onCredentialsChanged on com.palm.service.photos) are gone: LuneOS has no such aggregator, and the Accounts service would call them on every create, enable and delete. A Photos app finds these accounts by capability and calls the connector service directly (listAlbums, listPhotos, upload, deletePhoto)."
+			"implementation": "palm://com.palm.service.photos",
+			"onEnabled": "palm://com.palm.service.photos/onEnabled",
+			"onDelete": "palm://com.palm.service.photos/onDelete",
+			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
+			"__comment": "Makes the HiDrive account a photo source. The Photos aggregator calls com.palm.service.hidrive/listAlbums+listPhotos; one folder ('Camera Uploads' under home) is surfaced as one album. src_big is a '/file?path=..&access_token=..' URL fetched by the aggregator's curl (see adapter.getTemporaryLink)."
 		}
 	]
 }

@@ -17,8 +17,8 @@
 
 	"__comment2": "com.palm.app.cloud-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists (accounts/handlers/create.js -> Utils.hasPermission). Working templates (teams/telegram/skype) list their own auth app, not com.palm.app.accounts.",
 	"__comment3": "com.palm.service.boxnet is in read+writePermissions so the service itself can readCredentials(accountId) for file ops and writeCredentials back after a token refresh - Box ROTATES the refresh token on every use, so the write path is exercised on nearly every call (accounts/handlers/credentials.js checks these lists).",
-	"readPermissions":  ["com.palm.app.cloud-auth", "com.palm.service.boxnet", "org.webosports.app.documents", "org.webosports.app.documents-*", "org.webosports.app.photos", "org.webosports.app.photos-*"],
-	"writePermissions": ["com.palm.app.cloud-auth", "com.palm.service.boxnet"],
+	"readPermissions":  ["com.palm.app.cloud-auth", "com.palm.service.boxnet", "org.webosports.app.documents", "org.webosports.app.documents-*", "org.webosports.app.photos", "org.webosports.app.photos-*", "com.palm.service.photos"],
+	"writePermissions": ["com.palm.app.cloud-auth", "com.palm.service.boxnet", "com.palm.service.photos"],
 
 	"capabilityProviders": [
 		{
@@ -30,7 +30,11 @@
 		{
 			"capability": "PHOTO.UPLOAD",
 			"id": "com.palm.boxnet.photos",
-			"__comment": "PHOTO.UPLOAD marks the account as a photo source. The hooks of webOS 3.0.5 (implementation/onEnabled/onDelete/onCredentialsChanged on com.palm.service.photos) are gone: LuneOS has no such aggregator, and the Accounts service would call them on every create, enable and delete. A Photos app finds these accounts by capability and calls the connector service directly (listAlbums, listPhotos, upload, deletePhoto)."
+			"implementation": "palm://com.palm.service.photos",
+			"onEnabled": "palm://com.palm.service.photos/onEnabled",
+			"onDelete": "palm://com.palm.service.photos/onDelete",
+			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
+			"__comment": "Makes the Box account a photo source. implementation/hooks point at the stock Photos AGGREGATOR (com.palm.service.photos), which discovers PHOTO.UPLOAD accounts and (via templateId->serviceName in its Utils.js) calls com.palm.service.boxnet/listAlbums+listPhotos, then downloads bytes with the curl-patched Sync-Manager. Box photo URLs carry ?access_token= (Box has no unauthenticated pre-signed links), so the curl -L fetch needs no auth header."
 		}
 	]
 }

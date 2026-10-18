@@ -59,8 +59,8 @@ class Manifest(unittest.TestCase):
     def test_uris_and_services(self):
         c = [c for c in manifest.load() if c.key == "dropbox"][0]
         self.assertIn("com.palm.service.dropbox", c.services())
-        # webOS 3.0.5's Photos aggregator does not exist on LuneOS; no template may call it
-        self.assertNotIn("com.palm.service.photos", c.services())
+        # PHOTO.UPLOAD hooks go to the Photos aggregator (being rewritten for LuneOS)
+        self.assertIn("com.palm.service.photos", c.services())
         self.assertEqual(c.validator_app, "com.palm.app.cloud-auth")
 
     def test_unknown_template_is_an_error(self):
