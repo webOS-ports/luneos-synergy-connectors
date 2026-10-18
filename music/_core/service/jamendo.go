@@ -50,14 +50,12 @@ func (j *jamendoProvider) Search(ctx context.Context, query string, limit int) (
 	if err != nil {
 		return nil, err
 	}
-	var r struct {
-		Results []jamendoTrack `json:"results"`
-	}
-	if err := json.Unmarshal([]byte(body), &r); err != nil {
-		return nil, fmt.Errorf("jamendo parse: %w", err)
+	results, err := parseJamendoTracks([]byte(body))
+	if err != nil {
+		return nil, err
 	}
 	out := []providerTrack{}
-	for _, t := range r.Results {
+	for _, t := range results {
 		out = append(out, providerTrack{
 			ID: t.ID, Provider: "jamendo", Title: t.Name, Artist: t.ArtistName,
 			Thumbnail: t.AlbumImage, DurationMs: t.Duration * 1000, Path: "jamendo:" + t.ID,
@@ -76,14 +74,77 @@ func (j *jamendoProvider) StreamURL(ctx context.Context, trackID string) (string
 	if err != nil {
 		return "", err
 	}
-	var r struct {
-		Results []jamendoTrack `json:"results"`
-	}
-	if err := json.Unmarshal([]byte(body), &r); err != nil {
+	results, err := parseJamendoTracks([]byte(body))
+	if err != nil {
 		return "", err
 	}
-	if len(r.Results) == 0 || r.Results[0].Audio == "" {
+	if len(results) == 0 || results[0].Audio == "" {
 		return "", fmt.Errorf("jamendo: no audio for %s", trackID)
 	}
-	return r.Results[0].Audio, nil
+	return results[0].Audio, nil
+}
+
+// jamendoHeaders is the "headers" object of every v3.0 API answer. A refused request
+// does not fail at the HTTP level: it comes back 200 with an empty "results" and the
+// reason in here -- either status "failed" with error_message, or status "success" with
+// a warning, which is how the shared demo client_id is told it is over its usage limit:
+//
+//	{"headers":{"status":"success","code":0,"error_message":"","warnings":"Usage limits
+//	 are exceeded for this request, please contact Jamendo before we block your access to
+//	 this request","results_count":0},"results":[]}
+//
+// Ignoring it made search silently return nothing.
+type jamendoHeaders struct {
+	Status       string          `json:"status"`
+	Code         int             `json:"code"`
+	ErrorMessage string          `json:"error_message"`
+	Warnings     json.RawMessage `json:"warnings"`
+	ResultsCount int             `json:"results_count"`
+}
+
+// warnings is documented as a string; render anything else (an array, say) as its JSON.
+func (h *jamendoHeaders) warningText() string {
+	w := strings.TrimSpace(string(h.Warnings))
+	if w == "" || w == "null" || w == `""` || w == "[]" {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(h.Warnings, &s) == nil {
+		return strings.TrimSpace(s)
+	}
+	return w
+}
+
+// parseJamendoTracks decodes a /tracks answer and turns a refusal reported in its
+// headers into an error, so /provider/jamendo/search answers 502 with the reason as the
+// other providers do for upstream errors, instead of an empty list.
+func parseJamendoTracks(body []byte) ([]jamendoTrack, error) {
+	var r struct {
+		Headers *jamendoHeaders `json:"headers"`
+		Results []jamendoTrack  `json:"results"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, fmt.Errorf("jamendo parse: %w", err)
+	}
+	if h := r.Headers; h != nil {
+		warn := h.warningText()
+		if h.Status != "success" {
+			msg := strings.TrimSpace(h.ErrorMessage)
+			if msg == "" {
+				msg = warn
+			}
+			if msg == "" {
+				msg = "no error message"
+			}
+			st := h.Status
+			if st == "" {
+				st = "has no status"
+			}
+			return nil, fmt.Errorf("jamendo: request %s (code %d): %s", st, h.Code, msg)
+		}
+		if len(r.Results) == 0 && warn != "" {
+			return nil, fmt.Errorf("jamendo: %s", warn)
+		}
+	}
+	return r.Results, nil
 }
