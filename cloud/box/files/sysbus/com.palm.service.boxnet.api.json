@@ -1,0 +1,5 @@
+{
+    "synergy-box.operation": [
+        "com.palm.service.boxnet/*"
+    ]
+}

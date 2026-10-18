@@ -1,0 +1,8 @@
+{
+    "allowedNames": [
+        "com.palm.service.kdrive"
+    ],
+    "synergy-kdrive.operation": [
+        "dev"
+    ]
+}

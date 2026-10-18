@@ -1,0 +1,8 @@
+{
+    "allowedNames": [
+        "com.palm.service.s3"
+    ],
+    "synergy-s3.operation": [
+        "dev"
+    ]
+}

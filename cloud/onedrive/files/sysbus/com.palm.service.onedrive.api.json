@@ -1,0 +1,5 @@
+{
+    "synergy-onedrive.operation": [
+        "com.palm.service.onedrive/*"
+    ]
+}

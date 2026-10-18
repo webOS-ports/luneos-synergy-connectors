@@ -1,0 +1,5 @@
+{
+    "synergy-s3.operation": [
+        "com.palm.service.s3/*"
+    ]
+}

@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=com.palm.service.s3
+Exec=/usr/bin/run-js-service -n /usr/palm/services/com.palm.service.s3

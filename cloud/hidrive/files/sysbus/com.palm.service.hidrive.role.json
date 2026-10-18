@@ -1,0 +1,19 @@
+{
+    "appId": "com.palm.service.hidrive",
+    "allowedNames": [
+        "com.palm.service.hidrive"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "com.palm.service.hidrive",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}

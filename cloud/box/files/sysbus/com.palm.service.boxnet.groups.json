@@ -1,0 +1,8 @@
+{
+    "allowedNames": [
+        "com.palm.service.boxnet"
+    ],
+    "synergy-box.operation": [
+        "dev"
+    ]
+}

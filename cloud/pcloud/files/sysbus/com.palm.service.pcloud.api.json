@@ -1,0 +1,5 @@
+{
+    "synergy-pcloud.operation": [
+        "com.palm.service.pcloud/*"
+    ]
+}

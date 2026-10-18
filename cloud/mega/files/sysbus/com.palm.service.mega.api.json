@@ -1,0 +1,5 @@
+{
+    "synergy-mega.operation": [
+        "com.palm.service.mega/*"
+    ]
+}

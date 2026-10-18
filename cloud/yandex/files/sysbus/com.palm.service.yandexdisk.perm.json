@@ -1,0 +1,9 @@
+{
+    "com.palm.service.yandexdisk": ["accountsservice.operation", "activity.operation", "systemsettings.query", "time.query"],
+    "com.palm.service.accounts": ["synergy-yandex.operation"],
+    "com.palm.app.cloud-auth-*": ["synergy-yandex.operation"],
+    "com.palm.app.cloud-auth": ["synergy-yandex.operation"],
+    "org.webosports.app.documents-*": ["synergy-yandex.operation"],
+    "org.webosports.app.photos-*": ["synergy-yandex.operation"],
+    "com.palm.service.photos": ["synergy-yandex.operation"]
+}

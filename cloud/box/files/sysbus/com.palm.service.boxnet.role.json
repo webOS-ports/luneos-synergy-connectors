@@ -1,0 +1,19 @@
+{
+    "appId": "com.palm.service.boxnet",
+    "allowedNames": [
+        "com.palm.service.boxnet"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "com.palm.service.boxnet",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}

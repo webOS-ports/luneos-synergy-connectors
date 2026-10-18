@@ -1,0 +1,7 @@
+{
+    "com.palm.service.gdrive": ["accountsservice.operation", "activity.operation", "systemsettings.query", "time.query"],
+    "com.palm.service.accounts": ["synergy-gdrive.operation"],
+    "com.palm.app.cloud-auth-*": ["synergy-gdrive.operation"],
+    "com.palm.app.cloud-auth": ["synergy-gdrive.operation"],
+    "org.webosports.app.documents-*": ["synergy-gdrive.operation"]
+}

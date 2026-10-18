@@ -1,0 +1,19 @@
+{
+    "appId": "com.palm.service.pcloud",
+    "allowedNames": [
+        "com.palm.service.pcloud"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "com.palm.service.pcloud",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}

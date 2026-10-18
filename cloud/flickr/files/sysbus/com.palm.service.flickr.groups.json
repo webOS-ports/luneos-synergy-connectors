@@ -1,0 +1,8 @@
+{
+    "allowedNames": [
+        "com.palm.service.flickr"
+    ],
+    "synergy-flickr.operation": [
+        "dev"
+    ]
+}

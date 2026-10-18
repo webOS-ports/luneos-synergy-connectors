@@ -1,0 +1,19 @@
+{
+    "appId": "com.palm.service.yandexdisk",
+    "allowedNames": [
+        "com.palm.service.yandexdisk"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "com.palm.service.yandexdisk",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}

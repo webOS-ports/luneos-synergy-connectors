@@ -1,0 +1,19 @@
+{
+    "appId": "com.palm.service.mega",
+    "allowedNames": [
+        "com.palm.service.mega"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "com.palm.service.mega",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}

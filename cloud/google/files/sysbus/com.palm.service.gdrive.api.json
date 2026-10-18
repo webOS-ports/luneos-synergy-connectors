@@ -1,0 +1,5 @@
+{
+    "synergy-gdrive.operation": [
+        "com.palm.service.gdrive/*"
+    ]
+}

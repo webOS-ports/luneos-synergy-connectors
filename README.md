@@ -19,6 +19,7 @@ cloud/_core/apps/                  com.palm.app.cloud-auth, the shared OAuth sig
 cloud/<name>/account/              account template + icons  -> /usr/palm/public/accounts/
 cloud/<name>/service/              the connector's mojoservice -> /usr/palm/services/
 cloud/<name>/apps/                 its own sign-in app, where it has one (kdrive, mega, s3, flickr)
+cloud/<name>/files/sysbus/         its service's LS2 files (webos_system_bus) -> /usr/share/luna-service2/
 
 im/_core/include/                  webos-ls2-compat.h, shared by the plugins
 im/<name>/account/                 account template + icons

@@ -1,0 +1,5 @@
+{
+    "synergy-koofr.operation": [
+        "com.palm.service.koofr/*"
+    ]
+}

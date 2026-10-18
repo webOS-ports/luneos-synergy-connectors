@@ -1,0 +1,8 @@
+{
+    "allowedNames": [
+        "com.palm.service.dropbox"
+    ],
+    "synergy-dropbox.operation": [
+        "dev"
+    ]
+}

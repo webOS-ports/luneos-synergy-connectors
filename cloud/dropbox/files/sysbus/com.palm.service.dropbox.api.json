@@ -1,0 +1,5 @@
+{
+    "synergy-dropbox.operation": [
+        "com.palm.service.dropbox/*"
+    ]
+}

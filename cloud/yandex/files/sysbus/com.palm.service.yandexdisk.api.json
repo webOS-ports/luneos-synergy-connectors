@@ -1,0 +1,5 @@
+{
+    "synergy-yandex.operation": [
+        "com.palm.service.yandexdisk/*"
+    ]
+}

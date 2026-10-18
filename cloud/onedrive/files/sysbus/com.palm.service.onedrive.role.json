@@ -1,0 +1,19 @@
+{
+    "appId": "com.palm.service.onedrive",
+    "allowedNames": [
+        "com.palm.service.onedrive"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "com.palm.service.onedrive",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}

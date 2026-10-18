@@ -1,0 +1,9 @@
+{
+    "com.palm.service.pcloud": ["accountsservice.operation", "activity.operation", "systemsettings.query", "time.query"],
+    "com.palm.service.accounts": ["synergy-pcloud.operation"],
+    "com.palm.app.cloud-auth-*": ["synergy-pcloud.operation"],
+    "com.palm.app.cloud-auth": ["synergy-pcloud.operation"],
+    "org.webosports.app.documents-*": ["synergy-pcloud.operation"],
+    "org.webosports.app.photos-*": ["synergy-pcloud.operation"],
+    "com.palm.service.photos": ["synergy-pcloud.operation"]
+}

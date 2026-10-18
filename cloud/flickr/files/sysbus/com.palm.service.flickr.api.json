@@ -1,0 +1,5 @@
+{
+    "synergy-flickr.operation": [
+        "com.palm.service.flickr/*"
+    ]
+}

@@ -1,0 +1,19 @@
+{
+    "appId": "com.palm.service.s3",
+    "allowedNames": [
+        "com.palm.service.s3"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "com.palm.service.s3",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}

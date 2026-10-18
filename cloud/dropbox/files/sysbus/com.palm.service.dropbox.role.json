@@ -1,0 +1,19 @@
+{
+    "appId": "com.palm.service.dropbox",
+    "allowedNames": [
+        "com.palm.service.dropbox"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "com.palm.service.dropbox",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}

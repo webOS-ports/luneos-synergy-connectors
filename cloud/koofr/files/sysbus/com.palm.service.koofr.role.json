@@ -1,0 +1,19 @@
+{
+    "appId": "com.palm.service.koofr",
+    "allowedNames": [
+        "com.palm.service.koofr"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "com.palm.service.koofr",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}

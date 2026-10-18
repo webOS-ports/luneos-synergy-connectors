@@ -1,0 +1,5 @@
+{
+    "synergy-kdrive.operation": [
+        "com.palm.service.kdrive/*"
+    ]
+}
