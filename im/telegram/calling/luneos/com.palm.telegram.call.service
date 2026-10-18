@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=com.palm.telegram.call
+Exec=/usr/sbin/imlibpurpleservice
+Type=static

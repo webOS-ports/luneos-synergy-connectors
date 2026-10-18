@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=com.palm.signal.call
+Exec=/usr/sbin/imlibpurpleservice
+Type=static

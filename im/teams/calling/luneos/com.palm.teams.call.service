@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=com.palm.teams.call
+Exec=/usr/sbin/imlibpurpleservice
+Type=static

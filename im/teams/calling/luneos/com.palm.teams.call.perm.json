@@ -1,0 +1,4 @@
+{
+    "org.webosports.app.phone": ["imlibpurple-call.operation"],
+    "org.webosports.app.phone-*": ["imlibpurple-call.operation"]
+}
