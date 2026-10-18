@@ -25,7 +25,8 @@ im/_core/include/                  webos-ls2-compat.h, shared by the plugins
 im/<name>/account/                 account template + icons
 im/<name>/apps/                    sign-in (validator) app
 im/<name>/plugin/                  libpurple protocol plugin source (vendored fork, own licence)
-im/<name>/calling/                 call bridge sources and LS2/dbus files, where built
+im/<name>/calling/                 call bridge sources, where built
+im/<name>/files/sysbus/            LS2 files for its call service (webos_system_bus), where it has one
 
 music/_core/service/               spotify-webos-service, the Go streaming daemon (127.0.0.1:8730)
 music/_core/apps/                  org.webosports.app.musicauth, the shared sign-in app

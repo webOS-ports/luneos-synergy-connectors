@@ -14,7 +14,8 @@ their network logs in: `whatsapp/plugin/purple-combined/glue/call.c`,
 
 `imlibpurpleservice` ships the role that lets it own those names and defines
 the `imlibpurple-call.operation` group for their methods. Each network's
-`calling/luneos/` adds the two files the plugin package installs with it:
+`files/sysbus/` (installed by `webos_system_bus`) holds the two files the plugin package installs
+with it:
 
 - `com.palm.<net>.call.service` (`services.d`), `Type=static`. ls-hubd only
   routes to names listed in service files ("Service not listed in service
