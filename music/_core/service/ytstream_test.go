@@ -414,3 +414,106 @@ func TestYtProxyURL(t *testing.T) {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
+
+func getRange(t *testing.T, u, rng string) (*http.Response, []byte) {
+	t.Helper()
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Range", rng)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading proxied body: %v", err)
+	}
+	return resp, body
+}
+
+// gst's souphttpsrc asks for ranges when the app plays the URL itself (an MP4 index at
+// the end, a seek) and stops with "Server does not support seeking" on a 200.
+func TestYtStreamServesRanges(t *testing.T) {
+	const size = 2*ytChunkSize + 12345
+	g := &googlevideo{size: size}
+	up := httptest.NewServer(g)
+	defer up.Close()
+	srv := proxyFor(t, newFetcher(nil), up.URL+"/v", nil)
+
+	for _, c := range []struct {
+		rng         string
+		first, last int64
+	}{
+		{"bytes=1000-", 1000, size - 1},
+		{"bytes=0-", 0, size - 1},
+		{"bytes=1048000-1049999", 1048000, 1049999}, // across a chunk boundary
+		{"bytes=5-5", 5, 5},
+		{"bytes=100-99999999", 100, size - 1}, // last past the end
+	} {
+		resp, body := getRange(t, srv.URL, c.rng)
+		if resp.StatusCode != http.StatusPartialContent {
+			t.Fatalf("%s: status %d, want 206", c.rng, resp.StatusCode)
+		}
+		if want := fmt.Sprintf("bytes %d-%d/%d", c.first, c.last, size); resp.Header.Get("Content-Range") != want {
+			t.Errorf("%s: Content-Range %q, want %q", c.rng, resp.Header.Get("Content-Range"), want)
+		}
+		if resp.ContentLength != c.last-c.first+1 {
+			t.Errorf("%s: Content-Length %d, want %d", c.rng, resp.ContentLength, c.last-c.first+1)
+		}
+		if !bytes.Equal(body, fakeContent(c.first, c.last-c.first+1)) {
+			t.Errorf("%s: body is not bytes %d-%d (%d bytes)", c.rng, c.first, c.last, len(body))
+		}
+	}
+	if resp, _ := getAll(t, srv.URL); resp.Header.Get("Accept-Ranges") != "bytes" {
+		t.Errorf("Accept-Ranges %q, want bytes", resp.Header.Get("Accept-Ranges"))
+	}
+}
+
+func TestYtStreamRangePastEnd(t *testing.T) {
+	g := &googlevideo{size: 5000}
+	up := httptest.NewServer(g)
+	defer up.Close()
+	srv := proxyFor(t, newFetcher(nil), up.URL+"/v", nil)
+	if resp, _ := getRange(t, srv.URL, "bytes=5000-"); resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("status %d, want 416", resp.StatusCode)
+	}
+}
+
+func TestYtStreamUnservedRangeFormGetsEverything(t *testing.T) {
+	const size = ytChunkSize + 77
+	g := &googlevideo{size: size}
+	up := httptest.NewServer(g)
+	defer up.Close()
+	srv := proxyFor(t, newFetcher(nil), up.URL+"/v", nil)
+	resp, body := getRange(t, srv.URL, "bytes=-500")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", resp.StatusCode)
+	}
+	checkBody(t, body, size)
+}
+
+func TestParseByteRange(t *testing.T) {
+	for _, c := range []struct {
+		h           string
+		first, last int64
+		ok          bool
+	}{
+		{"bytes=0-", 0, -1, true},
+		{"bytes=10-20", 10, 20, true},
+		{"bytes=7-7", 7, 7, true},
+		{"", 0, 0, false},
+		{"bytes=-500", 0, 0, false},
+		{"bytes=0-1,5-6", 0, 0, false},
+		{"bytes=20-10", 0, 0, false},
+		{"bytes=x-", 0, 0, false},
+		{"items=0-", 0, 0, false},
+	} {
+		first, last, ok := parseByteRange(c.h)
+		if ok != c.ok || (ok && (first != c.first || last != c.last)) {
+			t.Errorf("%q: got %d %d %v, want %d %d %v", c.h, first, last, ok, c.first, c.last, c.ok)
+		}
+	}
+}

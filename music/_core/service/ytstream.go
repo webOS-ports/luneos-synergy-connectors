@@ -35,8 +35,12 @@ import (
 // curl never holds an upstream request open. When the client goes away, the request
 // context ends the fetching.
 //
+// A client that asks for a range (Range: bytes=<first>-[<last>]) gets that part with 206,
+// as from any web server: gst's souphttpsrc does when the app plays the URL itself, for
+// an MP4 whose index is at the end and for a seek, and gives up on a 200 for a range.
+//
 // GET /ytstream?id=<videoId>[&format=<label>]  (format: an ytFmtLabel label, as used by
-// /stream/switchformat, e.g. "OPUS 160"). No CORS: only curl on this device talks to it.
+// /stream/switchformat, e.g. "OPUS 160"). No CORS: only players on this device use it.
 
 // ytChunkSize is the largest range googlevideo answers with 206 (1 MiB).
 const ytChunkSize = 1 << 20
@@ -199,6 +203,7 @@ type ytRangeStream struct {
 	f          *ytChunkFetcher
 	url        string
 	total      int64 // -1 until known
+	limit      int64 // end (exclusive) of the range the client asked for; -1 for none
 	ctype      string
 	eof        bool // total unknown and upstream sent a short chunk
 	reresolved bool
@@ -210,6 +215,9 @@ func (s *ytRangeStream) fetch(ctx context.Context, off int64) ([]byte, error) {
 	end := off + s.f.chunk - 1
 	if s.total >= 0 && end >= s.total {
 		end = s.total - 1
+	}
+	if s.limit >= 0 && end >= s.limit {
+		end = s.limit - 1
 	}
 	resp, err := ytRangeGet(ctx, s.f.client, s.url, off, end)
 	if err != nil {
@@ -304,27 +312,79 @@ func (s *ytRangeStream) next(ctx context.Context, off int64) ([]byte, error) {
 }
 
 func (s *ytRangeStream) done(off int64) bool {
-	return s.eof || (s.total >= 0 && off >= s.total)
+	return s.eof || (s.total >= 0 && off >= s.total) || (s.limit >= 0 && off >= s.limit)
 }
 
-// serve streams u to w from offset 0 and returns the bytes written. The first chunk is
-// fetched before any header is written, so a URL that cannot be played is a 502.
+// parseByteRange parses a Range header of one range from a start offset,
+// "bytes=<first>-" or "bytes=<first>-<last>"; last is -1 when open. ok is false for no
+// header and for forms this proxy does not serve (suffix and multiple ranges), which
+// then get the whole stream.
+func parseByteRange(h string) (first, last int64, ok bool) {
+	spec, found := strings.CutPrefix(h, "bytes=")
+	if !found || strings.Contains(spec, ",") {
+		return 0, 0, false
+	}
+	a, b, found := strings.Cut(strings.TrimSpace(spec), "-")
+	if !found || a == "" {
+		return 0, 0, false
+	}
+	first, err := strconv.ParseInt(a, 10, 64)
+	if err != nil || first < 0 {
+		return 0, 0, false
+	}
+	if b == "" {
+		return first, -1, true
+	}
+	last, err = strconv.ParseInt(b, 10, 64)
+	if err != nil || last < first {
+		return 0, 0, false
+	}
+	return first, last, true
+}
+
+// serve streams u to w, all of it or the range the request asks for, and returns the
+// bytes written. The first chunk is fetched before any header is written, so a URL that
+// cannot be played is a 502.
 func (f *ytChunkFetcher) serve(w http.ResponseWriter, r *http.Request, u string) (int64, error) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	s := &ytRangeStream{f: f, url: u, total: -1}
-	first, err := s.next(ctx, 0)
+	s := &ytRangeStream{f: f, url: u, total: -1, limit: -1}
+	start, last, ranged := parseByteRange(r.Header.Get("Range"))
+	if ranged && last >= 0 {
+		s.limit = last + 1
+	}
+	first, err := s.next(ctx, start)
 	if err != nil {
+		var se *ytStatusError
+		if ranged && start > 0 && errors.As(err, &se) && se.code == http.StatusRequestedRangeNotSatisfiable {
+			http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
+			return 0, nil
+		}
 		http.Error(w, "youtube stream: "+err.Error(), http.StatusBadGateway)
 		return 0, err
 	}
+	if ranged && s.total < 0 && start > 0 {
+		// Without the length there is no Content-Range to send.
+		http.Error(w, "range of a stream of unknown length", http.StatusRequestedRangeNotSatisfiable)
+		return 0, nil
+	}
+	w.Header().Set("Accept-Ranges", "bytes")
 	if s.ctype != "" {
 		w.Header().Set("Content-Type", s.ctype)
 	}
-	if s.total >= 0 {
+	status := http.StatusOK
+	if ranged && s.total >= 0 {
+		end := s.total - 1
+		if s.limit >= 0 && s.limit-1 < end {
+			end = s.limit - 1
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, s.total))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+		status = http.StatusPartialContent
+	} else if s.total >= 0 {
 		w.Header().Set("Content-Length", strconv.FormatInt(s.total, 10))
 	}
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(status)
 
 	// Producer: fetch the following chunks, one ahead of the writer.
 	chunks := make(chan []byte, 1)
@@ -334,7 +394,7 @@ func (f *ytChunkFetcher) serve(w http.ResponseWriter, r *http.Request, u string)
 	go func() {
 		defer wg.Done()
 		defer close(chunks)
-		off := int64(len(first))
+		off := start + int64(len(first))
 		for !s.done(off) {
 			data, err := s.next(ctx, off)
 			if err != nil {
