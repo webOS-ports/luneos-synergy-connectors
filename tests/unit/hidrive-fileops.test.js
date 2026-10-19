@@ -227,3 +227,11 @@ test("deleteItem: a refused delete is a failure", () => {
 	assert.strictEqual(e.errorCode, "HIDRIVE_API_ERROR");
 	assert.strictEqual(e.status, 403);
 });
+
+test("uploadFile into a folder answers with the uploaded file, not a Future", () => {
+	const t = setup([[`PUT ${API}/file?dir=${enc("/users/me/Docs")}&name=${enc("a b.txt")}`,
+		json(201, { name: "a%20b.txt", path: "/users/me/Docs/a%20b.txt", size: 3 })]]);
+	const f = t.A.uploadFile(t.creds, "/users/me/Docs", "/media/internal/a b.txt", "a b.txt", "text/plain", t.onRenew);
+	assert.deepStrictEqual(plain(f.result), { id: "/users/me/Docs/a%20b.txt", path: "/users/me/Docs/a%20b.txt",
+		name: "a%20b.txt", size: 3 });
+});

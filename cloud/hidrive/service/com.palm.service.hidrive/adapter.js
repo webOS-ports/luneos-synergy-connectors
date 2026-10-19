@@ -181,7 +181,8 @@ var Adapter = {
 		f.then(this, function () {
 			var dir;
 			try { dir = pf.result; } catch (e0) { f.setException(e0); return; }
-			f.result = self._put(creds, dir, name, localPath, cb);
+			// nest: Foundations stores a Future assigned to .result as the result itself.
+			f.nest(self._put(creds, dir, name, localPath, cb));
 		});
 		return f;
 	},
