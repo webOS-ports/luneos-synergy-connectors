@@ -14,19 +14,24 @@
  *
  * REGISTER at https://console.cloud.google.com/ -> OAuth consent screen (External, In
  * production) + Credentials -> OAuth client ID -> "Desktop app". Add scope .../auth/drive
- * and the redirect URI below. Paste BOTH CLIENT_ID and CLIENT_SECRET.
+ * and the redirect URI below.
  */
+/* The OAuth app's credentials are not kept here. The build fills the PLACEHOLDER_GDRIVE_*
+ * values in from the builder's own configuration (meta-luneos cloud-synergy-connector.inc);
+ * a package built without them cannot sign in.
+ * A plain file the build patches (sed on the PLACEHOLDER_ lines), read with require(). */
 var Config = {
-	// Modern-TLS HTTP: device node is OpenSSL 0.9.8k, so ALL Drive HTTPS shells out to the
-	// bundled modern curl (same binary + system CA store the other connectors use).
+	// Not used by the service, which speaks HTTPS through node's own fetch (_cloudcore/node/
+	// http.js). The on-device harness (tests/suites/cloud.py tls_reachable) still runs this curl
+	// with this CA bundle to check the provider can be reached, so the keys stay.
 	CURL:                 "/usr/bin/curl",
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
 
 	CLIENT_ID:     "PLACEHOLDER_GDRIVE_CLIENT_ID",       // TODO: Google Cloud "Desktop app" client
 	// REQUIRED for Google (Desktop clients must send it on token exchange). Treated as
-	// non-confidential by Google; it ships in the package. oauth2.js includes it because it
-	// is not left as the PLACEHOLDER sentinel.
+	// non-confidential by Google; it ships in the package. _cloudcore/node/oauth.js sends it
+	// once the build has replaced the PLACEHOLDER sentinel.
 	CLIENT_SECRET: "PLACEHOLDER_GDRIVE_CLIENT_SECRET",
 	REDIRECT_URI:  "http://localhost/gdrive/oauth2callback",
 
@@ -43,7 +48,7 @@ var Config = {
 	// ".../auth/drive.readonly" for a lower-risk read-only build (breaks upload).
 	SCOPE:         "https://www.googleapis.com/auth/drive",
 
-	// --- _cloudcore generic wiring (consumed by ../_cloudcore) --------------------------
+	// --- _cloudcore generic wiring (read by _cloudcore/node) ----------------------------
 	SERVICE_NAME:  "com.palm.service.gdrive",
 	DISPLAY_NAME:  "Google Drive",          // exchangeCode username fallback
 	STATE:         "gdrive",                 // OAuth `state` + Atlas result-key stem
@@ -51,7 +56,8 @@ var Config = {
 	// token; Google must NOT get scope on the token calls, so TOKEN_SEND_SCOPE stays off.
 	AUTHORIZE_EXTRA:  "&access_type=offline&prompt=consent",
 	TOKEN_SEND_SCOPE: false,
-	// Caller allow-lists enforced by _cloudcore/acl.js.
+	// FILE_APP_IDS: the callers of the file methods (_cloudcore/node/commands.js). AUTH_APP_IDS
+	// is kept for reference: getAuthorizeUrl is open (see commands.js).
 	AUTH_APP_IDS:  ["com.palm.app.cloud-auth"],
 	FILE_APP_IDS:  ["org.webosports.app.documents", "org.webosports.app.documents-*", "com.palm.stark.files.service"]
 };

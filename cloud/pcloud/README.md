@@ -1,14 +1,13 @@
 # pCloud connector
 
-A full **pCloud** **DOCUMENTS + PHOTO.UPLOAD** Synergy connector on the shared **`_cloudcore`**
-runtime. Code-complete; **untested on device** only because it needs a pCloud app `client_id`
-+ `client_secret` (see Configuration).
+A **pCloud** **DOCUMENTS + PHOTO.UPLOAD** Synergy connector on **`_cloudcore/node`** (plain
+node 22 modules), laid out like the Dropbox connector, which is the reference.
 
-pCloud shares the `_cloudcore` file layer (adapter + the generic listFolder/upload/download/
-checkCredentials commands + httpcurl/acl/creds/cloudservice) but keeps a **local `oauth2.js`
-+ local `getAuthorizeUrl`/`exchangeCode` commands** — its region-host + no-PKCE auth cannot use
-the generic ones. It still uses the one generic `com.palm.app.cloud-auth` app, which forwards
-the redirect's `hostname`/`locationid` so the local `exchangeCode` can resolve the region.
+pCloud uses the generic file methods of `_cloudcore/node` (listFolder, download, upload,
+create/move/delete, checkCredentials, upload/deletePhoto) but has its **own `getAuthorizeUrl`
+and `exchangeCode`** (`oauth2.js`): its region-host + no-PKCE + no-refresh auth cannot use the
+generic ones. It still uses the one generic `com.palm.app.cloud-auth` app, which forwards the
+redirect's `hostname`/`locationid` so `exchangeCode` can resolve the region.
 
 pCloud is a clean REST/ID fit (folders and files are numeric IDs, the root is `folderid 0`),
 so the service is a near-clone of the Box/OneDrive ones — with **one thing that makes pCloud
@@ -36,24 +35,27 @@ So the connector:
 ## What's here
 
 ```
-service/com.palm.service.pcloud/     node service on the shared _cloudcore runtime
-  config.js        endpoints + client id/secret + US/EU region hosts + _cloudcore wiring;
-                   ROOT_FOLDER = 0
+service/com.palm.service.pcloud/     node service on _cloudcore/node
+  package.json     main: service.js (run-js-service requires the directory, calls run())
+  service.js       config + adapter + oauth2 + photos into _cloudcore/node's connector()
+  config.js        endpoints + client id/secret (PLACEHOLDER_PCLOUD_*, filled in by the build)
+                   + US/EU region hosts + _cloudcore wiring; ROOT_FOLDER = 0
   adapter.js       pCloud REST mapping: /listfolder (folderid), /getfilelink -> download,
-                   /uploadfile (multipart, overwrite-by-name), /checksumfile, /userinfo; region
-                   host per call; normalises to the _cloudcore shape (+ raw listFolderRaw /
-                   getFileLink for Photos); nonzero `result` -> exception
-  oauth2.js        LOCAL (not the generic one): NO PKCE (ships a client_secret, like gdrive),
+                   /uploadfile (multipart, overwrite-by-name), /checksumfile, /userinfo,
+                   create/rename/delete; region host per call; nonzero `result` -> PCLOUD_API_ERROR
+  oauth2.js        pCloud's getAuthorizeUrl / exchangeCode: NO PKCE (ships a client_secret),
                    NO refresh (tokens are long-lived); region-host-aware token exchange
-  commands/getAuthorizeUrl_command.js, exchangeCode_command.js   LOCAL: no PKCE verifier;
-                   region (hostname/locationid) threading into credentials
-  commands/        photolib, listAlbums, listPhotos               <- PHOTO.UPLOAD
-  sources.json     pulls ../_cloudcore/{acl,httpcurl,creds,cloudservice}.js and the generic
-                   ../_cloudcore/commands/{checkCredentials,listFolder,uploadFile,downloadFile};
-                   uses the LOCAL oauth2.js + getAuthorizeUrl/exchangeCode + local photos
+  photos.js        listAlbums / listPhotos                       <- PHOTO.UPLOAD
 account/com.palm.pcloud.json   Synergy template: customUI validator -> the generic
                                com.palm.app.cloud-auth, DOCUMENTS + PHOTO.UPLOAD, permissions
 ```
+
+File-manager locators are the numeric ids `listFolder` gives, or pCloud's typed ids (`d123`
+folder, `f456` file); a bare number is looked up as both and refused when it names both
+(`PCLOUD_AMBIGUOUS_ID`) or neither (`PCLOUD_NOT_FOUND`). A file move first lists the
+destination and refuses an existing name (`PCLOUD_EXISTS`), since `renamefile` would replace
+it. The root is `0` (also `"root"`, `""`, `"/"`, `d0`) and is never moved or deleted.
+`tests/unit/pcloud.test.js` covers all of it over a stand-in bus and fetch.
 
 ## How it differs from the others (all REST/ID-based)
 
@@ -78,16 +80,17 @@ the file-picker and a future QuickOffice reroute call it Dropbox-uniformly.
 Register a free app in the **pCloud developer console** (<https://docs.pcloud.com/> → *My
 applications*):
 - Set the redirect URI to `http://localhost/pcloud/oauth2callback` **verbatim**.
-- Copy **both** the **Client ID** and **Client secret** into
-  `service/com.palm.service.pcloud/config.js` (`CLIENT_ID`, `CLIENT_SECRET`). **Both are
-  required** — pCloud does **not** support PKCE, so the code→token exchange must send the
-  secret (same as the gdrive "Desktop app" client).
+- The build fills **both** the **Client ID** and **Client secret** in
+  (`PCLOUD_CLIENT_ID` / `PCLOUD_CLIENT_SECRET`, meta-luneos cloud-synergy-connector.inc).
+  **Both are required** — pCloud does **not** support PKCE, so the code→token exchange must
+  send the secret (same as the gdrive "Desktop app" client).
 
-Same modern system-curl (`/usr/bin/curl`) + current-CA prerequisites as the other connectors.
+HTTPS is node's own `fetch`; `CURL`/`CURL_CAINFO` in config.js are only read by the on-device
+harness's reachability check.
 
 ## Status / caveats
 
-- ✅ Service (on `_cloudcore`), generic `cloud-auth` app, template. Needs the Photos-aggregator `case "com.palm.pcloud"`
+- ✅ Service (on `_cloudcore/node`), generic `cloud-auth` app, template. Needs the Photos-aggregator `case "com.palm.pcloud"`
   (in `../../photos-integration/`) added by the integrator to route photo calls here.
 - ⏳ **Account sign-in untested** — needs a real `client_id` + `client_secret`.
 - ⚠️ **Region host** is resolved from the OAuth2 redirect and stored per account; if a
@@ -98,7 +101,7 @@ Same modern system-curl (`/usr/bin/curl`) + current-CA prerequisites as the othe
   file (pCloud keeps the old copy as a revision), matching the OneDrive PUT. `replace:true`
   (save-back by fileid) looks up the file's name+parent via `/checksumfile` and re-uploads.
 - ⚠️ **Photos:** pCloud has no album API, so **one folder** (default `folderid 0` = the account
-  root) is surfaced as one album; point `PhotoLib.ALBUM_FOLDER` at a specific folderid to
+  root) is surfaced as one album; point `ALBUM_FOLDER` in `photos.js` at a specific folderid to
   narrow it. Listing is flat (not recursive), matching the Dropbox provider.
 
 ## Web-verified API details

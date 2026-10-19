@@ -10,21 +10,24 @@
  *   - Authentication -> "Allow public client flows" = Yes (isFallbackPublicClient).
  * Paste the Application (client) ID into CLIENT_ID. NO client_secret is used or wanted:
  * Microsoft public/native clients MUST redeem the code WITHOUT a secret, so the identical
- * package ships to every device with nothing to provision (see oauth2.js).
+ * package ships to every device with nothing to provision (see _cloudcore/node/oauth.js).
  */
 /* The OAuth app's credentials are not kept here. The build fills the PLACEHOLDER_ONEDRIVE_*
  * values in from ONEDRIVE_CLIENT_ID / ONEDRIVE_CLIENT_SECRET (meta-luneos
- * cloud-synergy-connector.inc); a package built without them cannot sign in. */
+ * cloud-synergy-connector.inc); a package built without them cannot sign in.
+ * A plain file the build patches (sed on the PLACEHOLDER_ lines), read with require(). */
 var Config = {
-	// Modern-TLS HTTP: device node is OpenSSL 0.9.8k, so ALL Graph HTTPS shells out to the
-	// bundled modern curl (same binary + system CA store the Dropbox/Box connectors use).
+	// Not used by the service, which speaks HTTPS through node's own fetch (_cloudcore/node/
+	// http.js). The on-device harness (tests/suites/cloud.py tls_reachable) still runs this curl
+	// with this CA bundle to check the provider can be reached, so the keys stay.
 	CURL:                 "/usr/bin/curl",
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
 
 	CLIENT_ID:     "PLACEHOLDER_ONEDRIVE_CLIENT_ID", // from the build, see config.js header
 	// Microsoft public clients redeem the auth code with NO secret. Leave this placeholder;
-	// oauth2.js runs pure PKCE and never sends a secret when it starts with "PLACEHOLDER".
+	// _cloudcore/node/oauth.js runs pure PKCE and never sends a secret that starts with
+	// "PLACEHOLDER".
 	CLIENT_SECRET: "PLACEHOLDER_ONEDRIVE_CLIENT_SECRET",
 	REDIRECT_URI:  "http://localhost/onedrive/oauth2callback",
 
@@ -40,15 +43,16 @@ var Config = {
 	// User.Read = /me profile for the account display name. Space-separated per OAuth2.
 	SCOPE:         "Files.ReadWrite offline_access User.Read",
 
-	// --- _cloudcore generic wiring (consumed by ../_cloudcore) --------------------------
+	// --- _cloudcore generic wiring (read by _cloudcore/node) ----------------------------
 	SERVICE_NAME:  "com.palm.service.onedrive",
 	DISPLAY_NAME:  "OneDrive",               // exchangeCode username fallback
 	STATE:         "onedrive",               // OAuth `state` + Atlas result-key stem
 	// ROOT_FOLDER ("root") is defined above. Microsoft needs no extra authorize params, but
-	// DOES require `scope` on the token + refresh calls (shared oauth2.js opts in via the flag).
+	// DOES require `scope` on the token + refresh calls (_cloudcore/node/oauth.js opts in via the flag).
 	AUTHORIZE_EXTRA:  "",
 	TOKEN_SEND_SCOPE: true,
-	// Caller allow-lists enforced by _cloudcore/acl.js.
+	// FILE_APP_IDS: the callers of the file methods (_cloudcore/node/commands.js). AUTH_APP_IDS
+	// is kept for reference: getAuthorizeUrl is open (see commands.js).
 	AUTH_APP_IDS:  ["com.palm.app.cloud-auth"],
 	FILE_APP_IDS:  ["org.webosports.app.documents", "org.webosports.app.documents-*", "com.palm.stark.files.service"]
 };

@@ -1,4 +1,8 @@
 // node --test tests/unit
+// Enyo 0.10 finds a component's kind by its exact name, so "control" is no kind at all
+// ("Failed to find a constructor for kind [control]") and the whole page stays white, as the
+// S3 sign-in did. Every kind is capitalised, or a dotted enyo.* name.
+//
 // Enyo 0.10's enyo.Input takes its HTML input type from the published property inputType
 // (inputTypeChanged sets the inner element's type). A "type" property on it is ignored, which left
 // MEGA's password field showing the password in clear text. Passwords use kind "PasswordInput".
@@ -29,6 +33,19 @@ test("no Enyo Input in the apps sets type (ignored; use inputType or PasswordInp
 		const src = fs.readFileSync(file, "utf8");
 		for (const m of src.matchAll(INPUT_WITH_TYPE)) {
 			bad.push(`${path.relative(ROOT, file)}:${src.slice(0, m.index).split("\n").length}`);
+		}
+	}
+	assert.deepStrictEqual(bad, []);
+});
+
+test("every Enyo kind in the apps is a name Enyo can find", () => {
+	const bad = [];
+	for (const file of sources(ROOT)) {
+		const src = fs.readFileSync(file, "utf8");
+		for (const m of src.matchAll(/\bkind:\s*"([^"]*)"/g)) {
+			if (!/^([A-Z]|enyo\.[A-Z])/.test(m[1])) {
+				bad.push(`${path.relative(ROOT, file)}:${src.slice(0, m.index).split("\n").length} ${m[1]}`);
+			}
 		}
 	}
 	assert.deepStrictEqual(bad, []);

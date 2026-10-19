@@ -1,38 +1,49 @@
 # Dropbox connector
 
-A complete, decoupled Dropbox Synergy connector: OAuth2/PKCE sign-in, file
-browse/upload/download, and a Photos-app cloud source. Verified end-to-end on device.
+OAuth2/PKCE sign-in, file browse/upload/download/manage, and a Photos-app cloud source.
+The reference connector for `_cloudcore/node`: the first one ported off mojoservice onto
+plain node (22) modules, and the one the others copy.
 
 ## Components
 
 | Path | What it is |
 |---|---|
-| `service/com.palm.service.dropbox/` | The node service: OAuth2, Dropbox API v2 client, all HTTPS via the modern curl. Hosts every command below. |
-| `apps/com.palm.app.dropbox-auth/` | customUI OAuth webview the account template launches. Drives the Atlas login and hands the `?code=` back to the service. |
-| `apps/com.palm.app.dropbox-files/` | Enyo 0.10 file-picker/manager consumer app (browse / upload / download). |
-| `account/com.palm.dropbox/` | Synergy account template — base + 7 locale overrides. |
+| `service/com.palm.service.dropbox/` | The node service (see below). |
+| `account/com.palm.dropbox/` | Synergy account template. Sign-in runs in `com.palm.app.cloud-auth` (`cloud/_core/apps/`). |
+| `files/sysbus/` | Its LS2 role, permissions and service file. |
 
-## Service commands (`services.json`)
+The service directory:
+
+| File | What it is |
+|---|---|
+| `package.json` | `main: service.js`. With it, `run-js-service` (jsservicelauncher `bootstrap-node.js`) does `require()` of the directory and calls `run()` instead of loading a mojoservice `sources.json`. |
+| `service.js` | Wires `config.js`, `adapter.js` and `photos.js` into `_cloudcore/node`'s `connector()`. |
+| `config.js` | OAuth app, endpoints, caller allow-lists. A plain file: the build fills `PLACEHOLDER_DROPBOX_CLIENT_ID` in with sed. |
+| `adapter.js` | Dropbox API v2 as async functions on a session (`listFolder`, `downloadFile`, `uploadFile`, ...). |
+| `photos.js` | `listAlbums` / `listPhotos` for the Photos service. |
+
+## Service methods
+
+The generic ones come from `_cloudcore/node/commands.js` (arguments and replies listed at its
+head); `listAlbums`/`listPhotos` from `photos.js`.
 
 | Method | Caller | Purpose |
 |---|---|---|
-| `getAuthorizeUrl` | auth app | Build the PKCE authorize URL; returns `codeVerifier` (stateless — see below). |
-| `exchangeCode` | account validator | Redeem `?code=` → tokens; fetch email as username; return `credentials.common`. |
-| `checkCredentials` | accounts | `onCredentialsChanged` validator. |
-| `listFolder` | files app / photos app | Browse a folder (normalized entries). |
-| `uploadFile` / `downloadFile` | files app | File I/O (curl streams to/from disk, bypasses node maxBuffer). |
-| `listAlbums` / `listPhotos` | **Photos aggregator** | Photo-provider contract — see [`../../photos-integration`](../../photos-integration). |
+| `getAuthorizeUrl` | sign-in app | The PKCE authorize URL; returns `codeVerifier` (stateless, see below). |
+| `exchangeCode` | Accounts (validator) | `?code=` -> tokens; the account email as username; `credentials.common`. |
+| `checkCredentials` | Accounts | `onCredentialsChanged`. |
+| `listFolder`, `downloadFile`, `uploadFile` | Documents, Topaz Explorer | Browse, fetch, store (streamed to and from disk). |
+| `createFolder`, `moveItem`, `deleteItem` | Documents, Topaz Explorer | Manage; never autorename, never the root. |
+| `listAlbums`, `listPhotos`, `upload`, `deletePhoto` | Photos service | One folder (`/Camera Uploads`) as one album. |
+| `quit`, `info` | installer | Quit before an update; what the service is. |
 
-### Access control (`acl.js`)
+### Access control
 
-The stock mojoservice framework does **not** enforce a command's `allowedAppIds` — `acl.js`
-adds it, mirroring `com.palm.service.accounts` (caller = `applicationID() ||
-senderServiceName()`, glob-matched). App-facing methods (`listFolder`, `uploadFile`,
-`downloadFile`) are gated to `com.palm.app.dropbox-files` / `com.palm.app.photos`.
-`listAlbums`/`listPhotos` are intentionally **open** — the Photos aggregator calls provider
-services with *no* bus identity (same as the stock facebook/photobucket providers), so they
-rely on the LS2 private-bus role instead. `Acl.BRINGUP` (default **false**) is a
-testing-only switch that would let anonymous shell callers through.
+The file methods take only the callers in `Config.FILE_APP_IDS` (caller = `applicationID()`
+without its pid, else `senderServiceName()`, glob-matched as `com.palm.service.accounts`
+does). The others are open: Accounts and the Photos service call with no app id, and the
+sign-in app's calls arrive as `com.palm.app.accounts-<pid>`. The LS2 files decide who reaches
+the service at all.
 
 ## How sign-in works (no client secret)
 
@@ -62,29 +73,17 @@ Key correctness points (each was a real bug fixed during bring-up):
 
 `service/com.palm.service.dropbox/config.js`:
 
-- `CLIENT_ID` — Dropbox app key (public; PKCE, no secret). Register a scoped-access app at
-  <https://www.dropbox.com/developers/apps> with `account_info.read files.metadata.read
-  files.content.read files.content.write`, `token_access_type=offline`, and **"Allow public
-  clients" enabled**.
-- `CURL` = `/usr/bin/curl` (the modern system curl from the OpenSSL-11 update; no
-  `CURL_LD_LIBRARY_PATH` needed).
-- `CURL_CAINFO` = `/etc/ssl/certs/ca-certificates.crt` (the current system CA store — a
-  deployment prerequisite; see top-level README).
+- `CLIENT_ID` - Dropbox app key (public; PKCE, no secret), filled in by the build. Register a
+  scoped-access app at <https://www.dropbox.com/developers/apps> with `account_info.read
+  files.metadata.read files.content.read files.content.write`, `token_access_type=offline`, and
+  **"Allow public clients" enabled**.
+- HTTPS is node's own `fetch` with node's CA store. `CURL`/`CURL_CAINFO` are no longer used by
+  the service; the on-device harness still reads them for its reachability check.
 
 ## Deploy (device)
 
-```sh
-# service + apps + template (rootfs may be read-only after reboot)
-mount -o remount,rw /
-#  service -> /usr/palm/services/com.palm.service.dropbox/
-#  auth app -> /media/cryptofs/apps/usr/palm/applications/com.palm.app.dropbox-auth/
-#  files app-> /media/cryptofs/apps/usr/palm/applications/com.palm.app.dropbox-files/
-#  template -> /usr/palm/public/accounts/com.palm.dropbox/  (base + resources/*)
-```
-
-After any **template content** change, restart the accounts service (kill the
-`ice.accounts.js` pid — it caches templates at startup) **then** LunaSysMgr. After an
-**auth-app JS** change, restart LunaSysMgr (the accounts webview caches the app source).
-Service `.js` reloads per-call.
-
-> All `.js`/`.json` here pass `node --check` / JSON parse.
+The `synergy-cloud-dropbox` recipe (meta-luneos) installs the service directory as
+`/usr/palm/services/com.palm.service.dropbox/`, next to `/usr/palm/services/_cloudcore/`
+from `synergy-cloudcore`, which `service.js` requires as `../_cloudcore/node`.
+After a template change, restart the Accounts service (it reads templates at startup).
+The service itself exits after 30 s idle and is started again by the next call.

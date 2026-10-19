@@ -1,456 +1,228 @@
-/*global IMPORTS, Config, OAuth2, HttpCurl, console */
-/* adapter.js - Koofr provider ADAPTER for _cloudcore. Koofr is MOUNT + PATH based: files live
- * under a mount (the user's primary personal storage), addressed by (mountId, absolute path). The
- * primary mount id is resolved lazily (GET /mounts) and cached in the credentials; a locator is
- * the absolute path within that mount (the ROOT_FOLDER sentinel "/" is the mount root). Auth is
- * OAuth2 Bearer with transparent refresh-on-401 (access tokens expire; the refresh token renews
- * them). All HTTPS runs through the modern curl. The content host is the same host with a
- * "/content/api/v2" path prefix.
+/* adapter.js - Koofr REST v2 for _cloudcore/node (commands.js there has the interface).
  *
- * Credentials (creds): { accessToken, refreshToken, expiresAt, mountId? }.
+ * Koofr is MOUNT + PATH based: files live under a mount (the user's primary personal storage),
+ * addressed by (mountId, absolute path). The primary mount id is resolved with GET /mounts the
+ * first time a session needs it and kept on the session's credentials (creds.mountId), so it
+ * is also on the credentials a token refresh renews and saves. A locator is the absolute path
+ * within that mount; the root is "/" ("", "root" mean it too). Metadata calls go to API_BASE,
+ * file bytes to CONTENT_BASE (same host, "/content/api/v2"); every call carries
+ * "X-Koofr-Version" and the Bearer token.
  *
- * Exposes the uniform _cloudcore adapter interface (normalised shapes) plus the PHOTO.UPLOAD
- * helpers. getTemporaryLink hands back Koofr's files/download URL for the Photos aggregator.
+ * Every call runs through the session (s.authorized), which refreshes the token once on a 401
+ * and retries. Every failure rejects: a reply outside 2xx is KOOFR_API_ERROR with its status
+ * (KOOFR_DOWNLOAD_FAILED, KOOFR_MKDIR_FAILED, KOOFR_DELETE_FAILED for a download, the album
+ * folder and a photo's delete, as before).
+ *
+ * Credentials: { accessToken, refreshToken, expiresAt, mountId? }.
  */
-var Foundations = IMPORTS.foundations;
-var Future = Foundations.Control.Future;
+"use strict";
 
-var Adapter = {
-	_hdr: function (c) {
-		return { "Authorization": "Bearer " + c.accessToken,
-			"X-Koofr-Version": Config.KOOFR_VERSION || "2.1" };
-	},
-	_enc: function (p) { return encodeURIComponent(p); },
-	_norm: function (p) {
-		if (!p || p === "root" || p === "" || p === Config.ROOT_FOLDER) { return "/"; }
-		return (p.charAt(0) === "/") ? p : ("/" + p);
-	},
-	_join: function (folder, name) {
-		var base = (folder === "/") ? "" : String(folder).replace(/\/+$/, "");
-		return base + "/" + name;
-	},
-	_leaf: function (p) { var s = String(p).replace(/\/+$/, ""); var i = s.lastIndexOf("/"); return i >= 0 ? s.substring(i + 1) : s; },
-	_dirOf: function (p) { var s = String(p).replace(/\/+$/, ""); var i = s.lastIndexOf("/"); return i > 0 ? s.substring(0, i) : "/"; },
-	_mime: function (name, isFolder, contentType) {
-		if (contentType) { return contentType; }
-		if (isFolder) { return "application/x-directory"; }
-		var m = /\.([a-z0-9]+)$/i.exec(name || ""); var ext = m ? m[1].toLowerCase() : "";
-		var map = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif",
-			bmp: "image/bmp", heic: "image/heic", webp: "image/webp", pdf: "application/pdf" };
-		return map[ext] || null;
-	},
+const ERROR = "KOOFR_API_ERROR";
 
-	// Bearer HttpCurl call with transparent refresh-on-401. opts: { method, url, headers, outFile,
-	// dataFile, multipart, body }. Resolves to { status, responseText }.
-	_req: function (creds, opts, onRenewed) {
-		var self = this, f = new Future();
-		function fire(c) {
-			var o = { method: opts.method || "GET", url: opts.url, headers: self._hdr(c) };
-			if (opts.headers) { Object.keys(opts.headers).forEach(function (k) { o.headers[k] = opts.headers[k]; }); }
-			if (opts.outFile) { o.outFile = opts.outFile; o.follow = true; }
-			if (opts.dataFile) { o.dataFile = opts.dataFile; }
-			if (opts.multipart) { o.multipart = opts.multipart; }
-			if (opts.body != null) { o.body = opts.body; }
-			return HttpCurl.request(o);
-		}
-		var call = fire(creds);
-		f.now(this, function () { return call; });
-		f.then(this, function () {
-			var r = call.result;
-			if (r && r.status === 401 && creds.refreshToken) {
-				var rf = OAuth2.refresh(creds.refreshToken);
-				rf.then(self, function () {
-					// A refresh that failed, or anything thrown here, fails f: thrown inside rf's or retry's
-					// callback it would stay on that Future, and the request would never answer.
-					try {
-						var t = null, tErr = null;
-						try { t = rf.result; } catch (e) { tErr = e; }
-						if (tErr) { f.setException(tErr); return; }
-						var nc = { accessToken: t.accessToken,
-							refreshToken: t.refreshToken || creds.refreshToken,
-							expiresAt: Date.now() + (t.expiresIn * 1000),
-							mountId: creds.mountId };
-						if (onRenewed) { onRenewed(nc); }
-						var retry = fire(nc);
-						retry.then(self, function () {
-							try { f.result = retry.result; }
-							catch (e2) { f.setException(e2); }
-						});
-					} catch (e) { f.setException(e); }
-				});
-				return;
-			}
-			f.result = r;
-		});
-		return f;
-	},
-	_parse: function (r) {
-		this._ok(r);
-		return r.responseText ? JSON.parse(r.responseText) : {};
-	},
-	// Throw unless the reply is a 2xx; for calls whose body is not needed.
-	_ok: function (r) {
-		if (!r || r.status < 200 || r.status >= 300) {
-			throw { returnValue: false, errorCode: "KOOFR_API_ERROR", status: r && r.status, body: r && r.responseText };
-		}
-	},
+const MIME = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif",
+	bmp: "image/bmp", heic: "image/heic", webp: "image/webp", pdf: "application/pdf" };
 
-	// GET /mounts -> the primary personal mount id (isPrimary==true), else the first mount.
-	resolveMount: function (creds, cb) {
-		var self = this, f = new Future();
-		var call = this._req(creds, { method: "GET", url: Config.API_BASE + "/mounts" }, cb);
-		call.then(this, function () {
-			try {
-				var d = self._parse(call.result) || {}; var mounts = d.mounts || [];
-				var primary = null;
-				for (var i = 0; i < mounts.length; i++) { if (mounts[i].isPrimary) { primary = mounts[i]; break; } }
-				if (!primary && mounts.length) { primary = mounts[0]; }
-				if (!primary) { throw { returnValue: false, errorCode: "KOOFR_NO_MOUNT" }; }
-				f.result = primary.id;
-			} catch (e) { f.setException(e); }
-		});
-		return f;
-	},
-	// mountId from creds, or resolve it (and remember on creds for the rest of this call chain).
-	_mount: function (creds, cb) {
-		var self = this, f = new Future();
-		if (creds.mountId) { f.result = creds.mountId; return f; }
-		var rm = this.resolveMount(creds, cb);
-		f.now(this, function () { return rm; });
-		f.then(this, function () { try { creds.mountId = rm.result; f.result = creds.mountId; } catch (e) { f.setException(e); } });
-		return f;
-	},
+// A locator as an absolute path ("/" for the mount root).
+function norm(p) {
+	if (p === undefined || p === null || p === "" || p === "root" || p === "/") { return "/"; }
+	p = String(p);
+	return (p.charAt(0) === "/") ? p : ("/" + p);
+}
 
-	// GET /user -> identity (validates the token).
-	getAccountInfo: function (creds, cb) {
-		var self = this, f = new Future();
-		var call = this._req(creds, { method: "GET", url: Config.API_BASE + "/user" }, cb);
-		call.then(this, function () {
-			try {
-				var u = self._parse(call.result) || {};
-				var name = ((u.firstName || "") + " " + (u.lastName || "")).replace(/^\s+|\s+$/g, "");
-				f.result = { user: { emailAddress: u.email, displayName: name || u.email } };
-			} catch (e) { f.setException(e); }
-		});
-		return f;
-	},
+// norm without a trailing slash ("/" for the mount root, "//" included).
+function bare(p) { return norm(String(p === undefined || p === null ? "" : p).replace(/\/+$/, "")); }
 
-	// GET /mounts/{mid}/files/list?path=.. -> normalised entries (Koofr returns basenames, so the
-	// full path is composed from the folder path + name).
-	listFolder: function (creds, folderId, cb) {
-		var self = this, f = new Future();
-		var folderPath = this._norm(folderId);
-		var mf = this._mount(creds, cb);
-		f.now(this, function () { return mf; });
-		f.then(this, function () {
-			var mid;
-			try { mid = mf.result; } catch (e0) { f.setException(e0); return; }
-			var url = Config.API_BASE + "/mounts/" + mid + "/files/list?path=" + self._enc(folderPath);
-			var call = self._req(creds, { method: "GET", url: url }, cb);
-			call.then(self, function () {
-				try {
-					var d = self._parse(call.result) || {}; var files = d.files || [];
-					f.result = { entries: files.map(function (o) { return self._entry(folderPath, o); }) };
-				} catch (e) { f.setException(e); }
-			});
-		});
-		return f;
-	},
+function join(folder, name) {
+	const base = (folder === "/") ? "" : String(folder).replace(/\/+$/, "");
+	return base + "/" + name;
+}
 
-	// One listFolder entry from a Koofr file object (files/list item or files/info reply) that
-	// lives in folderPath.
-	_entry: function (folderPath, o) {
-		var isFolder = (o.type === "dir");
-		var full = this._join(folderPath, o.name);
-		return { id: full, type: (isFolder ? "folder" : "file"), name: o.name,
-			size: o.size || 0, modified: o.modified || 0, path: full,
-			mimeType: this._mime(o.name, isFolder, o.contentType) };
-	},
+function leaf(p) { const s = String(p).replace(/\/+$/, ""); const i = s.lastIndexOf("/"); return i >= 0 ? s.substring(i + 1) : s; }
+function dirOf(p) { const s = String(p).replace(/\/+$/, ""); const i = s.lastIndexOf("/"); return i > 0 ? s.substring(0, i) : "/"; }
 
-	// GET content/mounts/{mid}/files/get?path=.. -> bytes to disk.
-	downloadFile: function (creds, fileId, localDest, exportMime, cb) {
-		var self = this, f = new Future();
-		var mf = this._mount(creds, cb);
-		f.now(this, function () { return mf; });
-		f.then(this, function () {
-			var mid;
-			try { mid = mf.result; } catch (e0) { f.setException(e0); return; }
-			var url = Config.CONTENT_BASE + "/mounts/" + mid + "/files/get?path=" + self._enc(self._norm(fileId));
-			var call = self._req(creds, { method: "GET", url: url, outFile: localDest }, cb);
-			call.then(self, function () {
-				try {
-					var r = call.result;
-					if (!r || r.status < 200 || r.status >= 300) {
-						throw { returnValue: false, errorCode: "KOOFR_DOWNLOAD_FAILED", status: r && r.status };
-					}
-					f.result = { path: localDest };
-				} catch (e) { f.setException(e); }
-			});
-		});
-		return f;
-	},
+function mimeOf(name, isFolder, contentType) {
+	if (contentType) { return contentType; }
+	if (isFolder) { return "application/x-directory"; }
+	const m = /\.([a-z0-9]+)$/i.exec(name || "");
+	return MIME[m ? m[1].toLowerCase() : ""] || null;
+}
 
-	// POST content/mounts/{mid}/files/put?path=<folder>&filename=<name> (multipart "file").
-	uploadFile: function (creds, folderId, localPath, name, mimeType, cb) {
-		return this._put(creds, this._norm(folderId), name, localPath, cb);
-	},
-	uploadReplace: function (creds, fileId, localPath, mimeType, cb) {
-		return this._put(creds, this._dirOf(this._norm(fileId)), this._leaf(fileId), localPath, cb);
-	},
-	_put: function (creds, folderPath, name, localPath, cb) {
-		var self = this, f = new Future();
-		var mf = this._mount(creds, cb);
-		f.now(this, function () { return mf; });
-		f.then(this, function () {
-			var mid;
-			try { mid = mf.result; } catch (e0) { f.setException(e0); return; }
-			var url = Config.CONTENT_BASE + "/mounts/" + mid + "/files/put?path=" + self._enc(folderPath) +
-				"&filename=" + self._enc(name) + "&info=true&overwrite=true";
-			var call = self._req(creds, { method: "POST", url: url,
-				multipart: [{ name: "file", file: localPath, filename: name }] }, cb);
-			call.then(self, function () {
-				try {
-					var meta = self._parse(call.result) || {};
-					var full = self._join(folderPath, meta.name || name);
-					f.result = { id: full, path: full, name: meta.name || name, size: meta.size };
-				} catch (e) { f.setException(e); }
-			});
-		});
-		return f;
-	},
+// One listFolder entry from a Koofr file object (files/list item or files/info reply) that lives
+// in folderPath. Koofr gives basenames; the full path is the entry's id and path.
+function entry(folderPath, o) {
+	const isFolder = (o.type === "dir");
+	const full = join(folderPath, o.name);
+	return { id: full, type: isFolder ? "folder" : "file", name: o.name,
+		size: o.size || 0, modified: o.modified || 0, path: full, mimeType: mimeOf(o.name, isFolder, o.contentType) };
+}
 
-	// --- PHOTO.UPLOAD helpers ------------------------------------------------------------
-	// Is a listFolder entry an image file? (entries carry a computed mimeType.)
-	_isImg: function (e) {
-		if (!e || e.type !== "file") { return false; }
-		var m = e.mimeType || this._mime(e.name, false, null);
-		return !!(m && m.indexOf("image/") === 0);
-	},
-	// Enumerate BROWSABLE photo albums: the mount root's direct images plus every immediate
-	// sub-folder that holds at least one image (one level deep). aid = the absolute path.
-	// This replaces the old "only Camera Uploads" view (which 404'd when that folder didn't
-	// exist and broke the whole account sync) so the user's real folders - e.g. Koofr's default
-	// "My pictures" - actually show up in Photos & Videos.
-	photoAlbums: function (creds, cb) {
-		var self = this, f = new Future();
-		var lf = self.listFolder(creds, Config.ROOT_FOLDER, cb);
-		f.now(this, function () { return lf; });
-		f.then(this, function () {
-			var entries;
-			try { entries = (lf.result && lf.result.entries) || []; } catch (e) { entries = []; }
-			var albums = [], rootImgs = 0, folders = [];
-			entries.forEach(function (e) {
-				if (self._isImg(e)) { rootImgs++; }
-				else if (e.type === "folder") { folders.push(e); }
-			});
-			if (rootImgs) { albums.push({ aid: "/", name: "Koofr", images: rootImgs }); }
-			var i = 0;
-			function nextFolder() {
-				if (i >= folders.length) { f.result = { albums: albums }; return; }
-				var fld = folders[i++];
-				var sf = self.listFolder(creds, fld.id, cb);
-				// In a try: sf is not f, so a throw in its callback would stay on sf.
-				sf.then(self, function () {
-					try {
-						var se;
-						try { se = (sf.result && sf.result.entries) || []; } catch (e3) { se = []; }
-						var c = 0;
-						se.forEach(function (x) { if (self._isImg(x)) { c++; } });
-						if (c) { albums.push({ aid: fld.id, name: fld.name, images: c }); }
-						nextFolder();
-					} catch (e4) { f.setException(e4); }
-				});
-			}
-			nextFolder();
-		});
-		return f;
-	},
+// The errorText of a Koofr error reply: its error message where it has one.
+function describe(status, body) {
+	let why = "";
+	try {
+		const j = JSON.parse(body);
+		const e = (j && j.error) || j;
+		why = (e && typeof e.message === "string") ? e.message : ((e && typeof e.code === "string") ? e.code : "");
+	} catch (x) { why = String(body || "").replace(/\s+/g, " ").trim().slice(0, 200); }
+	return "Koofr answered HTTP " + status + (why ? ": " + why : "");
+}
 
-	resolvePhotoAlbum: function (creds, cb) {
-		var self = this, f = new Future();
-		var name = Config.PHOTO_ALBUM_NAME || "Camera Uploads";
-		var path = "/" + name;
-		var mf = this._mount(creds, cb);
-		f.now(this, function () { return mf; });
-		f.then(this, function () {
-			var mid;
-			try { mid = mf.result; } catch (e) { f.result = { path: path, name: name, exists: false }; return; }
-			var url = Config.API_BASE + "/mounts/" + mid + "/files/info?path=" + self._enc(path);
-			var probe = self._req(creds, { method: "GET", url: url }, cb);
-			probe.then(self, function () {
-				var ok = false;
-				try { var r = probe.result; ok = !!(r && r.status >= 200 && r.status < 300); } catch (e2) { ok = false; }
-				f.result = { path: path, name: name, exists: ok };
-			});
-		});
-		return f;
-	},
-	// POST /mounts/{mid}/files/folder?path=<parent> body {"name":..}.
-	ensureAlbumFolder: function (creds, name, cb) {
-		var self = this, f = new Future();
-		var leaf = String(name).replace(/^\/+|\/+$/g, "");
-		var mf = this._mount(creds, cb);
-		f.now(this, function () { return mf; });
-		f.then(this, function () {
-			var mid;
-			try { mid = mf.result; } catch (e0) { f.setException(e0); return; }
-			var url = Config.API_BASE + "/mounts/" + mid + "/files/folder?path=" + self._enc("/");
-			var call = self._req(creds, { method: "POST", url: url,
-				headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: leaf }) }, cb);
-			call.then(self, function () {
-				// A request that got no answer throws here; caught, or it would stay on call.
-				var r;
-				try { r = call.result; } catch (e) { f.setException(e); return; }
-				if (r && (r.status === 409 || (r.status >= 200 && r.status < 300))) { f.result = "/" + leaf; }
-				else { f.setException({ returnValue: false, errorCode: "KOOFR_MKDIR_FAILED", status: r && r.status }); }
-			});
-		});
-		return f;
-	},
-	// GET /mounts/{mid}/files/download?path=.. -> { link } (a ready-to-GET URL for the aggregator).
-	getTemporaryLink: function (creds, fileId, cb) {
-		var self = this, f = new Future();
-		var mf = this._mount(creds, cb);
-		f.now(this, function () { return mf; });
-		f.then(this, function () {
-			var mid;
-			try { mid = mf.result; } catch (e0) { f.setException(e0); return; }
-			var url = Config.API_BASE + "/mounts/" + mid + "/files/download?path=" + self._enc(self._norm(fileId));
-			var call = self._req(creds, { method: "GET", url: url }, cb);
-			call.then(self, function () {
-				try { var d = self._parse(call.result) || {}; f.result = { link: d.link, method: "GET" }; }
-				catch (e) { f.setException(e); }
-			});
-		});
-		return f;
-	},
-	// DELETE /mounts/{mid}/files/remove?path=..
-	deletePhoto: function (creds, fileId, cb) {
-		var self = this, f = new Future();
-		var mf = this._mount(creds, cb);
-		f.now(this, function () { return mf; });
-		f.then(this, function () {
-			var mid;
-			try { mid = mf.result; } catch (e0) { f.setException(e0); return; }
-			var url = Config.API_BASE + "/mounts/" + mid + "/files/remove?path=" + self._enc(self._norm(fileId));
-			var call = self._req(creds, { method: "DELETE", url: url }, cb);
-			call.then(self, function () {
-				var r;
-				try { r = call.result; } catch (e) { f.setException(e); return; }
-				if (r && (r.status === 200 || r.status === 204 || (r.status >= 200 && r.status < 300))) { f.result = { deleted: true }; }
-				else { f.setException({ returnValue: false, errorCode: "KOOFR_DELETE_FAILED", status: r && r.status }); }
-			});
-		});
-		return f;
-	},
+function createAdapter({ config, http, errors }) {
+	const { CloudError } = errors;
+	const enc = encodeURIComponent;
+	const headers = (extra) => Object.assign({ "X-Koofr-Version": config.KOOFR_VERSION || "2.1" }, extra || {});
 
-	// --- File manager: createFolder / moveItem / deleteItem (commands/fileOps_commands.js) ----
-	// Locators are listFolder's: absolute paths within the primary mount. Every step of a chain
-	// reuses renewed credentials, so a refresh in one step is not repeated (with a refresh token
-	// that has already been used) by the next.
-	_session: function (creds, cb) {
-		var s = { creds: creds };
-		s.cb = function (nc) { s.creds = nc; if (cb) { cb(nc); } };
-		return s;
-	},
-	// The mount id, kept on the session's current credentials (a refresh while the mount was
-	// being resolved would otherwise leave the renewed ones without it).
-	_sessionMount: function (s) {
-		return this._after(this._mount(s.creds, s.cb), function (mid) { s.creds.mountId = mid; return mid; });
-	},
-	// A Future settled by fn(result of g): fn's return value, a Future it returns (nested), or
-	// what it (or reading g's result) throws.
-	_after: function (g, fn) {
-		var self = this, f = new Future();
-		g.then(this, function () {
-			var v;
-			try { v = fn.call(self, g.result); } catch (e) { f.setException(e); return; }
-			if (v && typeof v.then === "function") { f.nest(v); } else { f.result = v; }
-		});
-		return f;
-	},
-	_fail: function (code, text) {
-		var f = new Future();
-		f.setException({ returnValue: false, errorCode: code, errorText: text });
-		return f;
-	},
-	// A locator as an absolute path without a trailing slash ("/" for the mount root).
-	_bare: function (p) { return this._norm(String(p == null ? "" : p).replace(/\/+$/, "")); },
-	// {API_BASE}/mounts/{mid}/files/{op}?path=<p>
-	_filesUrl: function (mid, op, p) {
-		return Config.API_BASE + "/mounts/" + mid + "/files/" + op + "?path=" + this._enc(p);
-	},
-	_json: function (s, method, url, obj) {
-		return this._req(s.creds, { method: method, url: url,
-			headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj) }, s.cb);
-	},
-	// GET files/info?path=p -> { entry } in listFolder's shape.
-	_infoEntry: function (s, mid, p) {
-		return this._after(this._req(s.creds, { method: "GET", url: this._filesUrl(mid, "info", p) }, s.cb),
-			function (r) {
-				var o = this._parse(r) || {};
-				if (!o.name) { o.name = this._leaf(p); }
-				return { entry: this._entry(this._dirOf(p), o) };
-			});
-	},
+	// One request with the session's token: http.request's reply ({ status, text } or, with
+	// toFile, { path }).
+	const send = (s, opts) => s.authorized((token) => http.request(Object.assign({}, opts,
+		{ bearer: token, headers: headers(opts.headers) })));
 
-	// POST files/folder?path=<parent> {"name"} (an existing name fails, 409), then files/info.
-	createFolder: function (creds, parent, name, cb) {
-		var s = this._session(creds, cb), parentPath = this._norm(parent);
-		return this._after(this._sessionMount(s), function (mid) {
-			return this._after(this._json(s, "POST", this._filesUrl(mid, "folder", parentPath), { name: name }),
-				function (r) {
-					this._ok(r);
-					return this._infoEntry(s, mid, this._join(parentPath, name));
-				});
-		});
-	},
-
-	// Rename in place: PUT files/rename?path=<item> {"name"}. Anything else: PUT files/move?path=
-	// <item> {"toMountId", "toPath"} with toPath the item's full new path, which moves and
-	// renames in one call. Koofr does not document what a move onto an existing name does, so
-	// an existing destination is refused here first (KOOFR_EXISTS) rather than overwritten or
-	// auto-renamed; a change of case only is let through when the probe finds the item itself.
-	moveItem: function (creds, item, toFolder, name, cb) {
-		var s = this._session(creds, cb), src = this._bare(item);
-		if (src === "/") { return this._fail("BAD_ARGS", "the root folder cannot be moved"); }
-		var destDir = (toFolder == null) ? this._dirOf(src) : this._bare(toFolder);
-		var dest = this._join(destDir, (name == null) ? this._leaf(src) : name);
-		if (destDir === src || destDir.indexOf(src + "/") === 0) {
-			return this._fail("BAD_ARGS", "a folder cannot be moved into itself");
-		}
-		return this._after(this._sessionMount(s), function (mid) {
-			if (dest === src) { return this._infoEntry(s, mid, src); }
-			var probe = this._req(s.creds, { method: "GET", url: this._filesUrl(mid, "info", dest) }, s.cb);
-			return this._after(probe, function (pr) {
-				if (!pr || pr.status !== 404) {
-					var there = this._parse(pr) || {};
-					// A change of case only: the probe may have found the item itself.
-					if (dest.toLowerCase() !== src.toLowerCase() || there.name === this._leaf(dest)) {
-						throw { returnValue: false, errorCode: "KOOFR_EXISTS", status: 409,
-							errorText: "an item with that name already exists there" };
-					}
-				}
-				var call = (destDir === this._dirOf(src)) ?
-					this._json(s, "PUT", this._filesUrl(mid, "rename", src), { name: this._leaf(dest) }) :
-					this._json(s, "PUT", this._filesUrl(mid, "move", src), { toMountId: mid, toPath: dest });
-				return this._after(call, function (r) {
-					this._ok(r);
-					return this._infoEntry(s, mid, dest);
-				});
-			});
-		});
-	},
-
-	// DELETE files/remove?path=<item> (a folder goes with its contents).
-	deleteItem: function (creds, item, cb) {
-		var s = this._session(creds, cb), src = this._bare(item);
-		if (src === "/") { return this._fail("BAD_ARGS", "the root folder cannot be deleted"); }
-		return this._after(this._sessionMount(s), function (mid) {
-			return this._after(this._req(s.creds, { method: "DELETE", url: this._filesUrl(mid, "remove", src) }, s.cb),
-				function (r) { this._ok(r); return {}; });
-		});
+	// The reply as JSON ({} when empty); a reply that is not JSON is the call's errorCode.
+	function parse(r, errorCode) {
+		if (!r.text) { return {}; }
+		try { return JSON.parse(r.text); }
+		catch (e) { throw new CloudError(errorCode || ERROR, "Koofr: the reply is not JSON", { status: r.status }); }
 	}
-};
+	const getJson = async (s, url) => parse(await send(s, { method: "GET", url }));
+	const sendJson = async (s, method, url, obj) => parse(await send(s, { method, url,
+		headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj) }));
 
-if (typeof exports !== "undefined") { exports.Adapter = Adapter; }
+	const filesUrl = (mid, op, p) => config.API_BASE + "/mounts/" + mid + "/files/" + op + "?path=" + enc(p);
+
+	// The primary mount's id (isPrimary, else the first mount), kept on the session's current
+	// credentials: those are the renewed ones when a refresh happened, so a renewed token is saved
+	// with its mount.
+	async function mount(s) {
+		if (s.creds.mountId) { return s.creds.mountId; }
+		const d = await getJson(s, config.API_BASE + "/mounts");
+		const mounts = (d && Array.isArray(d.mounts)) ? d.mounts : [];
+		const primary = mounts.find((m) => m && m.isPrimary) || mounts[0];
+		if (!primary || !primary.id) { throw new CloudError("KOOFR_NO_MOUNT", "Koofr: the account has no mount"); }
+		s.creds.mountId = primary.id;
+		return primary.id;
+	}
+
+	// GET files/info?path=p -> { entry } in listFolder's shape.
+	async function infoEntry(s, mid, p) {
+		const o = (await getJson(s, filesUrl(mid, "info", p))) || {};
+		if (!o.name) { o.name = leaf(p); }
+		return { entry: entry(dirOf(p), o) };
+	}
+
+	// POST content files/put?path=<folder>&filename=<name>&info=true&overwrite=true, the file as
+	// the multipart part "file", named as the file is to be.
+	async function put(s, folderPath, name, localPath) {
+		const mid = await mount(s);
+		const url = config.CONTENT_BASE + "/mounts/" + mid + "/files/put?path=" + enc(folderPath) +
+			"&filename=" + enc(name) + "&info=true&overwrite=true";
+		const meta = parse(await send(s, { method: "POST", url,
+			multipart: [{ name: "file", file: localPath, filename: name }] })) || {};
+		const full = join(folderPath, meta.name || name);
+		return { id: full, path: full, name: meta.name || name, size: meta.size };
+	}
+
+	const adapter = {
+		// GET /user -> { user:{ emailAddress, displayName } }.
+		async getAccountInfo(s) {
+			const u = (await getJson(s, config.API_BASE + "/user")) || {};
+			const name = ((u.firstName || "") + " " + (u.lastName || "")).trim();
+			return { user: { emailAddress: u.email, displayName: name || u.email } };
+		},
+
+		resolveMount: mount,
+
+		// GET /mounts/{mid}/files/list?path=..
+		async listFolder(s, folderId) {
+			const folderPath = norm(folderId);
+			const mid = await mount(s);
+			const d = (await getJson(s, filesUrl(mid, "list", folderPath))) || {};
+			return { entries: (Array.isArray(d.files) ? d.files : []).map((o) => entry(folderPath, o)) };
+		},
+
+		// GET content/mounts/{mid}/files/get?path=.. -> the bytes to localDest.
+		async downloadFile(s, fileId, localDest) {
+			const mid = await mount(s);
+			await send(s, { method: "GET", url: config.CONTENT_BASE + "/mounts/" + mid + "/files/get?path=" + enc(norm(fileId)),
+				toFile: localDest, errorCode: "KOOFR_DOWNLOAD_FAILED" });
+			return { path: localDest };
+		},
+
+		uploadFile(s, folderId, localPath, name) { return put(s, norm(folderId), name, localPath); },
+
+		// Overwrite the file at fileId (a save-back): the same put, into its folder under its name.
+		uploadReplace(s, fileId, localPath) { return put(s, dirOf(norm(fileId)), leaf(fileId), localPath); },
+
+		// POST /mounts/{mid}/files/folder?path=/ {"name"}: the album folder at the mount root,
+		// made if missing (an existing one answers 409, which is fine). -> its path.
+		async ensureAlbumFolder(s, name) {
+			const l = String(name).replace(/^\/+|\/+$/g, "");
+			const mid = await mount(s);
+			await send(s, { method: "POST", url: filesUrl(mid, "folder", "/"), headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ name: l }), accept: [409], errorCode: "KOOFR_MKDIR_FAILED" });
+			return "/" + l;
+		},
+
+		// GET /mounts/{mid}/files/download?path=.. -> { link } (a ready-to-GET URL for Photos).
+		async getTemporaryLink(s, fileId) {
+			const mid = await mount(s);
+			const d = (await getJson(s, filesUrl(mid, "download", norm(fileId)))) || {};
+			return { link: d.link, method: "GET" };
+		},
+
+		// DELETE /mounts/{mid}/files/remove?path=..
+		async deletePhoto(s, fileId) {
+			const mid = await mount(s);
+			await send(s, { method: "DELETE", url: filesUrl(mid, "remove", norm(fileId)), errorCode: "KOOFR_DELETE_FAILED" });
+			return { deleted: true };
+		},
+
+		// POST files/folder?path=<parent> {"name"} (an existing name fails, 409), then files/info.
+		async createFolder(s, parent, name) {
+			const parentPath = norm(parent);
+			const mid = await mount(s);
+			await sendJson(s, "POST", filesUrl(mid, "folder", parentPath), { name });
+			return infoEntry(s, mid, join(parentPath, name));
+		},
+
+		// Rename in place: PUT files/rename?path=<item> {"name"}. Anything else: PUT files/move?path=
+		// <item> {"toMountId", "toPath"} with toPath the item's full new path, which moves and
+		// renames in one call. Koofr does not document what a move onto an existing name does, so
+		// an existing destination is refused here first (KOOFR_EXISTS) rather than overwritten or
+		// auto-renamed; a change of case only is let through when the probe finds the item itself.
+		async moveItem(s, item, toFolder, name) {
+			const src = bare(item);
+			if (src === "/") { throw errors.badArgs("the root folder cannot be moved"); }
+			const destDir = (toFolder === null || toFolder === undefined) ? dirOf(src) : bare(toFolder);
+			const dest = join(destDir, (name === null || name === undefined) ? leaf(src) : name);
+			if (destDir === src || destDir.indexOf(src + "/") === 0) { throw errors.badArgs("a folder cannot be moved into itself"); }
+			const mid = await mount(s);
+			if (dest === src) { return infoEntry(s, mid, src); }
+			const probe = await send(s, { method: "GET", url: filesUrl(mid, "info", dest), accept: [404] });
+			if (probe.status !== 404) {
+				const there = parse(probe) || {};
+				// A change of case only: the probe may have found the item itself.
+				if (dest.toLowerCase() !== src.toLowerCase() || there.name === leaf(dest)) {
+					throw new CloudError("KOOFR_EXISTS", "an item with that name already exists there", { status: 409 });
+				}
+			}
+			if (destDir === dirOf(src)) {
+				await sendJson(s, "PUT", filesUrl(mid, "rename", src), { name: leaf(dest) });
+			} else {
+				await sendJson(s, "PUT", filesUrl(mid, "move", src), { toMountId: mid, toPath: dest });
+			}
+			return infoEntry(s, mid, dest);
+		},
+
+		// DELETE files/remove?path=<item> (a folder goes with its contents).
+		async deleteItem(s, item) {
+			const src = bare(item);
+			if (src === "/") { throw errors.badArgs("the root folder cannot be deleted"); }
+			const mid = await mount(s);
+			await send(s, { method: "DELETE", url: filesUrl(mid, "remove", src) });
+			return {};
+		},
+	};
+	return adapter;
+}
+
+module.exports = Object.assign(createAdapter, { ERROR, describe, norm, bare, join, leaf, dirOf, entry, mimeOf });

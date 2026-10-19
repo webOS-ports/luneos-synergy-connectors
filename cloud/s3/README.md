@@ -15,40 +15,41 @@ keys — like the Mega connector, not the OAuth ones.
 
 ## How it works
 
-- **`s3sig.js`** — AWS **Signature Version 4** request signing (HMAC-SHA256 chain + SHA-256 payload
-  hash), two forms: the `Authorization`-header form for list/get/put/delete, and the query-string
-  (`X-Amz-Signature`) **presigned-URL** form for handing the Photos aggregator a self-authenticating
-  GET URL. All hashing uses **native node `crypto`** (SHA-256/HMAC-SHA256 exist on the device's
-  OpenSSL-0.9.8k node, same as the OAuth connectors' PKCE S256 challenge), so signing is fast and
-  dependency-free.
-- **`s3xml.js`** — a tiny reader for the two S3 XML shapes we need (`ListObjectsV2` results +
-  `<Error>`); S3's XML is flat, so no general parser is required.
-- **`adapter.js`** — the uniform `_cloudcore` adapter. Folders are emulated with key **prefixes**
-  and the `/` **delimiter**; `ListObjectsV2` pages until `IsTruncated=false`. Download is a signed
-  `GET`, upload a signed `PUT` (`UNSIGNED-PAYLOAD` so the file streams without a full hash), delete
-  a signed `DELETE`. Path-style addressing (`endpoint/bucket/key`) is the default (needed for most
-  non-AWS endpoints); virtual-host style is available via the `pathStyle` flag.
-- **`com.palm.app.s3-auth`** — a customUI form (endpoint / region / bucket / access key / secret /
-  path-style toggle) that calls `login`, which validates the keys with a signed `ListObjectsV2`
-  before the account is stored.
+The service runs on `_cloudcore/node` (node 22, palmbus directly, fetch), as Dropbox does:
+`package.json` (main `service.js`), so `run-js-service` loads it as a node module.
 
-The **session/access model reuses all the generic `_cloudcore` commands**: the access key id is
-stored as `credentials.common.accessToken` (with the secret + endpoint/region/bucket alongside), so
-`AccountCreds` and the generic `checkCredentials`/`listFolder`/`upload`/`download`/photo commands
-work unchanged. QuickOffice needs nothing S3-specific — the reroute is account-derived.
+- **`s3sig.js`** — AWS **Signature Version 4** with node's `crypto`, two forms: the
+  `Authorization`-header form for every request, and the query-string (`X-Amz-Signature`)
+  **presigned-URL** form for the links handed to the Photos service. Every header the service
+  passes is signed, and the host is signed as fetch sends it (a non-default port kept).
+- **`adapter.js`** — the `_cloudcore/node` adapter. Folders are key **prefixes** with the `/`
+  **delimiter**; `ListObjectsV2` pages until `IsTruncated=false`. Download is a signed `GET`
+  streamed to the file, upload a signed `PUT` streamed from it (`UNSIGNED-PAYLOAD` over https,
+  where TLS protects the body; the file's SHA-256 over plain http), createFolder a zero-byte
+  `<prefix>/` marker, a move `CopyObject` and then a delete only after a real
+  `<CopyObjectResult>`, a folder delete `DeleteObjects` batches. It also reads the few S3 XML
+  shapes it needs (listings, `<Error>`, `CopyObjectResult`, `DeleteResult`). Path-style
+  addressing (`endpoint/bucket/key`) is the default; virtual-host style via `pathStyle: false`.
+- **`login.js`** — `login`, the account validator the sign-in app calls: it signs a zero-key
+  `ListObjectsV2` with the keys before Accounts stores them. The endpoint is `host[:port]`, or
+  `http(s)://host[:port]`; `scheme: "http"` is stored only for an `http://` one.
+- **`photos.js`** — `listAlbums`/`listPhotos`: one prefix (`Camera Uploads/`) is one album.
+- **`com.palm.app.s3-auth`** — a customUI form (endpoint / region / bucket / access key / secret /
+  path-style toggle) that calls `login`.
+
+The access key id is stored as `credentials.common.accessToken` (with the secret and
+endpoint/region/bucket alongside), so the generic `_cloudcore/node` commands (checkCredentials,
+listFolder, downloadFile, uploadFile, createFolder, moveItem, deleteItem, upload, deletePhoto)
+work unchanged. getAuthorizeUrl and exchangeCode answer NOT_SUPPORTED: there is no OAuth.
 
 ## Status
 
-🟢 **Code-complete; signing + wiring validated off-device.** On-device account creation still to be
-exercised.
-
-- The SigV4 signer is checked against **AWS's official published test vectors** — the canonical
-  GET Object, PUT Object and presigned-GET examples (signatures + canonical-request hash) all match.
-- The XML parser is unit-tested (entity decoding, sizes, timestamps, common-prefixes, truncation,
-  error bodies).
-- A **full mock-server integration run** drives the real adapter: credential validation, **paged**
-  folder listing (folder + files, placeholder-object skipped), download, upload (body captured),
-  delete, presigned photo URL, and confirms every request is SigV4-signed with the right key — 12/12.
+- `tests/unit/s3.test.js` runs the service on a stand-in bus and bucket: the exact requests of
+  every method, every signature checked independently (and AWS's published SigV4 examples),
+  and every request of every method failing in five ways, each still one error reply.
+- `S3_IT=1 node --test tests/unit/s3-garage.test.js` runs it against a real S3-compatible server
+  (Garage at `http://127.0.0.1:3900` by default): login, list, upload, download, replace,
+  moves, a presigned link, deletes, under a fresh prefix that is removed again.
 
 ## On-device test checklist
 

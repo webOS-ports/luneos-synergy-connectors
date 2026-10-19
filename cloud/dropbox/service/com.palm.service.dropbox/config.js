@@ -8,23 +8,17 @@
 /* The OAuth app's credentials are not kept here. The build fills the PLACEHOLDER_DROPBOX_*
  * values in from DROPBOX_CLIENT_ID / DROPBOX_CLIENT_SECRET (meta-luneos
  * cloud-synergy-connector.inc); a package built without them cannot sign in. */
+/* A plain file the build patches (sed on the PLACEHOLDER_ lines), read with require(). */
 var Config = {
-	// Modern-TLS HTTP: the device node is OpenSSL 0.9.8k and cannot handshake with
-	// api.dropboxapi.com, so ALL Dropbox HTTPS is shelled out to a modern curl.
-	// The companion OpenSSL-11 update ships a system curl at /usr/bin/curl
-	// (curl 7.88.1 + OpenSSL 1.1.1w, TLS 1.3), so no private bundle or
-	// LD_LIBRARY_PATH is needed. (The retired path bundled curl + libs under
-	// /var/dropbox-tls; that is no longer required.)
+	// Not used by the service, which speaks HTTPS through node's own fetch (_cloudcore/node/
+	// http.js). The on-device harness (tests/suites/cloud.py tls_reachable) still runs this curl
+	// with this CA bundle to check the provider can be reached, so the keys stay.
 	CURL:                "/usr/bin/curl",
 	CURL_LD_LIBRARY_PATH: "",
-	// CA bundle = the SYSTEM store. The stock rootfs ships a 2011 stub, so the
-	// deployment-bundle (this connector's prerequisite) installs a current
-	// ca-certificates.crt here - see deployment-bundle/install.sh "CA bundle" step.
-	// No private copy: a reset/flashed device gets current CAs via that prerequisite.
 	CURL_CAINFO:         "/etc/ssl/certs/ca-certificates.crt",
 
 	// PUBLIC CLIENT (PKCE) - there is NO client_secret. The app key is not secret and
-	// is the same on every device; PKCE (oauth2.js) replaces the secret. Nothing to
+	// is the same on every device; PKCE (_cloudcore/node/oauth.js) replaces the secret. Nothing to
 	// provision. Enable "Allow public clients" for this app in the Dropbox console.
 	CLIENT_ID:     "PLACEHOLDER_DROPBOX_CLIENT_ID", // from the build, see config.js header
 	REDIRECT_URI:  "http://localhost/dropbox/oauth2callback",
@@ -40,7 +34,7 @@ var Config = {
 	SCOPE:         "account_info.read files.metadata.read files.content.read files.content.write",
 	ACCESS_TYPE:   "offline",                                   // -> refresh_token
 
-	// --- _cloudcore generic wiring (consumed by ../_cloudcore) --------------------------
+	// --- _cloudcore generic wiring (read by _cloudcore/node) ----------------------------
 	SERVICE_NAME:  "com.palm.service.dropbox",
 	DISPLAY_NAME:  "Dropbox",
 	STATE:         "dropbox",

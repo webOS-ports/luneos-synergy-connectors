@@ -1,4 +1,5 @@
-"""Cloud/file connectors: one node mojoservice per provider on _cloudcore.
+"""Cloud/file connectors: one node service per provider, a plain node module (package.json)
+on the shared _cloudcore/node runtime.
 
 Method names, arguments and ACL behaviour are from cloud/cloudcore/service/
 _cloudcore (commands/*.js, acl.js). Gated methods check the caller's app id,
@@ -15,7 +16,6 @@ from harness.device import q
 from harness.runner import Fail, Skip, test
 
 SERVICES_DIR = "/usr/palm/services"
-FRAMEWORKS_DIR = "/usr/palm/frameworks"
 # LuneOS consumers of DOCUMENTS / PHOTO.UPLOAD accounts. Config.FILE_APP_IDS must
 # name these or the stock LuneOS apps are refused by Acl.enforce.
 LUNEOS_FILE_APPS = ("org.webosports.app.documents",)
@@ -76,45 +76,37 @@ def _file_app(cfg):
 
 # -- L0 ----------------------------------------------------------------------
 
+def _node_service(ctx, base):
+    """The connector's package.json (run-js-service require()s a directory that has one)."""
+    return ctx.dev.read_json(base + "/package.json")
+
+
 @test(0, ("cloud",))
 def service_sources(ctx, conn):
-    """Every source and framework library in sources.json resolves."""
+    """The service is a node module: its package.json, its main and the _cloudcore/node
+    runtime it requires are installed."""
     base = _svc_dir(conn)
-    src = ctx.dev.read_json(base + "/sources.json")
-    if src is None:
-        raise Fail("%s/sources.json not installed" % base)
-    missing = []
-    for e in src:
-        if "source" in e:
-            p = posixpath.normpath(posixpath.join(base, e["source"]))
-            if not ctx.dev.exists(p):
-                missing.append(e["source"])
-        elif "library" in e:
-            lib = e["library"]
-            p = "%s/%s/version/%s" % (FRAMEWORKS_DIR, lib["name"], lib["version"])
-            if not ctx.dev.exists(p):
-                missing.append("library %s %s" % (lib["name"], lib["version"]))
+    pkg = _node_service(ctx, base)
+    if pkg is None:
+        raise Fail("%s/package.json not installed" % base)
+    missing = [p for p in (posixpath.join(base, pkg.get("main") or "index.js"),
+                           posixpath.join(SERVICES_DIR, "_cloudcore/node/index.js"))
+               if not ctx.dev.exists(p)]
     if missing:
-        raise Fail("unresolved: " + ", ".join(missing))
+        raise Fail("not installed: " + ", ".join(missing))
 
 
 @test(0, ("cloud",))
 def service_syntax(ctx, conn):
-    """node --check every source the service loads (ES5 code on node 22)."""
+    """The service loads on node 22: require() of its directory, which starts nothing
+    until run()."""
     base = _svc_dir(conn)
-    src = ctx.dev.read_json(base + "/sources.json")
-    if src is None:
+    if _node_service(ctx, base) is None:
         raise Skip("not installed")
-    bad = []
-    for e in src:
-        if "source" not in e:
-            continue
-        p = posixpath.normpath(posixpath.join(base, e["source"]))
-        rc, out = ctx.dev.shell("node --check %s 2>&1" % q(p))
-        if rc != 0:
-            bad.append("%s: %s" % (e["source"], out.strip().splitlines()[-1:] or "?"))
-    if bad:
-        raise Fail("; ".join(bad))
+    js = "var s = require(%s); if (typeof s.run !== 'function') { throw new Error('no run()'); }" % json.dumps(base)
+    rc, out = ctx.dev.shell("node -e %s 2>&1" % q(js))
+    if rc != 0:
+        raise Fail("require(%s): %s" % (base, out.strip()[-300:]))
 
 
 @test(0, ("cloud",))

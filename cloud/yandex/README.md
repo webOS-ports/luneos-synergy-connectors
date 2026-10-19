@@ -14,26 +14,24 @@ Dropbox, and the uniform consumer contract maps cleanly (no opaque-id filename r
 ## What's here
 
 ```
-service/com.palm.service.yandexdisk/   node service: OAuth2 + Yandex Disk REST v1
+service/com.palm.service.yandexdisk/   node service on _cloudcore/node (node 22, fetch, no curl),
+                                       laid out as the Dropbox connector is
+  package.json     main: service.js; run-js-service requires the directory and calls run()
+  service.js       wires config.js, adapter.js and photos.js into _cloudcore/node's connector()
   config.js        OAuth (oauth.yandex.com) + REST (cloud-api.yandex.net/v1/disk) endpoints;
-                   CLIENT_ID + CLIENT_SECRET placeholders; disk.read/write/info + login scopes
-  oauth2.js        Authorization Code + PKCE; sends client_secret when configured (confidential),
-                   else pure PKCE (public). No `scope` on the token calls (Yandex fixes it at authorize)
-  yandexapi.js     Disk REST: /resources listing, /resources/download + /resources/upload
-                   two-step signed-href flow, uploadReplace (overwrite=true), refresh-on-401.
-                   Uses "Authorization: OAuth <token>" (NOT Bearer)
-  httpcurl.js      shells all TLS to the bundled modern curl (identical invocation; -L follow
-                   for the download/upload signed hrefs; dataFile = raw-body PUT upload)
-  creds.js acl.js  credentials-by-accountId; allowedAppIds enforcement
-  commands/        getAuthorizeUrl, exchangeCode, checkCredentials,
-                   listFolder, downloadFile, uploadFile              <- DOCUMENTS only
-apps/
-  com.palm.app.yandexdisk-auth/    customUI OAuth login (Atlas simple-mode, stateless PKCE verifier)
-  com.palm.app.yandexdisk-files/   Enyo file browser/uploader (path breadcrumb)
-account/com.palm.yandexdisk.json   Synergy template: customUI validator, DOCUMENTS capability,
-                                   permissions for the auth app + the service
+                   CLIENT_ID + CLIENT_SECRET placeholders (filled in by the build with sed)
+  adapter.js       Disk REST: /resources listing (paged with offset), the two-step signed-href
+                   download/upload, create/move (overwrite=false)/delete (to the Trash), 202
+                   operations polled with a bound. "Authorization: OAuth <token>" (NOT Bearer)
+  photos.js        listAlbums / listPhotos for the Photos service
+account/com.palm.yandexdisk.json   Synergy template: customUI validator (com.palm.app.cloud-auth),
+                                   DOCUMENTS + PHOTO.UPLOAD capabilities
 account/images/                    32x32 / 48x48 icons (PLACEHOLDERS — rebrand for Yandex)
 ```
+
+The generic methods (`getAuthorizeUrl`, `exchangeCode`, `checkCredentials`, `listFolder`,
+`downloadFile`, `uploadFile`, `createFolder`, `moveItem`, `deleteItem`, `upload`, `deletePhoto`)
+come from `_cloudcore/node/commands.js`, with their arguments and replies listed at its head.
 
 Icons under `apps/*/icon.png` and `account/images/*` are **placeholders copied from the
 Dropbox connector** — replace them with Yandex Disk artwork before shipping.
@@ -79,10 +77,11 @@ Register a free app at **https://oauth.yandex.com/client/new**:
   **Password/secret** into `CLIENT_SECRET`. *(Already populated with a registered app; the
   steps above are for re-registering under a different Yandex account.)*
   - To run as a **public (PKCE-only) client** instead, leave `CLIENT_SECRET` as the
-    `PLACEHOLDER…` default — `oauth2.js` then never sends a secret (it still sends the S256
+    `PLACEHOLDER…` default — `_cloudcore/node/oauth.js` then never sends a secret (it still sends the S256
     challenge). Whether Yandex accepts a secret-less exchange depends on the app type chosen.
 
-Same modern system-curl (`/usr/bin/curl`) + current-CA prerequisites as Dropbox/OneDrive.
+HTTPS is node's own `fetch` with node's CA store; `CURL`/`CURL_CAINFO` stay in `config.js` only
+for the on-device harness's reachability check.
 
 ## Photos (PHOTO.UPLOAD)
 
@@ -119,9 +118,12 @@ needs no auth header). Wiring: the `PHOTO.UPLOAD` capabilityProvider in the acco
 - ⚠️ **Icons are placeholders** (copied from Dropbox) — rebrand before shipping. (The Photos
   **Library** icon `icon_yandexdisk_{40x40,20x20}.png` under `../../photos-integration/assets/` is
   already Yandex-branded.)
-- ⚠️ **List paging:** only the first `limit=200` items per folder are returned (no `offset`
-  paging yet) — matches the other connectors' single-page behaviour.
+- ✅ **Unit-tested on `_cloudcore/node`** (`tests/unit/yandex.test.js`): exact requests,
+  replies, errors, root handling, operation polling, and every request of every method failed
+  in five ways. The live-API checks above were made with the earlier curl-based service.
+- **List paging:** folders are read in full, `limit=200` per page with `offset`, up to
+  `_embedded.total`.
 - ⚠️ **Signed-href auth:** the download/upload hrefs are treated as self-authenticating
   (fetched with no OAuth header), per Yandex docs ("you don't need an OAuth token to
-  upload"). `-L` follow is enabled in case the download href 302-redirects to a storage host.
+  upload"). Redirects are followed in case the download href 302-redirects to a storage host.
 - ⏳ **QuickOffice reroute (mxId `yandex`)** — provided by the integrator; not in this dir.

@@ -1,79 +1,79 @@
-/*global IMPORTS, Config, HttpCurl, console */
-/* oauth2.js - OAuth2 Authorization Code for pCloud. pCloud is the SIMPLEST of the
- * connectors' auth flows in two ways, and the trickiest in one:
+/* oauth2.js - pCloud's own getAuthorizeUrl and exchangeCode, in place of _cloudcore/node's.
  *
- *   1. NO PKCE. pCloud does not support the S256 code_challenge, so - like the gdrive
- *      "Desktop app" client - the code->token exchange authenticates with a SHIPPED
- *      client_secret instead of a PKCE verifier. There is therefore no verifier to
- *      generate/carry (buildAuthorizeUrl takes no crypto, exchangeCode takes no verifier).
- *   2. NO REFRESH. pCloud access tokens are LONG-LIVED and there is no refresh_token and no
- *      refresh endpoint - a token is valid until the user revokes the app. So there is no
- *      refresh() here and no refresh-on-401 in adapter.js (a 401/"login required" means
- *      the user revoked access and must re-add the account).
- *   3. REGION HOST. The token exchange must hit the account's REGION host (api.pcloud.com or
- *      eapi.pcloud.com), which the OAuth2 redirect told the auth app. exchangeCode() takes
- *      that apiHost and posts to https://<apiHost>/oauth2_token.
+ * The generic ones (_cloudcore/node/oauth.js + commands.js) cannot serve pCloud:
+ *   1. NO PKCE. pCloud does not support the S256 code_challenge; the code->token exchange
+ *      authenticates with the shipped client_secret instead, so there is no verifier to make or
+ *      carry: getAuthorizeUrl answers { url } only.
+ *   2. NO REFRESH. pCloud access tokens are long-lived and there is no refresh token or refresh
+ *      endpoint; a token works until the user revokes the app. Config has no TOKEN_URL, so the
+ *      connector has no oauth and no session ever refreshes.
+ *   3. REGION HOST. The token exchange must go to the account's region host (api.pcloud.com or
+ *      eapi.pcloud.com), which the authorize redirect names (hostname, locationid). The sign-in
+ *      app (com.palm.app.cloud-auth) forwards both to exchangeCode, which picks the host - a
+ *      pCloud hostname from the redirect wins, else the locationid's host, else the US one -
+ *      posts the code to https://<host>/oauth2_token, and stores the host in the credentials
+ *      (common.apiHost) for every later call.
  *
- * All HTTPS runs through the modern curl (HttpCurl) because device node is OpenSSL 0.9.8k.
+ *   getAuthorizeUrl { state? }                         -> { url }                                   open
+ *   exchangeCode    { code, hostname?, locationid? }   -> { username, credentials:{ common:
+ *                                                          { accessToken, apiHost, locationid, uid } } } open
+ *
+ * Both are open, as they were: Accounts calls exchangeCode with no app id, and the sign-in
+ * app's calls arrive as com.palm.app.accounts-<pid>.
  */
-var Foundations = IMPORTS.foundations;
-var Future = Foundations.Control.Future;
+"use strict";
 
-var OAuth2 = {
-	// Build the consent URL. No PKCE, so no verifier side effect - pCloud sends the
-	// client_secret at exchange time instead.
-	buildAuthorizeUrl: function (state) {
-		return Config.AUTHORIZE_URL +
+const TIMEOUT_MS = 60000;
+
+// deps: connector.js's, plus core (_cloudcore/node).
+function authMethods({ core, config, http, adapter }) {
+	const { CloudError, Session } = core;
+
+	function authorizeUrl(state) {
+		return config.AUTHORIZE_URL +
 			"?response_type=code" +
-			"&client_id="    + encodeURIComponent(Config.CLIENT_ID) +
-			"&redirect_uri=" + encodeURIComponent(Config.REDIRECT_URI) +
-			"&state="        + encodeURIComponent(state || "pcloud");
-	},
-
-	// Exchange the ?code= for a bearer access_token on the account's REGION host.
-	// apiHost comes from the OAuth2 redirect (hostname/locationid) via exchangeCode_command;
-	// it defaults to the US host if the redirect carried neither.
-	exchangeCode: function (code, apiHost) {
-		var host = Config.sanitizeHost(apiHost) || Config.DEFAULT_API_HOST;
-		var url = "https://" + host + Config.TOKEN_PATH;
-		var f = new Future();
-		f.now(this, function () {
-			return HttpCurl.request({ method: "POST", url: url, form: {
-				client_id:     Config.CLIENT_ID,
-				client_secret: Config.CLIENT_SECRET,
-				code:          code
-			} });
-		});
-		f.then(this, function () {
-			var r = f.result;
-			if (!r || r.status !== 200) {
-				if (typeof console !== "undefined") {
-					console.log("pcloud: token endpoint failed status=" + (r && r.status) +
-						" body=" + (r && r.responseText));
-				}
-				f.setException({ returnValue: false, errorCode: "OAUTH_TOKEN_FAILED",
-					status: r && r.status, body: r && r.responseText });
-				return;
-			}
-			var t = JSON.parse(r.responseText);
-			// pCloud returns HTTP 200 even on logical errors, flagged by a nonzero `result`.
-			if (t.result && t.result !== 0) {
-				f.setException({ returnValue: false, errorCode: "OAUTH_TOKEN_FAILED",
-					result: t.result, error: t.error });
-				return;
-			}
-			f.result = {
-				returnValue: true,
-				accessToken: t.access_token,
-				tokenType:   t.token_type,
-				uid:         t.userid || t.uid,
-				// pCloud may echo the region back in the token response; the redirect host wins.
-				locationid:  t.locationid,
-				apiHost:     host
-			};
-		});
-		return f;
+			"&client_id=" + encodeURIComponent(config.CLIENT_ID) +
+			"&redirect_uri=" + encodeURIComponent(config.REDIRECT_URI) +
+			"&state=" + encodeURIComponent(state || config.STATE || "pcloud");
 	}
-};
 
-if (typeof exports !== "undefined") { exports.OAuth2 = OAuth2; }
+	// POST https://<apiHost>/oauth2_token { client_id, client_secret, code }. A reply other than
+	// 200, one that is not JSON, a nonzero result, or no access_token is OAUTH_TOKEN_FAILED.
+	async function token(code, apiHost) {
+		const host = config.sanitizeHost(apiHost) || config.DEFAULT_API_HOST;
+		const r = await http.request({ method: "POST", url: "https://" + host + config.TOKEN_PATH,
+			form: { client_id: config.CLIENT_ID, client_secret: config.CLIENT_SECRET, code },
+			errorCode: "OAUTH_TOKEN_FAILED", describe: (status) => "pCloud token endpoint answered HTTP " + status });
+		let t = null;
+		try { t = JSON.parse(r.text); } catch (e) { t = null; }
+		if (r.status !== 200 || !t || typeof t !== "object") {
+			throw new CloudError("OAUTH_TOKEN_FAILED", "pCloud token endpoint answered HTTP " + r.status + " without JSON", { status: r.status });
+		}
+		if (t.result && t.result !== 0) {
+			throw new CloudError("OAUTH_TOKEN_FAILED", "pCloud token endpoint: error " + t.result +
+				(t.error ? ": " + String(t.error).slice(0, 200) : ""), { result: t.result });
+		}
+		if (!t.access_token) { throw new CloudError("OAUTH_TOKEN_FAILED", "pCloud token endpoint answered without an access token"); }
+		return { accessToken: t.access_token, uid: t.userid || t.uid, locationid: t.locationid, apiHost: host };
+	}
+
+	return {
+		getAuthorizeUrl: { timeoutMs: 30000, handler: async (p) => ({ url: authorizeUrl(p.state || "pcloud") }) },
+
+		// The account validator. The identity is only a nicety once the token is there: without
+		// it the account is made as "pCloud".
+		exchangeCode: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+			if (!p.code) { throw new CloudError("MISSING_CODE", "need code"); }
+			const apiHost = config.sanitizeHost(p.hostname) ||
+				((p.locationid !== undefined && p.locationid !== null) ? config.hostForLocation(p.locationid) : config.DEFAULT_API_HOST);
+			const t = await token(p.code, apiHost);
+			const common = { accessToken: t.accessToken, apiHost: t.apiHost || apiHost,
+				locationid: (t.locationid !== undefined && t.locationid !== null) ? t.locationid : p.locationid, uid: t.uid };
+			let u = {};
+			try { u = ((await adapter.getAccountInfo(new Session(common))) || {}).user || {}; } catch (e) { u = {}; }
+			return { username: u.emailAddress || "pCloud", credentials: { common } };
+		} },
+	};
+}
+
+module.exports = authMethods;

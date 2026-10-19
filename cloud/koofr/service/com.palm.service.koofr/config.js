@@ -5,19 +5,21 @@
  * SHARED consent webview app com.palm.app.cloud-auth. Files live under a mount (the user's
  * primary personal storage), addressed by (mountId, absolute path); the primary mount is
  * resolved lazily and cached in the credentials. Every API call sends "Authorization: Bearer
- * <token>" and shells through the modern curl (device node is ancient).
+ * <token>", through node's own fetch (_cloudcore/node/http.js).
  *
  * REGISTER a "Desktop app" client at https://app.koofr.net/developers/api . Set the redirect URI
  * to REDIRECT_URI below verbatim. Koofr is a confidential client (a client_secret is issued and
- * IS sent on the token exchange), and oauth2.js ALSO sends a PKCE challenge (harmless - Hydra
- * binds it and we send the matching verifier).
+ * IS sent on the token exchange), and _cloudcore/node/oauth.js ALSO sends a PKCE challenge
+ * (harmless - Hydra binds it and we send the matching verifier).
  */
+/* A plain file the build patches (sed on the PLACEHOLDER_ lines), read with require(). */
 /* The OAuth app's credentials are not kept here. The build fills the PLACEHOLDER_KOOFR_*
  * values in from KOOFR_CLIENT_ID / KOOFR_CLIENT_SECRET (meta-luneos
  * cloud-synergy-connector.inc); a package built without them cannot sign in. */
 var Config = {
-	// Modern-TLS HTTP: device node can't handshake with app.koofr.net, so ALL HTTPS shells out
-	// to the bundled modern curl (same binary + CA store as the other connectors).
+	// Not used by the service, which speaks HTTPS through node's own fetch (_cloudcore/node/
+	// http.js). The on-device harness (tests/suites/cloud.py tls_reachable) still runs this curl
+	// with this CA bundle to check the provider can be reached, so the keys stay.
 	CURL:                 "/usr/bin/curl",
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
@@ -38,9 +40,9 @@ var Config = {
 
 	ROOT_FOLDER: "/",   // mount root; the sentinel "root"/"" also maps here
 
-	PHOTO_ALBUM_NAME: "Camera Uploads",   // one folder surfaced as one album
+	PHOTO_ALBUM_NAME: "Camera Uploads",   // where a photo upload without an album goes
 
-	// --- _cloudcore generic wiring (consumed by ../_cloudcore) --------------------------
+	// --- _cloudcore generic wiring (read by _cloudcore/node) -----------------------------
 	SERVICE_NAME:  "com.palm.service.koofr",
 	DISPLAY_NAME:  "Koofr",
 	STATE:         "koofr",

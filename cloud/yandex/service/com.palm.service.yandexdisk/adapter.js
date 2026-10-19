@@ -1,447 +1,247 @@
-/*global IMPORTS, Config, OAuth2, HttpCurl, console, setTimeout */
-/* adapter.js - Yandex Disk provider ADAPTER for _cloudcore. Yandex Disk is PATH-based
- * (like Dropbox): a resource is addressed by "disk:/Folder/file.docx", so a locator handed
- * to consumers IS a real path. Every request sends "Authorization: OAuth <token>" (NOT the
- * Bearer scheme), passed via the headers map. download/upload are TWO-STEP: the API returns
- * a short-lived signed href fetched with a second, UNAUTHENTICATED curl. All HTTPS runs
- * through _cloudcore/httpcurl (device node is 0.9.8k).
+/* adapter.js - Yandex Disk REST v1 for _cloudcore/node (commands.js there has the interface).
  *
- * Exposes the uniform _cloudcore adapter interface (normalised shapes):
- *   listFolder(creds, folderId, cb) -> { entries:[{id,type,name,size,modified,path,mimeType}] }
- *   downloadFile(creds, fileId, localDest, exportMime, cb) -> { path }   (exportMime ignored)
- *   uploadFile(creds, folderId, localPath, name, mimeType, cb) -> { id, name, size }
- *   uploadReplace(creds, fileId, localPath, mimeType, cb)      -> { id, name, size }
- *   getAccountInfo(creds, cb) -> { user:{ displayName, emailAddress } }
+ * Yandex Disk is path based: a resource is "disk:/Folder/file.docx", which listFolder hands out
+ * as each entry's id and path. The root is "disk:/" ("", "/" and "root" mean it too); a bare
+ * "Folder/x" or "/Folder/x" is taken as "disk:/Folder/x", and "app:/", "trash:/" paths pass as
+ * they are. Every API request sends "Authorization: OAuth <token>" (not Bearer) through the
+ * session (s.authorized: one refresh and retry on a 401). Downloads and uploads are two steps:
+ * the API gives a short-lived signed href, which is fetched without the token.
+ *
+ * A reply outside 2xx is YANDEX_API_ERROR with its status and body; the steps that had their
+ * own codes keep them: YANDEX_NO_DOWNLOAD_HREF / YANDEX_DOWNLOAD_FAILED,
+ * YANDEX_NO_UPLOAD_HREF / YANDEX_UPLOAD_FAILED, YANDEX_MKDIR_FAILED (the album folder),
+ * YANDEX_DELETE_FAILED (deletePhoto), and for operations YANDEX_BAD_OPERATION,
+ * YANDEX_OPERATION_FAILED and YANDEX_OPERATION_TIMEOUT.
+ *
+ * The file operations (https://yandex.com/dev/disk-api/doc/en/reference/):
+ *   PUT    /resources?path=                                 create a folder (201, a Link)
+ *   POST   /resources/move?from=&path=&overwrite=false      move and/or rename, path = the NEW
+ *          full path; never over an existing item (409)
+ *   DELETE /resources?path=                                 to the Trash (no permanently=true)
+ * Any of them may answer 202 with a Link to an asynchronous operation (a large folder): it is
+ * polled - on the API host only, as it gets the token - until "success" or "failed", at most
+ * adapter.POLL_TRIES times, adapter.sleep(POLL_DELAY_MS) apart (tests replace sleep). create and
+ * move answer only a Link, so the new entry is read back with GET /resources?path=&limit=0.
  */
-var Foundations = IMPORTS.foundations;
-var Future = Foundations.Control.Future;
+"use strict";
 
-var Adapter = {
-	_hdr: function (c) { return { "Authorization": "OAuth " + c.accessToken }; },
+const ERROR = "YANDEX_API_ERROR";
+const POLL_TRIES = 30;
+const POLL_DELAY_MS = 1000;
+const MAX_PAGES = 100;   // listFolder: at most this many LIST_LIMIT pages
 
-	// Normalise a locator to the Disk namespace. "", "/", "root", ROOT_FOLDER -> root; a bare
-	// "/Foo/bar" -> "disk:/Foo/bar"; an already-qualified "disk:/..", "app:/..", "trash:/.." is
-	// passed through unchanged (that is what listFolder hands back as each entry.path).
-	_normPath: function (p) {
-		var root = Config.ROOT_FOLDER || Config.ROOT_PATH || "disk:/";
-		if (!p || p === "/" || p === "root" || p === root || p === Config.ROOT_PATH) { return root; }
-		if (p.indexOf("disk:/") === 0 || p.indexOf("app:/") === 0 || p.indexOf("trash:/") === 0) {
-			return p;
-		}
-		return "disk:/" + p.replace(/^\/+/, "");
-	},
+const enc = (p) => encodeURIComponent(p);
 
-	_join: function (folder, name) {
-		var base = this._normPath(folder);
-		if (base.charAt(base.length - 1) !== "/") { base += "/"; }
-		return base + name.replace(/^\/+/, "");
-	},
+// The parent folder of "disk:/a/b" ("disk:/a"; "disk:/" for a top-level item).
+function parentOf(p) {
+	const s = String(p).replace(/\/+$/, "");
+	const i = s.lastIndexOf("/");
+	const d = i >= 0 ? s.substring(0, i) : "";
+	return (!d || d.charAt(d.length - 1) === ":") ? d + "/" : d;
+}
 
-	// Authenticated request with transparent refresh-on-401. Resolves to the raw HttpCurl
-	// result { status, responseText }.
-	_req: function (base, creds, onRenewed) {
-		var self = this, f = new Future();
-		function fire(c) {
-			var o = { method: base.method || "GET", url: base.url, headers: self._hdr(c) };
-			if (base.headers) {
-				Object.keys(base.headers).forEach(function (k) { o.headers[k] = base.headers[k]; });
-			}
-			return HttpCurl.request(o);
-		}
-		f.now(this, function () { return fire(creds); });
-		f.then(this, function () {
-			var r = f.result;
-			if (r && r.status === 401 && creds.refreshToken) {
-				var rf = OAuth2.refresh(creds.refreshToken);
-				rf.then(self, function () {
-					// A refresh that failed, or anything thrown here, fails f: thrown inside rf's or retry's
-					// callback it would stay on that Future, and the request would never answer.
-					try {
-						var t = null, tErr = null;
-							try { t = rf.result; } catch (e) { tErr = e; }
-							if (tErr) { f.setException(tErr); return; }
-						var nc = { accessToken: t.accessToken,
-							refreshToken: t.refreshToken || creds.refreshToken,
-							expiresAt: Date.now() + (t.expiresIn * 1000) };
-						if (onRenewed) { onRenewed(nc); }
-						var retry = fire(nc);
-						retry.then(self, function () {
-							try { f.result = retry.result; }
-							catch (e2) { f.setException(e2); }
-						});
-					} catch (e) { f.setException(e); }
-				});
-				return;
-			}
-			f.result = r;
-		});
-		return f;
-	},
+// The last path component, as it is (Disk paths are not URL-encoded).
+function base(p) {
+	const s = String(p).replace(/\/+$/, "");
+	return s.substring(s.lastIndexOf("/") + 1);
+}
 
-	_parse: function (r) {
-		if (!r || r.status < 200 || r.status >= 300) {
-			throw { returnValue: false, errorCode: "YANDEX_API_ERROR",
-				status: r && r.status, body: r && r.responseText };
-		}
-		return r.responseText ? JSON.parse(r.responseText) : {};
-	},
+// The last component, URL-decoded, as a human album name ("disk:/Фотокамера/" -> "Фотокамера").
+function leafName(p) {
+	const seg = base(p);
+	try { return decodeURIComponent(seg); } catch (e) { return seg; }
+}
 
-	// GET https://login.yandex.ru/info -> normalise to { user:{ displayName, emailAddress } }.
-	getAccountInfo: function (creds, cb) {
-		var self = this, f = new Future();
-		var call = this._req({ method: "GET", url: Config.LOGIN_INFO_URL }, creds, cb);
-		call.then(this, function () {
-			try {
-				var u = self._parse(call.result) || {};
-				f.result = { user: {
-					emailAddress: u.default_email || u.login,
-					displayName:  u.display_name || u.real_name
-				} };
-			} catch (e) { f.setException(e); }
-		});
-		return f;
-	},
+// One Yandex Resource -> the listFolder entry (id = path).
+function entry(e) {
+	return { id: e.path, type: e.type === "dir" ? "folder" : "file", name: e.name, size: e.size,
+		modified: e.modified, path: e.path, mimeType: e.mime_type };
+}
 
-	// GET /resources?path=..&limit=.. -> normalised entries. Yandex items carry type
-	// ("dir"|"file"), name, size, modified, path (the "disk:/.." locator), mime_type.
-	listFolder: function (creds, folderId, cb) {
-		var self = this, f = new Future();
-		var p = this._normPath(folderId);
-		var url = Config.API_BASE + "/resources?path=" + encodeURIComponent(p) +
-			"&limit=" + Config.LIST_LIMIT;
-		var call = this._req({ method: "GET", url: url }, creds, cb);
-		call.then(this, function () {
-			try {
-				var res = self._parse(call.result) || {};
-				var items = (res._embedded && res._embedded.items) || [];
-				f.result = { entries: items.map(function (e) { return self._entry(e); }) };
-			} catch (e) { f.setException(e); }   // reject, don't hang, on non-2xx / parse error
-		});
-		return f;
-	},
+// The errorText of a Yandex error reply ({ message, description, error }).
+function describe(status, body) {
+	let why = "";
+	try {
+		const j = JSON.parse(body);
+		if (j && typeof j === "object") { why = [j.error, j.description || j.message].filter((x) => typeof x === "string" && x).join(": "); }
+	} catch (e) { why = String(body || "").replace(/\s+/g, " ").trim(); }
+	return "Yandex Disk answered HTTP " + status + (why ? ": " + why.slice(0, 200) : "");
+}
 
-	// One Yandex Resource object -> the normalised entry listFolder hands out (id = path).
-	_entry: function (e) {
-		var isFolder = (e.type === "dir");
-		return { id: e.path, type: (isFolder ? "folder" : "file"),
-			name: e.name, size: e.size, modified: e.modified, path: e.path,
-			mimeType: e.mime_type };
-	},
+function createAdapter({ config, http, errors }) {
+	const API = config.API_BASE;
+	const ROOT = config.ROOT_FOLDER || config.ROOT_PATH || "disk:/";
+	const ORIGIN = new URL(API).origin + "/";
+	const fail = (code, text, extra) => new errors.CloudError(code, text, extra);
 
-	// Two-step download: GET /resources/download?path=.. -> { href, method }; then GET the
-	// signed href to disk (no auth header - the href is self-authenticating). exportMime unused.
-	downloadFile: function (creds, fileId, localDest, exportMime, cb) {
-		var self = this, f = new Future();
-		var p = this._normPath(fileId);
-		var url = Config.API_BASE + "/resources/download?path=" + encodeURIComponent(p);
-		var call = this._req({ method: "GET", url: url }, creds, cb);
-		f.now(this, function () { return call; });
-		f.then(this, function () {
-			try {
-				var link = self._parse(call.result);
-				if (!link.href) {
-					throw { returnValue: false, errorCode: "YANDEX_NO_DOWNLOAD_HREF",
-						body: call.result && call.result.responseText };
-				}
-				var dl = HttpCurl.request({ method: link.method || "GET", url: link.href,
-					follow: true, outFile: localDest });
-				dl.then(self, function () {
-					try {
-						var r = dl.result;
-						if (!r || r.status < 200 || r.status >= 300) {
-							throw { returnValue: false, errorCode: "YANDEX_DOWNLOAD_FAILED",
-								status: r && r.status, body: r && r.responseText };
-						}
-						f.result = { path: localDest };
-					} catch (e2) { f.setException(e2); }
-				});
-			} catch (e) { f.setException(e); }
-		});
-		return f;
-	},
-
-	// Create a new file: two-step upload to folderId/name (overwrite=false).
-	uploadFile: function (creds, folderId, localPath, name, mimeType, cb) {
-		return this._putUpload(creds, this._join(folderId, name), localPath, false, cb);
-	},
-
-	// Overwrite the file at fileId (QuickOffice save-back). Path-based => upload overwrite=true.
-	uploadReplace: function (creds, fileId, localPath, mimeType, cb) {
-		return this._putUpload(creds, this._normPath(fileId), localPath, true, cb);
-	},
-
-	// Shared two-step PUT: GET /resources/upload?path=..&overwrite=.. -> { href, method:PUT };
-	// then PUT the local bytes to the signed href (no auth header needed).
-	_putUpload: function (creds, destPath, localPath, overwrite, cb) {
-		var self = this, f = new Future();
-		var ow = overwrite ? "true" : "false";
-		var url = Config.API_BASE + "/resources/upload?path=" + encodeURIComponent(destPath) +
-			"&overwrite=" + ow;
-		var call = this._req({ method: "GET", url: url }, creds, cb);
-		f.now(this, function () { return call; });
-		f.then(this, function () {
-			try {
-				var link = self._parse(call.result);
-				if (!link.href) {
-					throw { returnValue: false, errorCode: "YANDEX_NO_UPLOAD_HREF",
-						body: call.result && call.result.responseText };
-				}
-				var up = HttpCurl.request({ method: link.method || "PUT", url: link.href,
-					follow: true, dataFile: localPath });
-				up.then(self, function () {
-					try {
-						var r = up.result;
-						if (!r || r.status < 200 || r.status >= 300) {
-							throw { returnValue: false, errorCode: "YANDEX_UPLOAD_FAILED",
-								status: r && r.status, body: r && r.responseText };
-						}
-						f.result = { id: destPath, path: destPath, name: destPath.split("/").pop() };
-					} catch (e2) { f.setException(e2); }
-				});
-			} catch (e) { f.setException(e); }
-		});
-		return f;
-	},
-
-	// --- File-manager operations (fileOps_commands.js) ----------------------------------
-	// Yandex Disk REST (https://yandex.com/dev/disk-api/doc/en/reference/create-folder, /move,
-	// /delete, /operations):
-	//   PUT    /resources?path=                       create a folder (201, a Link to it)
-	//   POST   /resources/move?from=&path=&overwrite=false   move and/or rename: path is the NEW
-	//          full path (201 done; 202 = a non-empty folder moving asynchronously)
-	//   DELETE /resources?path=                       to the Trash (no permanently=true);
-	//          204 done, 202 = asynchronous
-	// A 202 carries a Link to the operation; it is polled (GET, status "success" | "failed" |
-	// "in-progress") a bounded number of times. The new entry is read back with
-	// GET /resources?path=..&limit=0 because create/move only answer with a Link.
-	_POLL_TRIES: 30,
-	_POLL_DELAY_MS: 1000,
-	_later: function (fn, ms) { setTimeout(fn, ms); },
-
-	_tracker: function (creds, cb) {
-		var t = { creds: creds };
-		t.renew = function (nc) { t.creds = nc; if (cb) { cb(nc); } };
-		return t;
-	},
-
-	// The parent folder of a "disk:/a/b" locator ("disk:/a"; "disk:/" for a top-level item).
-	_parentOf: function (p) {
-		var s = String(p).replace(/\/+$/, "");
-		var i = s.lastIndexOf("/");
-		var d = (i >= 0) ? s.substring(0, i) : "";
-		return (!d || d.charAt(d.length - 1) === ":") ? d + "/" : d;
-	},
-	// Last path component, as is (Disk paths are not URL-encoded, unlike _leaf's album names).
-	_base: function (p) {
-		var s = String(p).replace(/\/+$/, "");
-		return s.substring(s.lastIndexOf("/") + 1);
-	},
-
-	// Settle `f` once the request answered: 2xx done -> next(); 202 -> poll the operation first.
-	_settle: function (t, call, f, next) {
-		var self = this;
-		call.then(this, function () {
-			var r, link;
-			// All in the try, next() too: call is not f, so a throw here would stay on call.
-			try {
-				r = call.result; link = self._parse(r);
-				if (r.status !== 202) { next(); return; }
-				self._poll(t, link && link.href, 0, f, next);
-			} catch (e) { f.setException(e); }
-		});
-	},
-
-	// The operation href must be on the API host: it gets the OAuth header.
-	_poll: function (t, href, n, f, next) {
-		var self = this;
-		var origin = String(Config.API_BASE).replace(/^(https:\/\/[^\/]+\/).*$/, "$1");
-		if (!href || String(href).indexOf(origin) !== 0) {
-			f.setException({ returnValue: false, errorCode: "YANDEX_BAD_OPERATION", href: href || null });
-			return;
-		}
-		var st = this._req({ method: "GET", url: href }, t.creds, t.renew);
-		st.then(this, function () {
-			var op;
-			try { op = self._parse(st.result) || {}; } catch (e) { f.setException(e); return; }
-			if (op.status === "success") {
-				try { next(); } catch (e1) { f.setException(e1); }   // st is not f: a throw would stay on st
-				return;
-			}
-			if (op.status === "failed") {
-				f.setException({ returnValue: false, errorCode: "YANDEX_OPERATION_FAILED", href: href });
-				return;
-			}
-			if (n + 1 >= self._POLL_TRIES) {
-				f.setException({ returnValue: false, errorCode: "YANDEX_OPERATION_TIMEOUT", href: href,
-					status: op.status });
-				return;
-			}
-			self._later(function () { self._poll(t, href, n + 1, f, next); }, self._POLL_DELAY_MS);
-		});
-	},
-
-	// GET /resources?path=..&limit=0 -> { entry } into `f`.
-	_entryAt: function (t, path, f) {
-		var self = this;
-		var url = Config.API_BASE + "/resources?path=" + encodeURIComponent(path) + "&limit=0";
-		var call = this._req({ method: "GET", url: url }, t.creds, t.renew);
-		call.then(this, function () {
-			try { f.result = { entry: self._entry(self._parse(call.result) || {}) }; }
-			catch (e) { f.setException(e); }
-		});
-	},
-
-	createFolder: function (creds, parent, name, cb) {
-		var self = this, f = new Future(), t = this._tracker(creds, cb);
-		var path = this._join(parent, name);
-		var call = this._req({ method: "PUT",
-			url: Config.API_BASE + "/resources?path=" + encodeURIComponent(path) }, creds, t.renew);
-		this._settle(t, call, f, function () { self._entryAt(t, path, f); });
-		return f;
-	},
-
-	// toFolder null = rename in place; name null = keep the name; both = one move to the new path.
-	moveItem: function (creds, item, toFolder, name, cb) {
-		var self = this, f = new Future(), t = this._tracker(creds, cb);
-		var from = this._normPath(item);
-		var dst = this._join(toFolder ? toFolder : this._parentOf(from),
-			(name === null || name === undefined) ? this._base(from) : name);
-		var call = this._req({ method: "POST", url: Config.API_BASE + "/resources/move?from=" +
-			encodeURIComponent(from) + "&path=" + encodeURIComponent(dst) + "&overwrite=false" }, creds, t.renew);
-		this._settle(t, call, f, function () { self._entryAt(t, dst, f); });
-		return f;
-	},
-
-	// To the Trash (permanently is not sent; deletePhoto is the one that deletes for good).
-	deleteItem: function (creds, item, cb) {
-		var f = new Future(), t = this._tracker(creds, cb);
-		var call = this._req({ method: "DELETE",
-			url: Config.API_BASE + "/resources?path=" + encodeURIComponent(this._normPath(item)) }, creds, t.renew);
-		this._settle(t, call, f, function () { f.result = {}; });
-		return f;
-	},
-
-	// --- Photos-provider helpers (PHOTO.UPLOAD role) ------------------------------------
-	// Yandex is the Dropbox-shaped photo case: no self-authenticating per-item URL (unlike
-	// kDrive's ?access_token=), so listPhotos resolves a short-lived signed href PER photo
-	// via getTemporaryLink - exactly Dropbox's get_temporary_link pattern.
-
-	// Last path segment, URL-decoded, for a human album name ("disk:/Фотокамера/" -> "Фотокамера").
-	_leaf: function (p) {
-		var s = String(p).replace(/\/+$/, "");
-		var i = s.lastIndexOf("/");
-		var seg = (i >= 0) ? s.substring(i + 1) : s;
-		try { return decodeURIComponent(seg); } catch (e) { return seg; }
-	},
-
-	// GET /resources/download?path=.. -> { href } - the same self-authenticating signed link
-	// downloadFile uses, surfaced for listPhotos as src_big/src_small (fetched header-less by
-	// the Photos aggregator's curl). Resolves to { link, method }.
-	getTemporaryLink: function (creds, fileId, cb) {
-		var self = this, f = new Future();
-		var url = Config.API_BASE + "/resources/download?path=" +
-			encodeURIComponent(this._normPath(fileId));
-		var call = this._req({ method: "GET", url: url }, creds, cb);
-		call.then(this, function () {
-			try {
-				var link = self._parse(call.result) || {};
-				f.result = { link: link.href, method: link.method || "GET" };
-			} catch (e) { f.setException(e); }
-		});
-		return f;
-	},
-
-	// GET /v1/disk?fields=system_folders -> the server-localized system-folder map
-	// (photostream = camera-uploads, downloads, screenshots, ...). Resolves to that object.
-	getSystemFolders: function (creds, cb) {
-		var self = this, f = new Future();
-		var url = Config.API_BASE + "?fields=" + encodeURIComponent("system_folders");
-		var call = this._req({ method: "GET", url: url }, creds, cb);
-		call.then(this, function () {
-			// A non-2xx here (e.g. disk.info scope not granted) must NOT hang photo listing -
-			// resolve to an empty map so resolvePhotoAlbum cleanly falls back to Pictures.
-			var d;
-			try { d = self._parse(call.result) || {}; } catch (e) { d = {}; }
-			f.result = d.system_folders || {};
-		});
-		return f;
-	},
-
-	// Pick the photo album: prefer Yandex's own camera-uploads folder (system_folders.photostream,
-	// e.g. "disk:/Фотокамера/", localized by the server), but only if it actually exists; else
-	// fall back to Config.PHOTO_ALBUM_NAME ("Pictures"). Resolves to { path, name, exists }.
-	resolvePhotoAlbum: function (creds, cb) {
-		var self = this, f = new Future();
-		var fbName = Config.PHOTO_ALBUM_NAME || "Pictures";
-		var fallback = { path: "disk:/" + fbName, name: fbName, exists: false };
-		var sf = this.getSystemFolders(creds, cb);
-		f.now(this, function () { return sf; });
-		f.then(this, function () {
-			var folders;
-			try { folders = sf.result || {}; } catch (e) { folders = {}; }
-			var ps = folders.photostream;
-			if (!ps) { f.result = fallback; return; }
-			var ppath = String(ps).replace(/\/+$/, "");
-			// photostream is listed even before first camera upload; probe with a RAW request
-			// (limit=0) and check the HTTP status directly. A 404 is EXPECTED (folder absent) -
-			// use a raw _req (which always resolves to {status,...}) rather than listFolder, so a
-			// missing folder never throws/hangs; on non-2xx we fall back to Pictures.
-			var purl = Config.API_BASE + "/resources?path=" + encodeURIComponent(ppath) + "&limit=0";
-			var probe = self._req({ method: "GET", url: purl }, creds, cb);
-			probe.then(self, function () {
-				var ok = false;
-				try { var r = probe.result; ok = !!(r && r.status >= 200 && r.status < 300); }
-				catch (e2) { ok = false; }
-				f.result = ok ? { path: ppath, name: self._leaf(ppath), exists: true } : fallback;
-			});
-		});
-		return f;
-	},
-
-	// PUT /resources?path=disk:/NAME -> create the album folder (device->cloud photo upload
-	// target when the aggregator supplies no albumId). 201 Created and 409 (already exists) are
-	// both success. Resolves to the folder path.
-	ensureAlbumFolder: function (creds, name, cb) {
-		var self = this, f = new Future();
-		var path = this._normPath(name);
-		var url = Config.API_BASE + "/resources?path=" + encodeURIComponent(path);
-		var call = this._req({ method: "PUT", url: url }, creds, cb);
-		call.then(this, function () {
-			try {
-				var r = call.result;
-				if (r && (r.status === 409 || (r.status >= 200 && r.status < 300))) {
-					f.result = path;
-				} else {
-					throw { returnValue: false, errorCode: "YANDEX_MKDIR_FAILED",
-						status: r && r.status, body: r && r.responseText };
-				}
-			} catch (e) { f.setException(e); }
-		});
-		return f;
-	},
-
-	// DELETE /resources?path=..&permanently=true -> remove a photo (Photos delete button).
-	// pid is the "disk:/.." locator listPhotos handed back. 204 (deleted) / 202 (async delete
-	// scheduled) / any 2xx = success; reject otherwise so the aggregator keeps the local copy.
-	deletePhoto: function (creds, fileId, cb) {
-		var self = this, f = new Future();
-		var url = Config.API_BASE + "/resources?path=" +
-			encodeURIComponent(this._normPath(fileId)) + "&permanently=true";
-		var call = this._req({ method: "DELETE", url: url }, creds, cb);
-		call.then(this, function () {
-			try {
-				var r = call.result;
-				if (r && (r.status === 204 || r.status === 202 ||
-					(r.status >= 200 && r.status < 300))) {
-					f.result = { deleted: true };
-				} else {
-					throw { returnValue: false, errorCode: "YANDEX_DELETE_FAILED",
-						status: r && r.status, body: r && r.responseText };
-				}
-			} catch (e) { f.setException(e); }
-		});
-		return f;
+	function normPath(p) {
+		if (!p || p === "/" || p === "root" || p === ROOT || p === config.ROOT_PATH) { return ROOT; }
+		const s = String(p);
+		if (s.indexOf("disk:/") === 0 || s.indexOf("app:/") === 0 || s.indexOf("trash:/") === 0) { return s; }
+		return "disk:/" + s.replace(/^\/+/, "");
 	}
-};
 
-if (typeof exports !== "undefined") { exports.Adapter = Adapter; }
+	function join(folder, name) {
+		const b = normPath(folder);
+		return (b.endsWith("/") ? b : b + "/") + String(name).replace(/^\/+/, "");
+	}
+
+	// An API request with the token. -> { status, body } (body parsed, {} when empty).
+	async function call(s, method, url, extra) {
+		const r = await s.authorized((token) => http.request(Object.assign({ method, url,
+			headers: { Authorization: "OAuth " + token } }, extra || {})));
+		if (!r.text) { return { status: r.status, body: {} }; }
+		try { return { status: r.status, body: JSON.parse(r.text) }; }
+		catch (e) { throw fail(ERROR, method + " " + new URL(url).pathname + ": the reply is not JSON", { status: r.status }); }
+	}
+
+	// The href of a /resources/download or /resources/upload reply.
+	async function href(s, step, p, query, noHref) {
+		const { body } = await call(s, "GET", API + "/resources/" + step + "?path=" + enc(p) + (query || ""));
+		if (!body || typeof body.href !== "string" || !body.href) { throw fail(noHref, "Yandex Disk gave no " + step + " link for " + p); }
+		return body;
+	}
+
+	// A 202's operation, polled to its end; anything else is done already.
+	async function settle(s, r) {
+		if (r.status !== 202) { return; }
+		const op = r.body && r.body.href;
+		if (typeof op !== "string" || op.indexOf(ORIGIN) !== 0) {
+			throw fail("YANDEX_BAD_OPERATION", "the operation link is not on " + ORIGIN);
+		}
+		for (let n = 0; ; n++) {
+			const st = ((await call(s, "GET", op)).body || {}).status;
+			if (st === "success") { return; }
+			if (st === "failed") { throw fail("YANDEX_OPERATION_FAILED", "Yandex Disk could not finish the operation"); }
+			if (n + 1 >= adapter.POLL_TRIES) {
+				throw fail("YANDEX_OPERATION_TIMEOUT", "the operation was still " + String(st) + " after " + adapter.POLL_TRIES + " polls");
+			}
+			await adapter.sleep(adapter.POLL_DELAY_MS);
+		}
+	}
+
+	async function entryAt(s, p) {
+		const { body } = await call(s, "GET", API + "/resources?path=" + enc(p) + "&limit=0");
+		return { entry: entry(body || {}) };
+	}
+
+	// Two steps: the upload href (overwrite true|false), then the file PUT to it without the token.
+	async function upload(s, dest, localPath, overwrite) {
+		const link = await href(s, "upload", dest, "&overwrite=" + (overwrite ? "true" : "false"), "YANDEX_NO_UPLOAD_HREF");
+		await http.request({ method: link.method || "PUT", url: link.href, file: localPath,
+			headers: { "Content-Type": "application/octet-stream" }, errorCode: "YANDEX_UPLOAD_FAILED" });
+		return { id: dest, path: dest, name: base(dest) };
+	}
+
+	const adapter = {
+		POLL_TRIES,
+		POLL_DELAY_MS,
+		sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+		normPath,
+		join,
+
+		// GET login.yandex.ru/info -> { user:{ emailAddress, displayName } }.
+		async getAccountInfo(s) {
+			const u = (await call(s, "GET", config.LOGIN_INFO_URL)).body || {};
+			return { user: { emailAddress: u.default_email || u.login, displayName: u.display_name || u.real_name } };
+		},
+
+		// GET /resources?path=&limit= -> entries, every page (&offset=) up to _embedded.total.
+		async listFolder(s, folderId) {
+			const p = normPath(folderId);
+			const size = config.LIST_LIMIT || 200;
+			const entries = [];
+			for (let page = 0; page < MAX_PAGES; page++) {
+				const { body } = await call(s, "GET", API + "/resources?path=" + enc(p) + "&limit=" + size +
+					(page ? "&offset=" + (page * size) : ""));
+				const emb = (body && body._embedded) || {};
+				const items = Array.isArray(emb.items) ? emb.items : [];
+				entries.push(...items.map(entry));
+				if (items.length < size || !(typeof emb.total === "number" && emb.total > entries.length)) { break; }
+			}
+			return { entries };
+		},
+
+		// The signed href of GET /resources/download, then its bytes to localDest.
+		async downloadFile(s, fileId, localDest) {
+			const link = await href(s, "download", normPath(fileId), "", "YANDEX_NO_DOWNLOAD_HREF");
+			await http.request({ method: link.method || "GET", url: link.href, toFile: localDest, errorCode: "YANDEX_DOWNLOAD_FAILED" });
+			return { path: localDest };
+		},
+
+		// A new file at folder/name, never over an existing one (overwrite=false: a 409).
+		uploadFile(s, folderId, localPath, name) { return upload(s, join(folderId, name), localPath, false); },
+
+		// Overwrite the file at fileId (a save-back).
+		uploadReplace(s, fileId, localPath) { return upload(s, normPath(fileId), localPath, true); },
+
+		async createFolder(s, parent, name) {
+			const p = join(parent, name);
+			await settle(s, await call(s, "PUT", API + "/resources?path=" + enc(p)));
+			return entryAt(s, p);
+		},
+
+		// toFolder null = rename in place; name null = keep the name; both = one move.
+		async moveItem(s, item, toFolder, name) {
+			const from = normPath(item);
+			const dst = join(toFolder ? toFolder : parentOf(from), (name === null || name === undefined) ? base(from) : name);
+			await settle(s, await call(s, "POST", API + "/resources/move?from=" + enc(from) + "&path=" + enc(dst) + "&overwrite=false"));
+			return entryAt(s, dst);
+		},
+
+		// To the Trash (deletePhoto is the one that deletes for good).
+		async deleteItem(s, item) {
+			await settle(s, await call(s, "DELETE", API + "/resources?path=" + enc(normPath(item))));
+			return {};
+		},
+
+		// --- Photos (photos.js, and the generic upload/deletePhoto) ----------------------------
+
+		// The signed download href of a photo, for the Photos service: { link, method }.
+		async getTemporaryLink(s, fileId) {
+			const link = await href(s, "download", normPath(fileId), "", "YANDEX_NO_DOWNLOAD_HREF");
+			return { link: link.href, method: link.method || "GET" };
+		},
+
+		// GET /v1/disk?fields=system_folders -> the server's localised system folders
+		// (photostream = camera uploads); {} when it cannot be had (disk.info not granted).
+		async getSystemFolders(s) {
+			try { return ((await call(s, "GET", API + "?fields=" + enc("system_folders"))).body || {}).system_folders || {}; }
+			catch (e) { return {}; }
+		},
+
+		// The album: Yandex's own camera-uploads folder (system_folders.photostream) when it is
+		// there, else disk:/<PHOTO_ALBUM_NAME>. Never fails. -> { path, name, exists }
+		async resolvePhotoAlbum(s) {
+			const fbName = config.PHOTO_ALBUM_NAME || "Pictures";
+			const fallback = { path: "disk:/" + fbName, name: fbName, exists: false };
+			const ps = (await adapter.getSystemFolders(s)).photostream;
+			if (!ps) { return fallback; }
+			const p = String(ps).replace(/\/+$/, "");
+			try { await call(s, "GET", API + "/resources?path=" + enc(p) + "&limit=0"); }
+			catch (e) { return fallback; }
+			return { path: p, name: leafName(p), exists: true };
+		},
+
+		// PUT /resources?path=disk:/<name>: the upload folder when the Photos service names none.
+		// 201, or 409 when it is there already.
+		async ensureAlbumFolder(s, name) {
+			const p = normPath(name);
+			await s.authorized((token) => http.request({ method: "PUT", url: API + "/resources?path=" + enc(p),
+				headers: { Authorization: "OAuth " + token }, accept: [409], errorCode: "YANDEX_MKDIR_FAILED" }));
+			return p;
+		},
+
+		// DELETE /resources?path=&permanently=true (the Photos delete button); any 2xx, a 202
+		// (scheduled) too, is done.
+		async deletePhoto(s, fileId) {
+			await s.authorized((token) => http.request({ method: "DELETE",
+				url: API + "/resources?path=" + enc(normPath(fileId)) + "&permanently=true",
+				headers: { Authorization: "OAuth " + token }, errorCode: "YANDEX_DELETE_FAILED" }));
+			return { deleted: true };
+		},
+	};
+	return adapter;
+}
+
+module.exports = Object.assign(createAdapter, { ERROR, POLL_TRIES, POLL_DELAY_MS, MAX_PAGES, describe, entry, parentOf, base, leafName });

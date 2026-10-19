@@ -1,9 +1,8 @@
 /* config.js - STRATO HiDrive OAuth2 + REST 2.1 endpoints for the modern connector.
  *
  * HiDrive is PATH-BASED like Yandex/Dropbox: a resource is addressed by an absolute path under
- * the account home ("/users/<user>/Folder/file.docx"). This connector mirrors the Yandex one
- * with HiDrive's identity platform and its home-path convention bolted on. Every API call sends
- * "Authorization: Bearer <access_token>" and shells through the modern curl (device node 0.9.8k).
+ * the account home ("/users/<user>/Folder/file.docx"). Every API call sends
+ * "Authorization: Bearer <access_token>", through node's own fetch (_cloudcore/node/http.js).
  *
  * REGISTER a native app at https://developer.hidrive.com/get-api-key/ (app type "native" -> you
  * get a client_secret AND refresh tokens; there is NO PKCE, so the secret ships in the package,
@@ -14,15 +13,16 @@
  * values in from HIDRIVE_CLIENT_ID / HIDRIVE_CLIENT_SECRET (meta-luneos
  * cloud-synergy-connector.inc); a package built without them cannot sign in. */
 var Config = {
-	// Modern-TLS HTTP: device node is OpenSSL 0.9.8k and cannot handshake with HiDrive, so ALL
-	// HiDrive HTTPS shells out to the bundled modern curl (same binary + CA store as the others).
+	// Not used by the service, which speaks HTTPS through node's own fetch (_cloudcore/node/
+	// http.js). The on-device harness (tests/suites/cloud.py tls_reachable) still runs this curl
+	// with this CA bundle to check the provider can be reached, so the keys stay.
 	CURL:                 "/usr/bin/curl",
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
 
 	CLIENT_ID:     "PLACEHOLDER_HIDRIVE_CLIENT_ID", // from the build, see config.js header
 	// REQUIRED for HiDrive (no PKCE - the token exchange must send the secret). It ships in the
-	// package; oauth2.js sends it because it is not left as the PLACEHOLDER sentinel.
+	// package; _cloudcore/node/oauth.js sends it because it is not left as the PLACEHOLDER sentinel.
 	CLIENT_SECRET: "PLACEHOLDER_HIDRIVE_CLIENT_SECRET", // from the build, see config.js header
 	// HiDrive "native" apps require a localhost redirect WITH a port (http://localhost:<port>).
 	// The cloud-auth webview captures it by URL-prefix match, so nothing listens on the port -
@@ -39,13 +39,13 @@ var Config = {
 	USER_INFO_PATH: "/user/me?fields=account,alias,email,descr,home,home_id",
 
 	ROOT_FOLDER: "home",   // sentinel: adapter maps it to the account home path from /user/me
-	LIST_LIMIT:  5000,     // /dir members page size (adapter pages with offset,count)
+	LIST_LIMIT:  5000,     // /dir members page size (adapter pages with limit=offset,count)
 
 	// Photos (PHOTO.UPLOAD): HiDrive has no camera-uploads API, so one named folder under home is
 	// surfaced as one album (created on first device->cloud upload).
 	PHOTO_ALBUM_NAME: "Camera Uploads",
 
-	// --- _cloudcore generic wiring (consumed by ../_cloudcore) --------------------------
+	// --- _cloudcore generic wiring (read by _cloudcore/node) ----------------------------
 	SERVICE_NAME:  "com.palm.service.hidrive",
 	DISPLAY_NAME:  "HiDrive",
 	STATE:         "hidrive",

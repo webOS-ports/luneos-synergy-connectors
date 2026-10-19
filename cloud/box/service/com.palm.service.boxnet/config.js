@@ -1,20 +1,22 @@
-/* config.js - Box (box.com) OAuth2 + REST v2 endpoints for the modern connector.
+/* config.js - Box (box.com) OAuth2 + REST v2 endpoints.
  * Mirrors com.palm.service.dropbox/config.js. Box differs from Dropbox in two ways:
  * it is REST (GET /folders/{id}/items) not RPC, and it addresses everything by
  * numeric ID (root folder id = "0") rather than by path.
  *
  * The Box app (https://app.box.com/developers/console, Custom App -> "User
  * Authentication (OAuth 2.0)") lists REDIRECT_URI verbatim among its OAuth 2.0 Redirect
- * URIs. oauth2.js sends PKCE and CLIENT_SECRET: Box's token endpoint refuses a code
- * without the secret ("invalid_client").
+ * URIs. _cloudcore/node/oauth.js sends PKCE and CLIENT_SECRET: Box's token endpoint refuses a
+ * code without the secret ("invalid_client").
  *
  * The app's id and secret are not kept here. The build fills in the two placeholders
  * from BOX_CLIENT_ID / BOX_CLIENT_SECRET (meta-luneos cloud-synergy-connector.inc); a
  * package built without them cannot sign in.
  */
+/* A plain file the build patches (sed on the PLACEHOLDER_ lines), read with require(). */
 var Config = {
-	// Modern-TLS HTTP: device node is OpenSSL 0.9.8k, so ALL Box HTTPS shells out to
-	// the bundled modern curl (same binary + system CA store the Dropbox connector uses).
+	// Not used by the service, which speaks HTTPS through node's own fetch (_cloudcore/node/
+	// http.js). The on-device harness (tests/suites/cloud.py tls_reachable) still runs this curl
+	// with this CA bundle to check the provider can be reached, so the keys stay.
 	CURL:                 "/usr/bin/curl",
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
@@ -36,7 +38,7 @@ var Config = {
 	// "root" scope = full read/write to the user's own content.
 	SCOPE:         "root_readwrite",
 
-	// --- _cloudcore generic wiring (consumed by ../_cloudcore) --------------------------
+	// --- _cloudcore generic wiring (read by _cloudcore/node) ----------------------------
 	SERVICE_NAME:  "com.palm.service.boxnet",
 	DISPLAY_NAME:  "Box",
 	STATE:         "box",

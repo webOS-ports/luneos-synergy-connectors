@@ -13,16 +13,15 @@
  *     so exchangeCode can fetch the account email for the `username`.
  * Paste the app ID + secret into CLIENT_ID / CLIENT_SECRET. PKCE is also sent (S256),
  * so a build MAY run as a public client (leave CLIENT_SECRET as the placeholder and it
- * is never sent - see oauth2.js _hasSecret).
+ * is never sent - see _cloudcore/node/oauth.js hasSecret).
  */
 /* The OAuth app's credentials are not kept here. The build fills the PLACEHOLDER_YANDEX_*
  * values in from YANDEX_CLIENT_ID / YANDEX_CLIENT_SECRET (meta-luneos
  * cloud-synergy-connector.inc); a package built without them cannot sign in. */
 var Config = {
-	// Modern-TLS HTTP: the device node is OpenSSL 0.9.8k and cannot handshake with
-	// cloud-api.yandex.net / oauth.yandex.com, so ALL Yandex HTTPS is shelled out to the
-	// modern system curl (same binary + system CA store the Dropbox/OneDrive connectors
-	// use): /usr/bin/curl, curl 7.88.1 + OpenSSL 1.1.1w (TLS 1.3), from the OpenSSL-11 update.
+	// Not used by the service, which speaks HTTPS through node's own fetch (_cloudcore/node/
+	// http.js). The on-device harness (tests/suites/cloud.py tls_reachable) still runs this curl
+	// with this CA bundle to check the provider can be reached, so the keys stay.
 	CURL:                 "/usr/bin/curl",
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
@@ -30,7 +29,7 @@ var Config = {
 	CLIENT_ID:     "PLACEHOLDER_YANDEX_CLIENT_ID", // from the build, see config.js header
 	// Yandex is a confidential client: the secret IS sent on the token exchange/refresh.
 	// If a build wants a pure public (PKCE-only) client, leave this placeholder and
-	// oauth2.js will never send a secret (it also sends an S256 code_challenge).
+	// _cloudcore/node/oauth.js never sends a secret (it also sends an S256 code_challenge).
 	CLIENT_SECRET: "PLACEHOLDER_YANDEX_CLIENT_SECRET", // from the build, see config.js header
 	REDIRECT_URI:  "http://localhost/yandex/oauth2callback",
 
@@ -44,7 +43,7 @@ var Config = {
 	LOGIN_INFO_URL: "https://login.yandex.ru/info?format=json",
 
 	ROOT_PATH:     "disk:/",   // Disk root; "/" and "" normalise to this
-	LIST_LIMIT:    200,        // resources?limit=
+	LIST_LIMIT:    200,        // resources?limit= (the adapter pages with &offset=)
 
 	// Photos (PHOTO.UPLOAD) role: the album surfaced to the Photos app. resolvePhotoAlbum
 	// prefers Yandex's own camera-uploads folder (system_folders.photostream) when it exists,
@@ -54,7 +53,7 @@ var Config = {
 	// Space-separated. disk.read/write/info = files; login:email/info = account identity.
 	SCOPE:         "cloud_api:disk.read cloud_api:disk.write cloud_api:disk.info login:email login:info",
 
-	// --- _cloudcore generic wiring (consumed by ../_cloudcore) --------------------------
+	// --- _cloudcore generic wiring (read by _cloudcore/node) ----------------------------
 	SERVICE_NAME:  "com.palm.service.yandexdisk",
 	DISPLAY_NAME:  "Yandex Disk",
 	STATE:         "yandex",
