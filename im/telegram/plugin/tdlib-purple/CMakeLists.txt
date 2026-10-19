@@ -61,6 +61,25 @@ if (NOT NoWebp)
     link_directories(${libwebp_LIBRARY_DIRS} ${libpng_LIBRARY_DIRS})
 endif (NOT NoWebp)
 
+# The SkypeKit video bridge is a link-time swap, not an #ifdef. voipkit.cpp binds directly to
+# libpalmgstskype.so -- a gstreamer-0.10 plugin that exists only in legacy webOS firmware -- and
+# voipkit_none.c is the null backend offering the same five entry points. call-luna.cpp and
+# voipkit-tgvoip.cpp call those entry points with no NoVoip guard at the call sites, so exactly
+# one of the two must always be compiled in.
+#
+# This is the seam purple-combined (WA_VOIPKIT=0) and purple-teams (TEAMS_VOIPKIT=0) already use.
+# tdlib-purple was the only one of the three compiling voipkit.cpp unconditionally, which left its
+# Sid:: references undefined in the finished plugin; two of those are data rather than functions,
+# so libpurple could not dlopen it at all and prpl-telegram was never registered. See the note at
+# the top of voipkit_none.c for the measured failure.
+set(SkypeKitFwRootfs "" CACHE STRING "webOS firmware rootfs path (for libpalmgstskype.so)")
+if (SkypeKitFwRootfs STREQUAL "")
+    set(VoipKitSource voipkit_none.c)
+    message(STATUS "SkypeKitFwRootfs unset: building with the null video backend (voipkit_none.c)")
+else (SkypeKitFwRootfs STREQUAL "")
+    set(VoipKitSource voipkit.cpp)
+endif (SkypeKitFwRootfs STREQUAL "")
+
 configure_file(buildopt.h.in buildopt.h)
 configure_file(config.cpp.in config.cpp)
 
@@ -80,7 +99,7 @@ add_library(telegram-tdlib SHARED
     call-luna.cpp
     identifiers.cpp
     secret-chat.cpp
-    voipkit.cpp
+    ${VoipKitSource}
     voipkit-tgvoip.cpp
     h264_rtp.c
 )
@@ -178,7 +197,7 @@ if (NOT NoVoip)
     # -Wl,-rpath (not just -rpath-link) bakes /usr/lib/gstreamer-0.10 into the built .so's own
     # runtime search path so it finds libpalmgstskype.so on-device unconditionally, the same
     # robustness fix used for the WhatsApp plugin's build-combined.sh.
-    set(SkypeKitFwRootfs "" CACHE STRING "webOS firmware rootfs path (for libpalmgstskype.so)")
+    # SkypeKitFwRootfs is declared above, where it also picks ${VoipKitSource}.
     if (NOT SkypeKitFwRootfs STREQUAL "")
         target_link_libraries(telegram-tdlib PRIVATE palmgstskype)
         target_link_options(telegram-tdlib PRIVATE
