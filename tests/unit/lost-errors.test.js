@@ -11,11 +11,8 @@
 // multi-step operations (MEGA's tree then command...)
 // fail as well as the first one. The Future the entry point returns must settle with an error.
 //
-// multi-step operations (MEGA's tree then command...)
-// fail as well as the first one. The Future the entry point returns must settle with an error.
-//
-// Dropbox, Box, Flickr, kDrive, Koofr, pCloud and S3 are not here: they run on _cloudcore/node (async/await, no Futures), and
-// dropbox.test.js, box.test.js, flickr.test.js, kdrive.test.js, koofr.test.js, pcloud.test.js and s3.test.js do the same to them over the bus.
+// Dropbox, Box, Flickr, HiDrive, kDrive, Koofr, pCloud, S3 and Yandex are not here: they run on _cloudcore/node
+// (async/await, no Futures), and their own test files do the same to them over the bus.
 //
 // The stand-in Future follows future.js on the point that matters: a throw inside a then()
 // callback stays on that Future. Set FOUNDATIONS_FUTURE to the path of Foundations'
@@ -204,55 +201,6 @@ const CONNECTORS = {
 		["moveItem (to the root)", (A, c) => A.moveItem(c, "F", "root", null, () => {}), { minSteps: 2 }],
 		["deleteItem", (A, c) => A.deleteItem(c, "F", () => {})],
 	] },
-	hidrive: { dir: "hidrive", creds: OAUTH,
-		reply: () => (o) => {
-			if (/\/user\/me/.test(o.url)) { return ok({ home: "/users/me", email: "u@example.test" }); }
-			if (/\/meta\?/.test(o.url)) { return ok({ type: "file" }); }
-			if (o.method === "POST" && /\/dir\?/.test(o.url)) { return ok({}, 201); }
-			return ok();
-		},
-		entries: [
-			["getAccountInfo", (A, c) => A.getAccountInfo(c, () => {})],
-			["listFolder (home)", (A, c) => A.listFolder(c, "home", () => {}), { minSteps: 2 }],
-			["listFolder (a path)", (A, c) => A.listFolder(c, "/users/me/x", () => {})],
-			["downloadFile", (A, c) => A.downloadFile(c, "/users/me/a.jpg", dl(), null, () => {})],
-			["uploadFile", (A, c) => A.uploadFile(c, "home", LOCAL, "n.bin", null, () => {}), { minSteps: 2 }],
-			["uploadReplace", (A, c) => A.uploadReplace(c, "/users/me/a.jpg", LOCAL, null, () => {})],
-			["createFolder", (A, c) => A.createFolder(c, "home", "n", () => {}), { minSteps: 2 }],
-			["moveItem (rename)", (A, c) => A.moveItem(c, "/users/me/a.jpg", null, "b.jpg", () => {}), { minSteps: 2 }],
-			["moveItem (move)", (A, c) => A.moveItem(c, "/users/me/a.jpg", "/users/me/d", null, () => {}), { minSteps: 2 }],
-			["deleteItem", (A, c) => A.deleteItem(c, "/users/me/a.jpg", () => {}), { minSteps: 2 }],
-			["deletePhoto", (A, c) => A.deletePhoto(c, "/users/me/a.jpg", () => {})],
-			["ensureAlbumFolder", (A, c) => A.ensureAlbumFolder(c, "Album", () => {}), { minSteps: 2 }],
-			["photoAlbums", (A, c) => A.photoAlbums(c, () => {}), { tolerant: true, minSteps: 2 }],
-			["resolvePhotoAlbum", (A, c) => A.resolvePhotoAlbum(c, () => {}), { tolerant: true, minSteps: 2 }],
-		] },
-	yandex: { dir: "yandex", creds: OAUTH,
-		reply: () => (o) => {
-			if (/\/resources\/(download|upload)\?/.test(o.url)) {
-				return ok({ href: "https://dl.example.test/x", method: /upload/.test(o.url) ? "PUT" : "GET" });
-			}
-			if (o.method === "PUT" && /\/resources\?path=disk%3A%2Fasync/.test(o.url)) {
-				return ok({ href: "https://cloud-api.yandex.net/v1/disk/operations/1" }, 202);
-			}
-			if (/\/operations\//.test(o.url)) { return ok({ status: "success" }); }
-			return ok({}, o.method === "DELETE" ? 204 : (o.method === "GET" ? 200 : 201));
-		},
-		entries: [
-			["getAccountInfo", (A, c) => A.getAccountInfo(c, () => {})],
-			["listFolder", (A, c) => A.listFolder(c, "disk:/", () => {})],
-			["downloadFile", (A, c) => A.downloadFile(c, "disk:/a.jpg", dl(), null, () => {}), { minSteps: 2 }],
-			["uploadFile", (A, c) => A.uploadFile(c, "disk:/", LOCAL, "n.bin", null, () => {}), { minSteps: 2 }],
-			["uploadReplace", (A, c) => A.uploadReplace(c, "disk:/a.jpg", LOCAL, null, () => {}), { minSteps: 2 }],
-			["createFolder", (A, c) => A.createFolder(c, "disk:/", "n", () => {}), { minSteps: 2 }],
-			["createFolder (an operation to poll)", (A, c) => A.createFolder(c, "disk:/", "async", () => {}), { minSteps: 3 }],
-			["moveItem", (A, c) => A.moveItem(c, "disk:/a.jpg", "disk:/d", null, () => {}), { minSteps: 2 }],
-			["deleteItem", (A, c) => A.deleteItem(c, "disk:/a.jpg", () => {})],
-			["deletePhoto", (A, c) => A.deletePhoto(c, "disk:/a.jpg", () => {})],
-			["ensureAlbumFolder", (A, c) => A.ensureAlbumFolder(c, "Album", () => {})],
-			["getTemporaryLink", (A, c) => A.getTemporaryLink(c, "disk:/a.jpg", () => {})],
-			["resolvePhotoAlbum", (A, c) => A.resolvePhotoAlbum(c, () => {}), { tolerant: true }],
-		] },
 	mega: { dir: "mega", creds: MEGA.creds, files: ["megacrypto.js", "megaapi.js"],
 		setup: (ctx) => { ctx.Config.PHOTO_TMP_DIR = TMP; },
 		reply: () => (o) => {
@@ -337,7 +285,7 @@ function command(files, ctor, args, extra = {}) {
 	return future;
 }
 
-const PHOTO_SERVICES = ["hidrive", "mega", "onedrive", "yandex"];
+const PHOTO_SERVICES = ["mega", "onedrive"];
 for (const svc of PHOTO_SERVICES) {
 	const dir = serviceDir(svc);
 	for (const [file, ctor] of [["listAlbums_command.js", "ListAlbumsCommandAssistant"],

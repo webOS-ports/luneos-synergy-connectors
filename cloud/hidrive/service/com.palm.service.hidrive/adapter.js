@@ -1,456 +1,241 @@
-/*global IMPORTS, Config, OAuth2, HttpCurl, console */
-/* adapter.js - STRATO HiDrive provider ADAPTER for _cloudcore. HiDrive is PATH-BASED: a node is
- * addressed by an absolute path under the account HOME ("/users/<user>/Folder/file.docx"), so a
- * locator handed to consumers IS a path; the ROOT_FOLDER sentinel "home" maps to the account home
- * discovered from /user/me. Every request sends "Authorization: Bearer <token>" with transparent
- * refresh-on-401 (HiDrive access tokens live 1h; the native-app refresh token renews them). All
- * HTTPS runs through the modern curl (device node is 0.9.8k).
+/* adapter.js - STRATO HiDrive REST 2.1 for _cloudcore/node (commands.js there has the interface).
  *
- * Exposes the uniform _cloudcore adapter interface (normalised shapes) plus the PHOTO.UPLOAD
- * helpers. getTemporaryLink hands back a "/file?path=..&access_token=.." URL for the Photos
- * aggregator's curl (see the note on that method).
+ * HiDrive is path based: a node is addressed by its absolute path under the account home
+ * ("/users/<user>/Folder/file.docx"), which listFolder hands out as each entry's id and path.
+ * The root locator "home" (Config.ROOT_FOLDER, and what the generic commands use when given no
+ * folder) is the account home, read from GET /user/me and kept per access token. HiDrive
+ * answers names and paths URL-encoded ("a%20b.pdf"); they are decoded on the way in, so a
+ * locator is a plain path and is encoded exactly once when it goes into a URL.
+ *
+ * Every call runs through the session (s.authorized): "Authorization: Bearer <token>", one
+ * refresh and retry on a 401 (the refresh sends Config.CLIENT_SECRET: HiDrive's native apps are
+ * confidential clients). A reply outside 2xx is HIDRIVE_API_ERROR with its status and body,
+ * except where the old adapter had its own code: HIDRIVE_DOWNLOAD_FAILED (GET /file),
+ * HIDRIVE_MKDIR_FAILED (the album folder) and HIDRIVE_DELETE_FAILED (deletePhoto).
+ *
+ * The file operations (https://api.hidrive.strato.com/2.1/static/apidoc/api.json):
+ *   POST /dir?path=                        create (201, the new dir's metadata)
+ *   POST /file|dir/rename?path=&name=      rename in place
+ *   POST /file|dir/move?src=&dst=          move, dst = the object's NEW full path
+ *   DELETE /file?path= | /dir?path=&recursive=true
+ * A path does not say whether it is a file or a directory and those endpoints are per type, so
+ * moveItem and deleteItem ask GET /meta?path=&fields=type first. No on_exist is sent: a name
+ * that is taken fails with 409 instead of overwriting or renaming. There is no trash in the 2.1
+ * API: deleteItem deletes for good.
  */
-var Foundations = IMPORTS.foundations;
-var Future = Foundations.Control.Future;
+"use strict";
 
-var Adapter = {
-	_homeByToken: {},
+const ERROR = "HIDRIVE_API_ERROR";
+const HOME = "home";
+const MAX_PAGES = 40;          // listFolder: at most this many LIST_LIMIT pages
+const HOME_CACHE_MAX = 32;
 
-	_enc: function (p) { return encodeURIComponent(p); },
-	// HiDrive returns member name/path URL-ENCODED (spaces as %20 etc). Decode on the way in so
-	// display names are clean and _enc re-encodes exactly once when the path is used as a locator.
-	_dec: function (p) { try { return decodeURIComponent(String(p == null ? "" : p)); } catch (e) { return p; } },
-	_leaf: function (p) {
-		var s = String(p == null ? "" : p).replace(/\/+$/, "");
-		var i = s.lastIndexOf("/"); return (i >= 0) ? s.substring(i + 1) : s;
-	},
-	_dirOf: function (p) {
-		var s = String(p).replace(/\/+$/, ""); var i = s.lastIndexOf("/");
-		return (i > 0) ? s.substring(0, i) : "/";
-	},
-	_mime: function (name, isFolder) {
-		if (isFolder) { return "application/x-directory"; }
-		var m = /\.([a-z0-9]+)$/i.exec(name || ""); var ext = m ? m[1].toLowerCase() : "";
-		var map = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif",
-			bmp: "image/bmp", heic: "image/heic", webp: "image/webp", pdf: "application/pdf" };
-		return map[ext] || null;
-	},
+const enc = (p) => encodeURIComponent(p);
 
-	// Authenticated HttpCurl call with transparent refresh-on-401. opts: { method, url, headers,
-	// outFile, dataFile }. Resolves to the raw HttpCurl result { status, responseText }.
-	_authCall: function (creds, opts, onRenewed) {
-		var self = this, f = new Future();
-		function fire(c) {
-			var o = { method: opts.method || "GET", url: opts.url,
-				headers: { "Authorization": "Bearer " + c.accessToken } };
-			if (opts.headers) { Object.keys(opts.headers).forEach(function (k) { o.headers[k] = opts.headers[k]; }); }
-			if (opts.outFile) { o.outFile = opts.outFile; o.follow = true; }
-			if (opts.dataFile) { o.dataFile = opts.dataFile; }
-			return HttpCurl.request(o);
-		}
-		var call = fire(creds);
-		f.now(this, function () { return call; });
-		f.then(this, function () {
-			var r = call.result;
-			if (r && r.status === 401 && creds.refreshToken) {
-				var rf = OAuth2.refresh(creds.refreshToken);
-				rf.then(self, function () {
-					// A refresh that failed, or anything thrown here, fails f: thrown inside rf's or retry's
-					// callback it would stay on that Future, and the request would never answer.
-					try {
-						var t = null, tErr = null;
-						try { t = rf.result; } catch (e) { tErr = e; }
-						if (tErr) { f.setException(tErr); return; }
-						var nc = { accessToken: t.accessToken,
-							refreshToken: t.refreshToken || creds.refreshToken,
-							expiresAt: Date.now() + (t.expiresIn * 1000) };
-						if (onRenewed) { onRenewed(nc); }
-						var retry = fire(nc);
-						retry.then(self, function () {
-							try { f.result = retry.result; }
-							catch (e2) { f.setException(e2); }
-						});
-					} catch (e) { f.setException(e); }
-				});
-				return;
-			}
-			f.result = r;
-		});
-		return f;
-	},
+// HiDrive's URL-encoded names and paths, decoded ("" for none; as is when not valid encoding).
+function dec(p) {
+	const s = String(p === undefined || p === null ? "" : p);
+	try { return decodeURIComponent(s); } catch (e) { return s; }
+}
 
-	_parse: function (r) {
-		if (!r || r.status < 200 || r.status >= 300) {
-			throw { returnValue: false, errorCode: "HIDRIVE_API_ERROR",
-				status: r && r.status, body: r && r.responseText };
-		}
-		return r.responseText ? JSON.parse(r.responseText) : {};
-	},
+function leaf(p) {
+	const s = String(p === undefined || p === null ? "" : p).replace(/\/+$/, "");
+	const i = s.lastIndexOf("/");
+	return i >= 0 ? s.substring(i + 1) : s;
+}
 
-	// GET /user/me -> identity + home path (cached per token for path resolution).
-	getAccountInfo: function (creds, cb) {
-		var self = this, f = new Future();
-		var call = this._authCall(creds, { method: "GET", url: Config.API_BASE + Config.USER_INFO_PATH }, cb);
-		call.then(this, function () {
-			try {
-				var u = self._parse(call.result) || {};
-				if (u.home) { self._homeByToken[creds.accessToken] = u.home; }
-				f.result = { user: {
-					emailAddress: u.email || u.account,
-					displayName:  u.alias || u.descr || u.email
-				} };
-			} catch (e) { f.setException(e); }
-		});
-		return f;
-	},
+function dirOf(p) {
+	const s = String(p).replace(/\/+$/, "");
+	const i = s.lastIndexOf("/");
+	return i > 0 ? s.substring(0, i) : "/";
+}
 
-	// Resolve the account home path (root sentinel target). Cached; else fetched via /user/me.
-	_ensureHome: function (creds, cb) {
-		var self = this, f = new Future();
-		var cached = this._homeByToken[creds.accessToken];
-		if (cached) { f.result = cached; return f; }
-		var info = this.getAccountInfo(creds, cb);
-		f.now(this, function () { return info; });
-		f.then(this, function () {
-			try { info.result; } catch (e) { f.setException(e); return; }
-			f.result = self._homeByToken[creds.accessToken] || "/";
-		});
-		return f;
-	},
+// dir + "/" + name, without doubling a slash on either side.
+function child(dir, name) { return String(dir).replace(/\/+$/, "") + "/" + String(name).replace(/^\/+/, ""); }
 
-	_resolve: function (creds, folderId, cb) {
-		var self = this, f = new Future();
-		if (folderId && folderId !== "home" && folderId !== Config.ROOT_FOLDER) { f.result = folderId; return f; }
-		var h = this._ensureHome(creds, cb);
-		f.now(this, function () { return h; });
-		f.then(this, function () { try { f.result = h.result; } catch (e) { f.setException(e); } });
-		return f;
-	},
+const MIME = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif",
+	bmp: "image/bmp", heic: "image/heic", webp: "image/webp", pdf: "application/pdf" };
 
-	// GET /dir?path=..&members=all&fields=.. -> normalised entries.
-	listFolder: function (creds, folderId, cb) {
-		var self = this, f = new Future();
-		var pf = this._resolve(creds, folderId, cb);
-		f.now(this, function () { return pf; });
-		f.then(this, function () {
-			var pathVal;
-			try { pathVal = pf.result; } catch (e0) { f.setException(e0); return; }
-			// NB: HiDrive `fields` describes the DIRECTORY itself; child rows come from the
-			// `members.<field>` namespace (a plain `fields=name,type,..` list returns only the
-			// folder's own metadata with no members[] at all). Ask for members + their fields.
-			var url = Config.API_BASE + "/dir?path=" + self._enc(pathVal) +
-				"&members=all&fields=members.name,members.type,members.size,members.mtime,members.path,members.id" +
-				"&limit=0," + (Config.LIST_LIMIT || 5000);
-			var call = self._authCall(creds, { method: "GET", url: url }, cb);
-			call.then(self, function () {
-				try {
-					var res = self._parse(call.result) || {};
-					var members = res.members || [];
-					f.result = { entries: members.map(function (m) { return self._entry(m); }) };
-				} catch (e) { f.setException(e); }
-			});
-		});
-		return f;
-	},
+function mimeOf(name, isFolder) {
+	if (isFolder) { return "application/x-directory"; }
+	const m = /\.([a-z0-9]+)$/i.exec(name || "");
+	return MIME[m ? m[1].toLowerCase() : ""] || null;
+}
 
-	// One HiDrive member/meta object -> the normalised entry listFolder hands out (id = path).
-	_entry: function (m) {
-		var isFolder = (m.type === "dir");
-		var name = this._dec(m.name), path = this._dec(m.path);
-		return { id: path, type: (isFolder ? "folder" : "file"),
-			name: name, size: m.size || 0,
-			modified: m.mtime ? (m.mtime * 1000) : 0, path: path,
-			mimeType: this._mime(name, isFolder) };
-	},
+// One HiDrive member/meta object -> the listFolder entry (id = the decoded path).
+function entry(m) {
+	const isFolder = m.type === "dir";
+	const name = dec(m.name), p = dec(m.path);
+	return { id: p, type: isFolder ? "folder" : "file", name, size: m.size || 0,
+		modified: m.mtime ? m.mtime * 1000 : 0, path: p, mimeType: mimeOf(name, isFolder) };
+}
 
-	// GET /file?path=.. -> bytes to disk.
-	downloadFile: function (creds, fileId, localDest, exportMime, cb) {
-		var self = this, f = new Future();
-		var url = Config.API_BASE + "/file?path=" + this._enc(fileId);
-		var call = this._authCall(creds, { method: "GET", url: url, outFile: localDest }, cb);
-		call.then(this, function () {
-			try {
-				var r = call.result;
-				if (!r || r.status < 200 || r.status >= 300) {
-					throw { returnValue: false, errorCode: "HIDRIVE_DOWNLOAD_FAILED", status: r && r.status };
-				}
-				f.result = { path: localDest };
-			} catch (e) { f.setException(e); }
-		});
-		return f;
-	},
+// The entry of an operation's metadata reply; the path the call addressed where it has none.
+function opEntry(m, p) {
+	const e = entry(m || {});
+	if (!m || !m.path) { e.id = e.path = p; }
+	if (!m || !m.name) { e.name = leaf(e.path); e.mimeType = mimeOf(e.name, e.type === "folder"); }
+	return { entry: e };
+}
 
-	// PUT /file?dir=..&name=.. -> create-or-overwrite the file with the local bytes.
-	uploadFile: function (creds, folderId, localPath, name, mimeType, cb) {
-		var self = this, f = new Future();
-		var pf = this._resolve(creds, folderId, cb);
-		f.now(this, function () { return pf; });
-		f.then(this, function () {
-			var dir;
-			try { dir = pf.result; } catch (e0) { f.setException(e0); return; }
-			// nest: Foundations stores a Future assigned to .result as the result itself.
-			f.nest(self._put(creds, dir, name, localPath, cb));
-		});
-		return f;
-	},
-	// Overwrite an existing file by path (QuickOffice save-back) - split into dir + name.
-	uploadReplace: function (creds, fileId, localPath, mimeType, cb) {
-		return this._put(creds, this._dirOf(fileId), this._leaf(fileId), localPath, cb);
-	},
-	_put: function (creds, dir, name, localPath, cb) {
-		var self = this, f = new Future();
-		var url = Config.API_BASE + "/file?dir=" + this._enc(dir) + "&name=" + this._enc(name);
-		var call = this._authCall(creds, { method: "PUT", url: url, dataFile: localPath,
-			headers: { "Content-Type": "application/octet-stream" } }, cb);
-		call.then(this, function () {
-			try {
-				var meta = self._parse(call.result) || {};
-				f.result = { id: meta.path || (dir + "/" + name), path: meta.path || (dir + "/" + name),
-					name: meta.name || name, size: meta.size };
-			} catch (e) { f.setException(e); }
-		});
-		return f;
-	},
+// The errorText of a HiDrive error reply ({ code, msg }): its msg where it has one.
+function describe(status, body) {
+	let msg = "";
+	try { const j = JSON.parse(body); msg = (j && typeof j.msg === "string") ? j.msg : ""; }
+	catch (e) { msg = String(body || "").replace(/\s+/g, " ").trim(); }
+	return "HiDrive answered HTTP " + status + (msg ? ": " + msg.slice(0, 200) : "");
+}
 
-	// --- File-manager operations (fileOps_commands.js) ----------------------------------
-	// HiDrive REST 2.1 (https://api.hidrive.strato.com/2.1/static/apidoc/api.json):
-	//   POST /dir?path=          create (201, the new dir's metadata)
-	//   POST /file|dir/rename?path=&name=      rename in place (200/201, the object's metadata)
-	//   POST /file|dir/move?src=&dst=          move, dst = the object's NEW full path (200)
-	//   DELETE /file?path= | /dir?path=&recursive=true   (204)
-	// There is no trash in the 2.1 API, so deleteItem deletes for good. A path does not say
-	// whether it is a file or a directory and every endpoint above is per type, so moveItem and
-	// deleteItem first ask GET /meta?path=&fields=type (one small request; /fs/move cannot
-	// rename and /fs/delete answers a multi-status batch). No on_exist is sent: a name that is
-	// already taken fails with 409 instead of overwriting or auto-renaming.
+function createAdapter({ config, http }) {
+	const API = config.API_BASE;
+	const homes = new Map();   // access token -> home path
 
-	// The credentials to use after a refresh: later requests of one operation use the renewed
-	// token instead of hitting 401 again with the old one.
-	_tracker: function (creds, cb) {
-		var t = { creds: creds };
-		t.renew = function (nc) { t.creds = nc; if (cb) { cb(nc); } };
-		return t;
-	},
+	// An authorized request whose reply is JSON ({} when empty).
+	const api = (s, method, url, extra) => s.authorized((token) =>
+		http.json(Object.assign({ method, url, bearer: token }, extra || {})));
 
-	// Authenticated request -> Future of the parsed JSON body; a non-2xx is a failed Future.
-	_api: function (t, method, url) {
-		var self = this, f = new Future();
-		var call = this._authCall(t.creds, { method: method, url: url }, t.renew);
-		call.then(this, function () {
-			try { f.result = self._parse(call.result) || {}; } catch (e) { f.setException(e); }
-		});
-		return f;
-	},
+	async function ensureHome(s) {
+		const cached = homes.get(s.accessToken);
+		if (cached) { return cached; }
+		await adapter.getAccountInfo(s);
+		return homes.get(s.accessToken) || "/";
+	}
+
+	// A folder locator -> its path: the root ("" or "home") is the home; a Photos album id
+	// (listAlbums hands out the path URL-encoded, "%2Fusers%2F...") is decoded back.
+	async function resolve(s, folderId) {
+		if (!folderId || folderId === HOME || folderId === config.ROOT_FOLDER) { return ensureHome(s); }
+		const f = String(folderId);
+		return /^%2F/i.test(f) ? dec(f) : f;
+	}
 
 	// "dir" or "file" (a symlink is handled through the /file endpoints).
-	_kind: function (t, p) {
-		var f = new Future();
-		var meta = this._api(t, "GET", Config.API_BASE + "/meta?path=" + this._enc(p) + "&fields=type");
-		meta.then(this, function () {
-			try { f.result = (meta.result.type === "dir") ? "dir" : "file"; } catch (e) { f.setException(e); }
-		});
-		return f;
-	},
-
-	_child: function (dir, name) { return String(dir).replace(/\/+$/, "") + "/" + name; },
-
-	// Entry from an operation's metadata reply; falls back to the path the call addressed.
-	_opEntry: function (m, path) {
-		var e = this._entry(m || {});
-		if (!m || !m.path) { e.id = e.path = path; }
-		if (!m || !m.name) { e.name = this._leaf(e.path); e.mimeType = this._mime(e.name, e.type === "folder"); }
-		return { entry: e };
-	},
-
-	createFolder: function (creds, parent, name, cb) {
-		var self = this, f = new Future(), t = this._tracker(creds, cb);
-		var pf = this._resolve(creds, parent, t.renew);
-		pf.then(this, function () {
-			var dir;
-			try { dir = pf.result; } catch (e0) { f.setException(e0); return; }
-			var path, call;
-			// In a try: pf is not f, so a throw in this callback would stay on pf.
-			try {
-				path = self._child(dir, name);
-				call = self._api(t, "POST", Config.API_BASE + "/dir?path=" + self._enc(path));
-			} catch (e1) { f.setException(e1); return; }
-			call.then(self, function () {
-				try { f.result = self._opEntry(call.result, path); } catch (e) { f.setException(e); }
-			});
-		});
-		return f;
-	},
-
-	// toFolder null = rename in place; name null = keep the name; both = move and rename at once.
-	moveItem: function (creds, item, toFolder, name, cb) {
-		var self = this, f = new Future(), t = this._tracker(creds, cb);
-		var kf = this._kind(t, item);
-		kf.then(this, function () {
-			var kind;
-			try { kind = kf.result; } catch (e0) { f.setException(e0); return; }
-			function done(call, path) {
-				call.then(self, function () {
-					try { f.result = self._opEntry(call.result, path); } catch (e) { f.setException(e); }
-				});
-			}
-			// The steps below in try blocks: kf and df are not f, so a throw in their callbacks
-			// would stay there and the move would never answer.
-			if (!toFolder) {
-				try {
-					done(self._api(t, "POST", Config.API_BASE + "/" + kind + "/rename?path=" + self._enc(item) +
-						"&name=" + self._enc(name)), self._child(self._dirOf(item), name));
-				} catch (e2) { f.setException(e2); }
-				return;
-			}
-			var df = self._resolve(t.creds, toFolder, t.renew);
-			df.then(self, function () {
-				try {
-					var dir = df.result;
-					var dst = self._child(dir, (name === null || name === undefined) ? self._leaf(item) : name);
-					done(self._api(t, "POST", Config.API_BASE + "/" + kind + "/move?src=" + self._enc(item) +
-						"&dst=" + self._enc(dst)), dst);
-				} catch (e1) { f.setException(e1); }
-			});
-		});
-		return f;
-	},
-
-	// Permanent: HiDrive's API has no trash. A directory goes with its contents.
-	deleteItem: function (creds, item, cb) {
-		var self = this, f = new Future(), t = this._tracker(creds, cb);
-		var kf = this._kind(t, item);
-		kf.then(this, function () {
-			var kind;
-			var call;
-			// In a try: kf is not f, so a throw in this callback would stay on kf.
-			try {
-				kind = kf.result;
-				call = self._api(t, "DELETE", Config.API_BASE + "/" + kind + "?path=" + self._enc(item) +
-					(kind === "dir" ? "&recursive=true" : ""));
-			} catch (e0) { f.setException(e0); return; }
-			call.then(self, function () {
-				try { call.result; f.result = {}; } catch (e) { f.setException(e); }
-			});
-		});
-		return f;
-	},
-
-	// --- PHOTO.UPLOAD helpers ------------------------------------------------------------
-	// Enumerate BROWSABLE photo albums: the account HOME (its direct image children - people keep
-	// photos at the top level, as this account does) plus every immediate sub-folder that holds at
-	// least one image. aid = the absolute path (listPhotos lists it directly). This replaces the
-	// old "only Camera Uploads" view so real photos actually show up in Photos & Videos.
-	_isImg: function (e) {
-		var m = this._mime(e && e.name, false);
-		return e && e.type === "file" && m && m.indexOf("image/") === 0;
-	},
-	photoAlbums: function (creds, cb) {
-		var self = this, f = new Future();
-		var hf = this._ensureHome(creds, cb);
-		f.now(this, function () { return hf; });
-		f.then(this, function () {
-			var home;
-			try { home = hf.result; } catch (e) { f.setException(e); return; }
-			var lf = self.listFolder(creds, home, cb);
-			// Everything in lf's and each sf's callback in a try: neither is f, so a throw there
-			// would stay on it and the album list would never answer.
-			lf.then(self, function () {
-				var entries;
-				try { entries = (lf.result && lf.result.entries) || []; } catch (e2) { entries = []; }
-				var albums = [], homeImgs = 0, folders = [];
-				var i = 0;
-				function nextFolder() {
-					if (i >= folders.length) { f.result = { albums: albums }; return; }
-					var fld = folders[i++];
-					var sf = self.listFolder(creds, fld.id, cb);
-					sf.then(self, function () {
-						try {
-							var se;
-							try { se = (sf.result && sf.result.entries) || []; } catch (e3) { se = []; }
-							var c = 0;
-							se.forEach(function (x) { if (self._isImg(x)) { c++; } });
-							if (c) { albums.push({ aid: fld.id, name: fld.name, images: c }); }
-							nextFolder();
-						} catch (e4) { f.setException(e4); }
-					});
-				}
-				try {
-					entries.forEach(function (e) {
-						if (self._isImg(e)) { homeImgs++; }
-						else if (e.type === "folder") { folders.push(e); }
-					});
-					if (homeImgs) { albums.push({ aid: home, name: "HiDrive", images: homeImgs }); }
-					// Probe each immediate sub-folder for images (bounded to one level).
-					nextFolder();
-				} catch (e5) { f.setException(e5); }
-			});
-		});
-		return f;
-	},
-
-	resolvePhotoAlbum: function (creds, cb) {
-		var self = this, f = new Future();
-		var name = Config.PHOTO_ALBUM_NAME || "Camera Uploads";
-		var hf = this._ensureHome(creds, cb);
-		f.now(this, function () { return hf; });
-		f.then(this, function () {
-			var home;
-			try { home = hf.result; } catch (e) { f.result = { path: "", name: name, exists: false }; return; }
-			var path = home + "/" + name;
-			var probe = self._authCall(creds, { method: "GET",
-				url: Config.API_BASE + "/dir?path=" + self._enc(path) + "&members=none" }, cb);
-			probe.then(self, function () {
-				var ok = false;
-				try { var r = probe.result; ok = !!(r && r.status >= 200 && r.status < 300); } catch (e2) { ok = false; }
-				f.result = { path: path, name: name, exists: ok };
-			});
-		});
-		return f;
-	},
-	ensureAlbumFolder: function (creds, name, cb) {
-		var self = this, f = new Future();
-		var hf = this._ensureHome(creds, cb);
-		f.now(this, function () { return hf; });
-		f.then(this, function () {
-			var home;
-			try { home = hf.result; } catch (e) { f.setException(e); return; }
-			var path = home + "/" + String(name).replace(/^\/+|\/+$/g, "");
-			var call = self._authCall(creds, { method: "POST",
-				url: Config.API_BASE + "/dir?path=" + self._enc(path) }, cb);
-			call.then(self, function () {
-				// A request that got no answer throws here; caught, or it would stay on call.
-				var r;
-				try { r = call.result; } catch (e2) { f.setException(e2); return; }
-				// 201 Created or 409 (exists) are both success.
-				if (r && (r.status === 409 || (r.status >= 200 && r.status < 300))) { f.result = path; }
-				else { f.setException({ returnValue: false, errorCode: "HIDRIVE_MKDIR_FAILED", status: r && r.status }); }
-			});
-		});
-		return f;
-	},
-	// A "/file?path=..&access_token=.." URL the Photos aggregator's curl can fetch header-less.
-	// NOTE: relies on HiDrive accepting the token as a query param (common for Bearer APIs);
-	// if a device test shows it does not, switch listPhotos to a download-to-temp file:// scheme
-	// (as the Mega connector does). See ../README.md.
-	getTemporaryLink: function (creds, fileId, cb) {
-		var f = new Future();
-		f.result = { link: Config.API_BASE + "/file?path=" + this._enc(fileId) +
-			"&access_token=" + encodeURIComponent(creds.accessToken), method: "GET" };
-		return f;
-	},
-	// DELETE /file?path=..
-	deletePhoto: function (creds, fileId, cb) {
-		var self = this, f = new Future();
-		var call = this._authCall(creds, { method: "DELETE",
-			url: Config.API_BASE + "/file?path=" + this._enc(fileId) }, cb);
-		call.then(this, function () {
-			var r;
-			try { r = call.result; } catch (e) { f.setException(e); return; }
-			if (r && (r.status === 204 || (r.status >= 200 && r.status < 300))) { f.result = { deleted: true }; }
-			else { f.setException({ returnValue: false, errorCode: "HIDRIVE_DELETE_FAILED", status: r && r.status }); }
-		});
-		return f;
+	async function kind(s, p) {
+		const m = await api(s, "GET", API + "/meta?path=" + enc(p) + "&fields=type");
+		return (m && m.type === "dir") ? "dir" : "file";
 	}
-};
 
-if (typeof exports !== "undefined") { exports.Adapter = Adapter; }
+	// PUT /file?dir=&name= creates or overwrites the file with the local bytes.
+	async function put(s, dir, name, localPath) {
+		const meta = (await api(s, "PUT", API + "/file?dir=" + enc(dir) + "&name=" + enc(name),
+			{ file: localPath, headers: { "Content-Type": "application/octet-stream" } })) || {};
+		const p = meta.path ? dec(meta.path) : child(dir, name);
+		return { id: p, path: p, name: meta.name ? dec(meta.name) : name, size: meta.size };
+	}
+
+	const adapter = {
+		// GET /user/me -> { user:{ emailAddress, displayName } }; the home path is kept.
+		async getAccountInfo(s) {
+			const u = (await api(s, "GET", API + config.USER_INFO_PATH)) || {};
+			if (u.home) {
+				if (homes.size >= HOME_CACHE_MAX) { homes.clear(); }
+				homes.set(s.accessToken, String(u.home));
+			}
+			return { user: { emailAddress: u.email || u.account, displayName: u.alias || u.descr || u.email } };
+		},
+
+		ensureHome,
+
+		// GET /dir?path=&members=all&fields=members.* -> entries, LIST_LIMIT at a time
+		// (limit=offset,count), until a page comes back short. HiDrive's `fields` describe the
+		// directory itself; its children's fields are the members.<field> ones.
+		async listFolder(s, folderId) {
+			const p = await resolve(s, folderId);
+			const size = config.LIST_LIMIT || 5000;
+			const entries = [];
+			for (let page = 0; page < MAX_PAGES; page++) {
+				const res = (await api(s, "GET", API + "/dir?path=" + enc(p) +
+					"&members=all&fields=members.name,members.type,members.size,members.mtime,members.path,members.id" +
+					"&limit=" + (page * size) + "," + size)) || {};
+				const members = Array.isArray(res.members) ? res.members : [];
+				entries.push(...members.map(entry));
+				if (members.length < size) { break; }
+			}
+			return { entries };
+		},
+
+		// GET /file?path= -> the bytes to localDest. exportMime is not HiDrive's.
+		async downloadFile(s, fileId, localDest) {
+			await s.authorized((token) => http.request({ method: "GET", url: API + "/file?path=" + enc(fileId),
+				bearer: token, toFile: localDest, errorCode: "HIDRIVE_DOWNLOAD_FAILED" }));
+			return { path: localDest };
+		},
+
+		// A new file at folder/name (an existing one of that name is overwritten, as before).
+		async uploadFile(s, folderId, localPath, name) {
+			return put(s, await resolve(s, folderId), String(name).replace(/^\/+/, ""), localPath);
+		},
+
+		// Overwrite the file at fileId (a save-back): its folder and its name.
+		uploadReplace(s, fileId, localPath) { return put(s, dirOf(fileId), leaf(fileId), localPath); },
+
+		async createFolder(s, parent, name) {
+			const p = child(await resolve(s, parent), name);
+			return opEntry(await api(s, "POST", API + "/dir?path=" + enc(p)), p);
+		},
+
+		// toFolder null = rename in place; name null = keep the name; both = one move.
+		async moveItem(s, item, toFolder, name) {
+			const k = await kind(s, item);
+			if (toFolder === null || toFolder === undefined || toFolder === "") {
+				const m = await api(s, "POST", API + "/" + k + "/rename?path=" + enc(item) + "&name=" + enc(name));
+				return opEntry(m, child(dirOf(item), name));
+			}
+			const dst = child(await resolve(s, toFolder), (name === null || name === undefined) ? leaf(item) : name);
+			return opEntry(await api(s, "POST", API + "/" + k + "/move?src=" + enc(item) + "&dst=" + enc(dst)), dst);
+		},
+
+		// For good: a file through DELETE /file, a directory with its contents through DELETE /dir.
+		async deleteItem(s, item) {
+			const k = await kind(s, item);
+			await api(s, "DELETE", API + "/" + k + "?path=" + enc(item) + (k === "dir" ? "&recursive=true" : ""));
+			return {};
+		},
+
+		// --- Photos (photos.js, and the generic upload/deletePhoto) ----------------------------
+
+		// The albums: the home's own images, then each immediate sub-folder holding images, as
+		// [{ aid: path, name, images }]. A folder that cannot be listed counts as empty; only the
+		// home itself not being found (GET /user/me failing) throws.
+		async photoAlbums(s, isImage) {
+			const home = await ensureHome(s);
+			const list = async (p) => {
+				try { return (await adapter.listFolder(s, p)).entries; } catch (e) { return []; }
+			};
+			const albums = [];
+			const top = await list(home);
+			const homeImages = top.filter(isImage).length;
+			if (homeImages) { albums.push({ aid: home, name: "HiDrive", images: homeImages }); }
+			for (const f of top.filter((e) => e.type === "folder")) {
+				const n = (await list(f.id)).filter(isImage).length;
+				if (n) { albums.push({ aid: f.id, name: f.name, images: n }); }
+			}
+			return albums;
+		},
+
+		// The upload folder when the Photos service names none: home/<name>, made when missing
+		// (201, or 409 when it is there already).
+		async ensureAlbumFolder(s, name) {
+			const p = child(await ensureHome(s), String(name).replace(/^\/+|\/+$/g, ""));
+			await s.authorized((token) => http.request({ method: "POST", url: API + "/dir?path=" + enc(p),
+				bearer: token, accept: [409], errorCode: "HIDRIVE_MKDIR_FAILED" }));
+			return p;
+		},
+
+		// A "/file?path=..&access_token=.." URL the Photos service can fetch without a header
+		// (HiDrive takes the token as a query parameter; see ../README.md). No request.
+		getTemporaryLink(s, fileId) {
+			return { link: API + "/file?path=" + enc(fileId) + "&access_token=" + enc(s.accessToken), method: "GET" };
+		},
+
+		// DELETE /file?path= (the Photos delete button; pid is listPhotos' path).
+		async deletePhoto(s, fileId) {
+			await s.authorized((token) => http.request({ method: "DELETE", url: API + "/file?path=" + enc(fileId),
+				bearer: token, errorCode: "HIDRIVE_DELETE_FAILED" }));
+			return { deleted: true };
+		},
+	};
+	return adapter;
+}
+
+module.exports = Object.assign(createAdapter, { ERROR, HOME, describe, entry, dec, leaf, dirOf, child, mimeOf, MAX_PAGES });
