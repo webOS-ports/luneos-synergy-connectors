@@ -222,15 +222,25 @@ var MegaCrypto = (function () {
 	// AES). Modern node accepts Buffers - detect which and use it. NEVER call final() (that would
 	// add padding on modern node); ECB update() returns each block immediately.
 	var _cipherUsesBuf = null;
+	// Whether createCipheriv takes Buffers, and the IV it wants for ECB, which has none: modern
+	// node takes only null there ("Invalid initialization vector" for 16 bytes), node 0.4.12 a
+	// 16-byte one. Probing with a 16-byte IV alone made modern node look like 0.4.12, and the
+	// string forms then failed (MEGA uploads: CTR_FAILED).
+	var _ecbNullIv = null;
 	function _detectCipherBuf() {
 		if (_cipherUsesBuf !== null) { return _cipherUsesBuf; }
 		_cipherUsesBuf = false;
 		if (_nc && _nc.createCipheriv) {
-			try { _nc.createCipheriv("aes-128-ecb", toBuffer(_zeros(16)), toBuffer(_zeros(16))); _cipherUsesBuf = true; }
-			catch (e) { _cipherUsesBuf = false; }
+			try { _nc.createCipheriv("aes-128-ecb", toBuffer(_zeros(16)), null); _cipherUsesBuf = true; _ecbNullIv = true; }
+			catch (e) {
+				try { _nc.createCipheriv("aes-128-ecb", toBuffer(_zeros(16)), toBuffer(_zeros(16))); _cipherUsesBuf = true; _ecbNullIv = false; }
+				catch (e2) { _cipherUsesBuf = false; _ecbNullIv = false; }
+			}
 		}
 		return _cipherUsesBuf;
 	}
+	// The IV argument for an ECB cipher on this node, in the Buffer form.
+	function _ecbIvBuf() { _detectCipherBuf(); return _ecbNullIv ? null : toBuffer(_zeros(16)); }
 	function _zeros(n) { var a = []; for (var i = 0; i < n; i++) { a.push(0); } return a; }
 	function _binStr(bytes) { var s = "", i; for (i = 0; i < bytes.length; i++) { s += String.fromCharCode(bytes[i] & 0xff); } return s; }
 	function _binToBytes(s) { var b = [], i; for (i = 0; i < s.length; i++) { b.push(s.charCodeAt(i) & 0xff); } return b; }
@@ -239,7 +249,7 @@ var MegaCrypto = (function () {
 	function _ecbCipher(keyBytes) {
 		var useBuf = _detectCipherBuf(), iv = _zeros(16), ci;
 		if (useBuf) {
-			ci = _nc.createCipheriv("aes-128-ecb", toBuffer(keyBytes), toBuffer(iv));
+			ci = _nc.createCipheriv("aes-128-ecb", toBuffer(keyBytes), _ecbIvBuf());
 			if (ci.setAutoPadding) { ci.setAutoPadding(false); }
 			return { buf: true, ci: ci, seed: function (b) { return toBuffer(b); },
 				step: function (s) { return ci.update(s); }, out: function (s) { return [].slice.call(s); } };
@@ -507,6 +517,19 @@ var MegaCrypto = (function () {
 	}
 
 	// ---- attributes ---------------------------------------------------------------------
+	// The attribute block is "MEGA" + JSON, as UTF-8, zero-padded to a multiple of 16 bytes and
+	// AES-128-CBC encrypted with a zero IV under the node's 128-bit key (a file's 8-word key
+	// xor-folded to 4 words, a folder's 4-word key as is), in Mega base64. Same as megajs's
+	// MutableFile.packAttributes/File.unpackAttributes + AES.encryptCBC/decryptCBC.
+	// UTF-8 through encodeURIComponent/escape, which ES5 (and the device's node 0.4.12) have.
+	function utf8Bytes(s) {
+		var e = unescape(encodeURIComponent(s)), out = [], i;   // throws URIError on a lone surrogate
+		for (i = 0; i < e.length; i++) { out.push(e.charCodeAt(i)); }
+		return out;
+	}
+	function utf8Decode(bin) {
+		try { return decodeURIComponent(escape(bin)); } catch (e) { return bin; }   // not UTF-8: as bytes
+	}
 	// Decrypt a node's `a` attribute block (base64) with its 128-bit key. Returns the parsed
 	// JSON object ({ n: "filename", ... }) or null.
 	function decryptAttr(attrB64, keyA32) {
@@ -514,12 +537,11 @@ var MegaCrypto = (function () {
 		var s = "";
 		for (var i = 0; i < pt.length && pt[i] !== 0; i++) { s += String.fromCharCode(pt[i]); }
 		if (s.substr(0, 4) !== "MEGA") { return null; }
-		try { return JSON.parse(s.substr(4)); } catch (e) { return null; }
+		try { return JSON.parse(utf8Decode(s.substr(4))); } catch (e) { return null; }
 	}
-	// Encrypt attributes for upload: "MEGA" + JSON, zero-padded to 16 bytes, CBC(zero IV).
+	// Encrypt attributes (the inverse of decryptAttr).
 	function encryptAttr(obj, keyA32) {
-		var s = "MEGA" + JSON.stringify(obj), bytes = [];
-		for (var i = 0; i < s.length; i++) { bytes.push(s.charCodeAt(i) & 0xff); }
+		var bytes = utf8Bytes("MEGA" + JSON.stringify(obj));
 		while (bytes.length % 16 !== 0) { bytes.push(0); }
 		return bytesToB64(cbcEncryptBytes(keyA32.slice(0, 4), bytes));
 	}
@@ -564,13 +586,9 @@ var MegaCrypto = (function () {
 		try {
 			var useBuf = _detectCipherBuf();
 			var keyArg = useBuf ? toBuffer(aesKeyBytes) : _binStr(aesKeyBytes);
-			var ivArg  = useBuf ? toBuffer(_zeros(16))  : _binStr(_zeros(16));
 			var nb = a32ToBytes([nonce[0], nonce[1]]);   // 8-byte nonce
-			// ECB ignores the IV, but node builds disagree on its form: modern node wants a NULL
-			// iv, the device's 0.4.12 wants a 16-byte one. Detect which this build accepts.
-			var ecbIv;
-			try { _nc.createCipheriv("aes-128-ecb", keyArg, null); ecbIv = null; }
-			catch (eiv) { ecbIv = ivArg; }
+			// ECB ignores the IV, but node builds disagree on its form (see _detectCipherBuf).
+			var ecbIv = useBuf ? _ecbIvBuf() : _binStr(_zeros(16));
 			var fin = _fs.openSync(inPath, "r");
 			var fout = _fs.openSync(outPath, "w");
 			var CHUNK = 65536, buf = new Buffer(CHUNK), blockIndex = 0, n;

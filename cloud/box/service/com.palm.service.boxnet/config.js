@@ -43,7 +43,7 @@ var Config = {
 	AUTHORIZE_EXTRA:  "",                     // Box needs no extra authorize params
 	TOKEN_SEND_SCOPE: false,
 	AUTH_APP_IDS:  ["com.palm.app.cloud-auth"],
-	FILE_APP_IDS:  ["org.webosports.app.documents", "org.webosports.app.documents-*"]
+	FILE_APP_IDS:  ["org.webosports.app.documents", "org.webosports.app.documents-*", "com.palm.stark.files.service"]
 };
 
 if (typeof exports !== "undefined") { exports.Config = Config; }

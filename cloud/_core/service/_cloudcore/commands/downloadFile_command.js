@@ -32,7 +32,7 @@ DownloadFileCommandAssistant.prototype = {
 				try { res = call.result; }
 				catch (e2) { future.setException(e2); return; }
 				if (renewed && args.accountId) { AccountCreds.save(args.accountId, renewed); }
-				future.result = { returnValue: true, renewedCredentials: renewed, path: res.path };
+				future.result = { returnValue: true, renewedCredentials: renewed, path: res && res.path };
 			});
 		});
 	}

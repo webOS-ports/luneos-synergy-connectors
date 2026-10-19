@@ -27,8 +27,8 @@ enyo.kind({
 					spellcheck: false, autoCapitalize: "lowercase", style: "width:100%; margin-top:8px;" },
 				{ kind: "Input", name: "keyField", hint: "Access key ID",
 					spellcheck: false, style: "width:100%; margin-top:8px;" },
-				{ kind: "Input", name: "secretField", hint: "Secret access key",
-					type: "password", spellcheck: false, style: "width:100%; margin-top:8px;" },
+				{ kind: "PasswordInput", name: "secretField", hint: "Secret access key",
+					spellcheck: false, style: "width:100%; margin-top:8px;" },
 				{ kind: "control", style: "margin-top:10px; display:flex; align-items:center;", components: [
 					{ name: "pathStyleToggle", kind: "CheckBox", checked: true },
 					{ kind: "Control", className: "accounts-body-text", style: "margin-left:8px;",

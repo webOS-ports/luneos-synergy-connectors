@@ -25,11 +25,45 @@ var Future = Foundations.Control.Future;
 
 var reqf = (typeof require !== "undefined") ? require : (IMPORTS.require || null);
 var cp = reqf ? reqf("child_process") : null;
+var fsm = reqf ? reqf("fs") : null;
 
 var HttpCurl = {
-	// request({ method, url, headers:{}, form:{k:v}, body:"", bearer:"" }) -> Future
-	// resolves to { status: <int>, responseText: <string> }
+	// The folders a download goes into, made 0755: the file is for an app to read, and the web
+	// apps run as another user than this service. curl's --create-dirs makes them 0750, which
+	// left Documents unable to open what it had downloaded into a new cache folder.
+	makeDirs: function (dir) {
+		if (!fsm || !dir) { return; }
+		var parts = dir.split("/"), cur = "", i;
+		for (i = 1; i < parts.length; i++) {
+			if (!parts[i]) { continue; }
+			cur += "/" + parts[i];
+			try {
+				if (!fsm.existsSync(cur)) {
+					fsm.mkdirSync(cur);
+					fsm.chmodSync(cur, 493);   // 0755, whatever the umask
+				}
+			} catch (e) { return; }   // curl --create-dirs tries again, and says why if it cannot
+		}
+	},
+
+	// request({ method, url, headers:{}, form:{k:v}, body:"", bearer:"", responseHeader:"" })
+	// -> Future resolving to { status: <int>, responseText: <string> }, plus header: <string>
+	// (the named response header's value, "" when absent) when responseHeader is given.
+	// A Future, always: a request that cannot even be started (execFile refusing an argument,
+	// an outFile that is not a string) fails the Future instead of throwing. A throw here, inside
+	// some other Future's callback, would be kept on that Future and the command never answer.
 	request: function (opts) {
+		try {
+			return HttpCurl._request(opts);
+		} catch (e) {
+			var f = new Future();
+			f.setException({ returnValue: false, errorCode: "CURL_FAILED",
+				detail: String((e && e.message) || e) });
+			return f;
+		}
+	},
+
+	_request: function (opts) {
 		opts = opts || {};
 		var f = new Future();
 
@@ -45,8 +79,12 @@ var HttpCurl = {
 		// files..." spinner. --connect-timeout caps the handshake; --max-time is a total backstop
 		// (generous so large up/downloads still complete). A hard fail here becomes CURL_FAILED,
 		// which the consumer can retry, instead of an indefinite hang.
+		// One response header can come back too: curl's %header{} write-out (curl >= 7.84) puts its
+		// value on a line of its own before the status code. Header names hold no "}".
+		var wantHeader = opts.responseHeader && /^[A-Za-z0-9-]+$/.test(opts.responseHeader);
 		var args = ["-s", "-S", "--tlsv1.2", "--connect-timeout", "15", "--max-time", "90",
-			"-w", "\n%{http_code}", "-X", method];
+			"-w", wantHeader ? "\n%header{" + opts.responseHeader + "}\n%{http_code}" : "\n%{http_code}",
+			"-X", method];
 
 		// Point curl at the system CA store (/etc/ssl/certs/ca-certificates.crt). The
 		// stock rootfs stub is from 2011; the deployment-bundle prerequisite refreshes
@@ -70,13 +108,20 @@ var HttpCurl = {
 			args.push("-L");   // Box content endpoint 302-redirects to dl.boxcloud.com
 		}
 		if (opts.outFile) {
+			HttpCurl.makeDirs(opts.outFile.substring(0, opts.outFile.lastIndexOf("/")));
 			args.push("--create-dirs", "-o", opts.outFile);
 		}
 		if (opts.multipart) {
-			// [{name, value} | {name, file}] -> curl -F. Box wants an "attributes" JSON
-			// part plus a "file" part reading the local file with @.
+			// [{name, value} | {name, file, filename?}] -> curl -F. Box wants an "attributes" JSON
+			// part plus a "file" part reading the local file with @. A file part is named after
+			// the local file unless `filename` says otherwise; providers that take the name from
+			// the part (pCloud) need that, quoted as curl reads it.
 			opts.multipart.forEach(function (p) {
-				args.push("-F", p.file ? (p.name + "=@" + p.file) : (p.name + "=" + p.value));
+				var part = p.file ? (p.name + "=@" + p.file) : (p.name + "=" + p.value);
+				if (p.file && p.filename) {
+					part += ';filename="' + String(p.filename).replace(/(["\\])/g, "\\$1") + '"';
+				}
+				args.push("-F", part);
 			});
 		} else if (opts.form) {
 			Object.keys(opts.form).forEach(function (k) {
@@ -113,7 +158,15 @@ var HttpCurl = {
 				var cut = stdout.lastIndexOf("\n");
 				var head = (cut >= 0) ? stdout.substring(0, cut) : stdout;
 				var tail = (cut >= 0) ? stdout.substring(cut + 1) : "";
-				f.result = { status: parseInt(tail, 10) || 0, responseText: head };
+				var result = { status: parseInt(tail, 10) || 0 };
+				if (wantHeader) {
+					// ...and before it, the header line.
+					var hcut = head.lastIndexOf("\n");
+					result.header = (hcut >= 0) ? head.substring(hcut + 1) : head;
+					head = (hcut >= 0) ? head.substring(0, hcut) : "";
+				}
+				result.responseText = head;
+				f.result = result;
 			});
 
 		return f;

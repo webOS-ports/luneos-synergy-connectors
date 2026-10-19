@@ -1,4 +1,4 @@
-/*global IMPORTS, Config, HttpCurl, MegaCrypto, console */
+/*global IMPORTS, Config, HttpCurl, MegaCrypto, MegaHashcash, console */
 /* megaapi.js - the Mega "cs" command queue + login handshake + node-tree fetch.
  *
  * Every call POSTs a JSON array of commands to https://g.api.mega.co.nz/cs (through the modern
@@ -6,6 +6,8 @@
  * is a JSON array of per-command results, OR a bare negative integer = a global API error
  * (e.g. -3 EAGAIN "try again", -15 ESID "session expired", -9 ENOENT, -16 blocked). Negative
  * ints inside the array are per-command errors. -3 is transparently retried with backoff.
+ * HTTP 402 with an X-Hashcash challenge asks for a proof of work first (hashcash.js); the request
+ * is sent again, under the same id, with the answer.
  *
  * LOGIN (us0 -> us): us0 tells us the account version (v1 legacy AES key derivation, or v2
  * PBKDF2-SHA512 with a server salt). We derive the password AES key + login hash accordingly,
@@ -22,9 +24,12 @@ var MegaApi = (function () {
 	var _seq = Math.floor((new Date()).getTime() / 1000) & 0x7fffffff;   // seed the id counter
 
 	// Human-readable text for the Mega error codes we care to surface.
+	// Names as in MEGA's SDK (megaapi.h API_E*) and megajs's ERRORS table.
 	var ERR = {
-		"-2": "EARGS", "-3": "EAGAIN", "-8": "EEXPIRED", "-9": "ENOENT", "-11": "EACCESS",
-		"-13": "ETOOMANY", "-14": "ERANGE", "-15": "ESID", "-16": "EBLOCKED", "-26": "EMFAREQUIRED"
+		"-1": "EINTERNAL", "-2": "EARGS", "-3": "EAGAIN", "-4": "ERATELIMIT", "-5": "EFAILED",
+		"-6": "ETOOMANY", "-7": "ERANGE", "-8": "EEXPIRED", "-9": "ENOENT", "-10": "ECIRCULAR",
+		"-11": "EACCESS", "-12": "EEXIST", "-13": "EINCOMPLETE", "-14": "EKEY", "-15": "ESID",
+		"-16": "EBLOCKED", "-17": "EOVERQUOTA", "-18": "ETEMPUNAVAIL", "-26": "EMFAREQUIRED"
 	};
 	function apiError(code, ctx) {
 		return { returnValue: false, errorCode: "MEGA_" + (ERR[String(code)] || ("E" + code)),
@@ -33,22 +38,36 @@ var MegaApi = (function () {
 
 	// POST one JSON array of commands. Resolves to the parsed reply (array or negative int).
 	// Retries -3 (EAGAIN) up to 4 times with linear backoff. `sidOverride` lets login pass the
-	// not-yet-stored session id; otherwise the caller's creds.accessToken is the sid.
-	function post(commands, sid, tries) {
+	// not-yet-stored session id; otherwise the caller's creds.accessToken is the sid. `hashcash`
+	// and `id` are for the resend after a 402: the answer to send, and the id it was asked for.
+	function post(commands, sid, tries, hashcash, id) {
 		var f = new Future();
-		var url = Config.API_BASE + "?id=" + (_seq++);
+		if (id === undefined) { id = _seq++; }
+		var url = Config.API_BASE + "?id=" + id;
 		if (sid) { url += "&sid=" + sid; }
 		var body = JSON.stringify(commands);
+		var headers = { "Content-Type": "application/json" };
+		if (hashcash) { headers["X-Hashcash"] = hashcash; }
 		var call = HttpCurl.request({
-			method: "POST", url: url, body: body,
-			headers: { "Content-Type": "application/json" }
+			method: "POST", url: url, body: body, headers: headers, responseHeader: "X-Hashcash"
 		});
 		// Same shape as the OAuth connectors' _req (device-proven): f.now sequences on the curl
-		// call, f.then inspects the reply. On -3 (EAGAIN) pipe a retry future into f.result.
+		// call, f.then inspects the reply. On -3 (EAGAIN) f nests the retry's future.
 		f.now(this, function () { return call; });
 		f.then(this, function () {
 			var r;
 			try { r = call.result; } catch (e) { f.setException(e); return; }
+			if (r && r.status === 402 && r.header && (tries || 0) < 4) {
+				// Proof of work first. Several rounds are allowed, as megajs does; each answers the
+				// newest challenge. f is left pending and settled later, as on EAGAIN below.
+				var work = MegaHashcash.solve(r.header);
+				work.then(this, function () {
+					var answer;
+					try { answer = work.result; } catch (e3) { f.setException(e3); return; }
+					f.nest(post(commands, sid, (tries || 0) + 1, answer, id));
+				});
+				return;
+			}
 			if (!r || r.status < 200 || r.status >= 300) {
 				f.setException(apiError("HTTP_" + (r && r.status), r && r.responseText)); return;
 			}
@@ -58,9 +77,10 @@ var MegaApi = (function () {
 			// A bare negative number is a global error.
 			if (typeof parsed === "number") {
 				if (parsed === -3 && (tries || 0) < 4 && typeof setTimeout !== "undefined") {
-					// EAGAIN - wait and retry (linear backoff); adopting the retry future's result.
+					// EAGAIN - wait and retry (linear backoff), taking the retry's outcome with nest():
+					// assigning a Future to .result would make the Future itself the result.
 					setTimeout(function () {
-						f.result = post(commands, sid, (tries || 0) + 1);
+						f.nest(post(commands, sid, (tries || 0) + 1));
 					}, 500 * ((tries || 0) + 1));
 					return;
 				}
@@ -188,7 +208,10 @@ var MegaApi = (function () {
 
 		// fetchNodes(creds) -> Future<{ nodes:[...], rootHandle, byHandle:{} }>. Pulls the whole
 		// filesystem tree (`f`) and decrypts each node's key + attributes with the master key.
-		// nodes carry: { h, p, t, name, size, ts, key(a32), aesKeyA32, nonce, metaMac }.
+		// nodes carry: { h, p, t, name, attrs, size, ts, key(a32), aesKeyA32, nonce, metaMac }, attrs
+		// being the whole decrypted attribute object (null when it could not be decrypted).
+		// rubbishHandle/inboxHandle are the t===4/t===3 roots; shareHandles holds the folders with
+		// an outgoing share key (`ok`), under which new nodes would also need a `cr` share-key set.
 		fetchNodes: function (creds) {
 			var f = new Future();
 			var master = this.masterKey(creds);
@@ -198,10 +221,14 @@ var MegaApi = (function () {
 				var res;
 				try { res = ff.result; } catch (e) { f.setException(e); return; }
 				var raw = (res && res.f) || [];
-				var out = [], byHandle = {}, root = null;
+				var out = [], byHandle = {}, root = null, rubbish = null, inbox = null, shares = {};
+				var ok = (res && res.ok) || [];
+				for (var si = 0; si < ok.length; si++) { if (ok[si] && ok[si].h) { shares[ok[si].h] = true; } }
 				for (var i = 0; i < raw.length; i++) {
-					var n = raw[i], node = { h: n.h, p: n.p, t: n.t, size: n.s, ts: n.ts, name: null };
+					var n = raw[i], node = { h: n.h, p: n.p, t: n.t, size: n.s, ts: n.ts, name: null, attrs: null };
 					if (n.t === 2) { root = n.h; }
+					if (n.t === 3) { inbox = n.h; }
+					if (n.t === 4) { rubbish = n.h; }
 					// Decrypt the node key: `k` = "handle:b64key [handle2:b64key2 ...]". Own nodes are
 					// wrapped with the master key. Pick a pair whose key unwraps to a sane length.
 					if (n.k) {
@@ -220,19 +247,20 @@ var MegaApi = (function () {
 									node.aesKeyA32 = uk.aesKeyA32;
 									node.nonce = uk.nonce;
 									node.metaMac = uk.metaMac;
-									if (n.a) { var af = MC.decryptAttr(n.a, uk.aesKeyA32); node.name = af && af.n; }
+									if (n.a) { var af = MC.decryptAttr(n.a, uk.aesKeyA32); node.attrs = af; node.name = af && af.n; }
 								} else {           // folder: 4-word key
 									node.key = rawKey;
 									node.aesKeyA32 = rawKey.slice(0, 4);
-									if (n.a) { var ad = MC.decryptAttr(n.a, rawKey.slice(0, 4)); node.name = ad && ad.n; }
+									if (n.a) { var ad = MC.decryptAttr(n.a, rawKey.slice(0, 4)); node.attrs = ad; node.name = ad && ad.n; }
 								}
-							} catch (ek) { node.name = null; }
+							} catch (ek) { node.name = null; node.attrs = null; }
 						}
 					}
 					byHandle[n.h] = node;
 					out.push(node);
 				}
-				f.result = { nodes: out, rootHandle: root, byHandle: byHandle };
+				f.result = { nodes: out, rootHandle: root, rubbishHandle: rubbish, inboxHandle: inbox,
+					shareHandles: shares, byHandle: byHandle };
 			});
 			return f;
 		}

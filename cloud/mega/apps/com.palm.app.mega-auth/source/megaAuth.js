@@ -23,14 +23,14 @@ enyo.kind({
 				{ className: "accounts-body-text", style: "line-height:1.5; padding-bottom:10px;",
 					content: "Sign in with your MEGA email and password. Your password stays on the device — it is only used to unlock your encrypted files." },
 				{ kind: "Input", name: "emailField", hint: "MEGA email address",
-					type: "email", autoCapitalize: "lowercase", spellcheck: false, style: "width:100%;" },
-				{ kind: "Input", name: "passwordField", hint: "Password",
-					type: "password", spellcheck: false, style: "width:100%; margin-top:8px;" },
+					inputType: "email", autoCapitalize: "lowercase", spellcheck: false, style: "width:100%;" },
+				{ kind: "PasswordInput", name: "passwordField", hint: "Password",
+					spellcheck: false, style: "width:100%; margin-top:8px;" },
 				{ name: "mfaRow", showing: false, components: [
 					{ className: "accounts-body-text", style: "line-height:1.5; padding-top:10px;",
 						content: "Enter the 6-digit code from your authenticator app:" },
 					{ kind: "Input", name: "mfaField", hint: "2FA code",
-						type: "tel", style: "width:100%; margin-top:4px;" }
+						inputType: "tel", style: "width:100%; margin-top:4px;" }
 				]},
 				{ name: "status", className: "accounts-body-text", style: "padding-top:10px; color:#b00000;" }
 			]}

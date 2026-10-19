@@ -6,7 +6,8 @@
  * behaviour lives in exactly two per-service files:
  *   - config.js  : endpoints, client id/secret, app-id allow-lists, auth header scheme
  *   - adapter.js : the REST mapping (var Adapter = {...}) - listFolder/downloadFile/
- *                  uploadFile/uploadReplace/getAccountInfo, each returning a normalised shape
+ *                  uploadFile/uploadReplace/getAccountInfo, and createFolder/moveItem/deleteItem
+ *                  (commands/fileOps_commands.js), each returning a normalised shape
  *
  * services.json references this assistant by name ("assistant": "CloudService").
  */
@@ -26,8 +27,13 @@
  * checkCredentials.
  */
 var CloudGuard = {
+	// The photo helpers too: the per-service Photos commands call them from credF's callback,
+	// where a throw would be lost the same way.
 	ENTRY_POINTS: ["listFolder", "downloadFile", "uploadFile", "uploadReplace",
-		"getAccountInfo", "deletePhoto", "ensureAlbumFolder"],
+		"getAccountInfo", "deletePhoto", "ensureAlbumFolder",
+		"createFolder", "moveItem", "deleteItem",
+		"listFolderRaw", "listSpecialChildren", "getTemporaryLink", "getFileLink",
+		"photoAlbums", "resolvePhotoAlbum", "getPhotoLocalPath"],
 
 	wrap: function (adapter) {
 		var i, name;
@@ -65,6 +71,13 @@ var CloudGuard = {
 };
 
 if (typeof Adapter !== "undefined") { CloudGuard.wrap(Adapter); }
+
+/* The provider's root folder locator, for a command given no folder. Config.ROOT_FOLDER may be
+ * falsy and still be the root (pCloud's is the number 0), so it is taken whenever it is set. */
+function cloudRoot() {
+	var r = (typeof Config !== "undefined") ? Config.ROOT_FOLDER : undefined;
+	return (r === undefined || r === null || r === "") ? "root" : r;
+}
 
 function CloudService() {}
 CloudService.prototype = {

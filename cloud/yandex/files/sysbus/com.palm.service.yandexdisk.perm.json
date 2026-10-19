@@ -9,5 +9,6 @@
     "org.webosports.app.documents": ["synergy-yandex.operation"],
     "org.webosports.app.photos-*": ["synergy-yandex.operation"],
     "org.webosports.app.photos": ["synergy-yandex.operation"],
-    "com.palm.service.photos": ["synergy-yandex.operation"]
+    "com.palm.service.photos": ["synergy-yandex.operation"],
+    "com.palm.stark.files.service": ["synergy-yandex.operation"]
 }

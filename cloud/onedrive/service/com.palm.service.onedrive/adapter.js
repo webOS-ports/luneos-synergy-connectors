@@ -15,6 +15,9 @@
  *   uploadFile(creds, folderId, localPath, name, mimeType, cb) -> driveItem
  *   uploadReplace(creds, fileId, localPath, mimeType, cb)      -> driveItem
  *   getAccountInfo(creds, cb) -> { user:{ displayName, emailAddress } }
+ *   createFolder(creds, parent, name, cb)               -> { entry }   (listFolder-shaped)
+ *   moveItem(creds, item, toFolder|null, name|null, cb) -> { entry }
+ *   deleteItem(creds, item, cb)                         -> {}          (to the recycle bin)
  * Plus listSpecialChildren() (RAW Graph {value:[driveItem]}) used by the per-provider Photos
  * commands, which read `@microsoft.graph.downloadUrl` off the raw driveItems.
  */
@@ -33,6 +36,7 @@ var Adapter = {
 			var o = { method: base.method, url: base.url, bearer: c.accessToken };
 			if (base.headers)  { o.headers = base.headers; }
 			if (base.dataFile) { o.dataFile = base.dataFile; }   // raw-body PUT upload
+			if (base.body)     { o.body = base.body; }           // JSON body (file ops)
 			if (toFile)        { o.follow = true; o.outFile = base.outFile; }
 			return HttpCurl.request(o);
 		}
@@ -42,13 +46,20 @@ var Adapter = {
 			if (r && r.status === 401 && creds.refreshToken) {
 				var rf = OAuth2.refresh(creds.refreshToken);
 				rf.then(self, function () {
-					var t = rf.result;
-					var nc = { accessToken: t.accessToken,
-						refreshToken: t.refreshToken || creds.refreshToken,  // MS rotates -> keep new
-						expiresAt: Date.now() + (t.expiresIn * 1000) };
-					if (onRenewed) { onRenewed(nc); }
-					var retry = fire(nc);
-					retry.then(self, function () { f.result = self._parse(retry.result, toFile, base); });
+					// A refresh that failed, or anything thrown here, fails f: thrown inside rf's or retry's
+					// callback it would stay on that Future, and the request would never answer.
+					try {
+						var t = rf.result;
+						var nc = { accessToken: t.accessToken,
+							refreshToken: t.refreshToken || creds.refreshToken,  // MS rotates -> keep new
+							expiresAt: Date.now() + (t.expiresIn * 1000) };
+						if (onRenewed) { onRenewed(nc); }
+						var retry = fire(nc);
+						retry.then(self, function () {
+							try { f.result = self._parse(retry.result, toFile, base); }
+							catch (e2) { f.setException(e2); }
+						});
+					} catch (e) { f.setException(e); }
 				});
 				return;
 			}
@@ -69,23 +80,25 @@ var Adapter = {
 	// GET /me -> normalise to { user:{ displayName, emailAddress } }. Personal accounts carry
 	// `mail` sometimes null -> fall back to userPrincipalName.
 	getAccountInfo: function (creds, cb) {
-		var self = this, f = new Future();
-		var call = this.get("/me?$select=id,displayName,userPrincipalName,mail", creds, cb);
-		call.then(this, function () {
-			var u = call.result || {};
-			f.result = { user: { emailAddress: u.mail || u.userPrincipalName,
+		// _map, not call.then(): a failed call read inside call's callback would stay on call.
+		return this._map(this.get("/me?$select=id,displayName,userPrincipalName,mail", creds, cb), function (u) {
+			u = u || {};
+			return { user: { emailAddress: u.mail || u.userPrincipalName,
 				displayName: u.displayName } };
 		});
-		return f;
 	},
 
 	// RAW children of a drive item -> Graph { value:[driveItem] }. NO $select, so the folder/
 	// file facets + @microsoft.graph.downloadUrl come through. itemId falsy/"root" = drive root.
 	_children: function (creds, itemId, cb) {
-		var seg = (!itemId || itemId === Config.ROOT_FOLDER)
+		return this.get(this._childrenPath(itemId) + "?$top=1000", creds, cb);
+	},
+
+	// The children collection of a folder locator; falsy/"root" = the drive root.
+	_childrenPath: function (itemId) {
+		return (!itemId || itemId === Config.ROOT_FOLDER)
 			? "/me/drive/root/children"
 			: "/me/drive/items/" + encodeURIComponent(itemId) + "/children";
-		return this.get(seg + "?$top=1000", creds, cb);
 	},
 
 	// RAW children of a named special folder (e.g. "cameraroll") -> Graph { value:[...] }. Used
@@ -99,19 +112,19 @@ var Adapter = {
 	// facet (=> folder) or `file` facet, id, name, size, lastModifiedDateTime; the locator is
 	// the item id (OneDrive is ID-based), handed back as the next folderId/fileId.
 	listFolder: function (creds, folderId, cb) {
-		var self = this, f = new Future();
-		var call = this._children(creds, folderId, cb);
-		call.then(this, function () {
-			var data = call.result || {};
-			f.result = { entries: (data.value || []).map(function (e) {
-				var isFolder = !!e.folder;
-				return { id: e.id, type: (isFolder ? "folder" : "file"),
-					name: e.name, size: e.size, modified: e.lastModifiedDateTime,
-					path: e.id, mimeType: (e.file && e.file.mimeType),
-					downloadUrl: e["@microsoft.graph.downloadUrl"] };
-			}) };
+		return this._map(this._children(creds, folderId, cb), function (data) {
+			data = data || {};
+			return { entries: (data.value || []).map(function (e) { return this._entry(e); }, this) };
 		});
-		return f;
+	},
+
+	// One Graph driveItem -> the NORMALISED entry listFolder hands out.
+	_entry: function (e) {
+		var isFolder = !!e.folder;
+		return { id: e.id, type: (isFolder ? "folder" : "file"),
+			name: e.name, size: e.size, modified: e.lastModifiedDateTime,
+			path: e.id, mimeType: (e.file && e.file.mimeType),
+			downloadUrl: e["@microsoft.graph.downloadUrl"] };
 	},
 
 	// GET /me/drive/items/{id}/content -> 302 to a pre-signed host (curl -L follows and strips
@@ -149,6 +162,66 @@ var Adapter = {
 		return this._req({ method: "DELETE",
 			url: Config.API_BASE + "/me/drive/items/" + encodeURIComponent(fileId) },
 			creds, cb, false);
+	},
+
+	// A Future that settles with fn(call's result), or with call's exception.
+	_map: function (call, fn) {
+		var self = this, f = new Future();
+		call.then(this, function () {
+			try { f.result = fn.call(self, call.result); }
+			catch (e) { f.setException(e); }
+		});
+		return f;
+	},
+
+	// A JSON request against API_BASE.
+	_json: function (method, path, body, creds, onRenewed) {
+		return this._req({ method: method, url: Config.API_BASE + path,
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body) }, creds, onRenewed, false);
+	},
+
+	// POST {parent}/children with a folder facet. conflictBehavior "fail": an existing name is
+	// a 409, not a silently renamed "New Folder 1". -> { entry }
+	createFolder: function (creds, parent, name, cb) {
+		var call = this._json("POST", this._childrenPath(parent),
+			{ name: name, folder: {}, "@microsoft.graph.conflictBehavior": "fail" }, creds, cb);
+		return this._map(call, function (r) { return { entry: this._entry(r) }; });
+	},
+
+	// PATCH the item's name and/or parentReference. Graph refuses parentReference {id:"root"},
+	// so a move to the root looks up the root's real id first. -> { entry }
+	moveItem: function (creds, item, toFolder, name, cb) {
+		var self = this, f = new Future();
+		var renewed = null;
+		function onR(nc) { renewed = nc; if (cb) { cb(nc); } }
+		function patch(parentId) {
+			var body = {};
+			if (name !== null && name !== undefined) { body.name = name; }
+			if (parentId) { body.parentReference = { id: parentId }; }
+			var p = self._map(self._json("PATCH", "/me/drive/items/" + encodeURIComponent(item),
+				body, renewed || creds, onR), function (r) { return { entry: this._entry(r) }; });
+			p.then(self, function () {
+				try { f.result = p.result; }
+				catch (e) { f.setException(e); }
+			});
+		}
+		if (toFolder !== Config.ROOT_FOLDER) { patch(toFolder || null); return f; }
+		var rootF = this.get("/me/drive/root?$select=id", creds, onR);
+		rootF.then(this, function () {
+			// patch() in the try as well: rootF is not f, so a throw here would stay on rootF.
+			try { patch(rootF.result.id); }
+			catch (e) { f.setException(e); }
+		});
+		return f;
+	},
+
+	// DELETE the item: Graph moves it to the recycle bin (204 No Content). -> {}
+	deleteItem: function (creds, item, cb) {
+		var call = this._req({ method: "DELETE",
+			url: Config.API_BASE + "/me/drive/items/" + encodeURIComponent(item) },
+			creds, cb, false);
+		return this._map(call, function () { return {}; });
 	}
 };
 

@@ -79,8 +79,15 @@ var S3Sig = (function () {
 		}).join("&");
 	}
 
+	// Base64 MD5 of a request body: the Content-MD5 header DeleteObjects requires.
+	function md5Base64(strOrBuf) {
+		var h = _nc.createHash("md5");
+		h.update(strOrBuf); return h.digest("base64");
+	}
+
 	return {
 		sha256Hex: sha256Hex,
+		md5Base64: md5Base64,
 		uriEncode: uriEncode,
 		amzDates: amzDates,
 

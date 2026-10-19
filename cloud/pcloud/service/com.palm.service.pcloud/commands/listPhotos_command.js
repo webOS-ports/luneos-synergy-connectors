@@ -29,8 +29,11 @@ ListPhotosCommandAssistant.prototype = {
 					future.result = { returnValue: true, photos: [] };
 					return;
 				}
-				var contents = (data.metadata && data.metadata.contents) || [];
-				var images = contents.filter(PhotoLib.isImage);
+				// Here and around next(): lf (and each link's Future) is not future, so a throw in
+				// their callbacks would stay there and the command never answer.
+				var images;
+				try { images = ((data.metadata && data.metadata.contents) || []).filter(PhotoLib.isImage); }
+				catch (e3) { future.setException(e3); return; }
 				var photos = [];
 				var i = 0;
 
@@ -55,10 +58,10 @@ ListPhotosCommandAssistant.prototype = {
 						} else {
 							console.log("pcloud: listPhotos - no link for fileid " + e.fileid);
 						}
-						next();
+						try { next(); } catch (eN) { future.setException(eN); }
 					});
 				}
-				next();
+				try { next(); } catch (eN) { future.setException(eN); }
 			});
 		});
 	}

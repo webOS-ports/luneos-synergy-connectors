@@ -31,9 +31,13 @@ var FlickrApi = {
 				if (params[k] !== null && params[k] !== undefined) { all[k] = params[k]; }
 			});
 		}
-		var url = OAuth1.signedUrl("GET", Config.REST_URL, all,
-			creds && creds.oauthToken, creds && creds.oauthTokenSecret);
-		f.now(this, function () { return HttpCurl.request({ method: "GET", url: url }); });
+		// Signed inside now(): a signing failure then fails f instead of throwing out of rest(),
+		// which the commands call from other Futures' callbacks, where a throw would be lost.
+		f.now(this, function () {
+			var url = OAuth1.signedUrl("GET", Config.REST_URL, all,
+				creds && creds.oauthToken, creds && creds.oauthTokenSecret);
+			return HttpCurl.request({ method: "GET", url: url });
+		});
 		f.then(this, function () {
 			f.result = self._parse(f.result);
 		});

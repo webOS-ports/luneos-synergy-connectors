@@ -33,17 +33,22 @@ ListAlbumsCommandAssistant.prototype = {
 						(e2 && (e2.message || e2.status)));
 					data = {};
 				}
-				var sets = (data.photosets && data.photosets.photoset) || [];
-				sets.forEach(function (s) {
-					albums.push({
-						aid:  s.id,
-						name: (s.title && s.title._content !== undefined) ? s.title._content : String(s.id),
-						size: { images: parseInt(s.photos, 10) || 0 }
+				// setsF is not future: a throw in its callback would stay on setsF and the command
+				// never answer.
+				var allF;
+				try {
+					var sets = (data.photosets && data.photosets.photoset) || [];
+					sets.forEach(function (s) {
+						albums.push({
+							aid:  s.id,
+							name: (s.title && s.title._content !== undefined) ? s.title._content : String(s.id),
+							size: { images: parseInt(s.photos, 10) || 0 }
+						});
 					});
-				});
 
-				// Synthetic "All Photos" album: one lightweight call to read the total count.
-				var allF = FlickrApi.allPhotos(creds, "1");
+					// Synthetic "All Photos" album: one lightweight call to read the total count.
+					allF = FlickrApi.allPhotos(creds, "1");
+				} catch (e4) { future.setException(e4); return; }
 				allF.then(self, function () {
 					var total = 0;
 					try {

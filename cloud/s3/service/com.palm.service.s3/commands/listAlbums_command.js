@@ -23,23 +23,30 @@ ListAlbumsCommandAssistant.prototype = {
 				try { album = albF.result; }
 				catch (e2) { album = { path: (Config.PHOTO_ALBUM_NAME || "Camera Uploads") + "/",
 					name: (Config.PHOTO_ALBUM_NAME || "Camera Uploads") }; }
-				if (!album.exists) {
-					future.result = { returnValue: true,
-						albums: [{ aid: album.name, name: album.name, size: { images: 0 } }] };
-					return;
-				}
-				var lf = Adapter.listFolder(creds, album.path, function (nc) { renewed = nc; });
+				// albF and lf are not future: a throw in their callbacks would stay there and the
+				// command never answer, hence the try blocks.
+				var lf;
+				try {
+					if (!album.exists) {
+						future.result = { returnValue: true,
+							albums: [{ aid: album.name, name: album.name, size: { images: 0 } }] };
+						return;
+					}
+					lf = Adapter.listFolder(creds, album.path, function (nc) { renewed = nc; });
+				} catch (e4) { future.setException(e4); return; }
 				lf.then(self, function () {
 					var entries;
 					try { entries = (lf.result && lf.result.entries) || []; }
 					catch (e3) { entries = []; }
-					if (renewed && args.accountId) { AccountCreds.save(args.accountId, renewed); }
-					var count = 0;
-					entries.forEach(function (e) { if (PhotoLib.isImage(e)) { count++; } });
-					// aid = bare token (strip the trailing slash); listPhotos re-adds it.
-					var aid = String(album.path).replace(/\/+$/, "");
-					future.result = { returnValue: true,
-						albums: [{ aid: aid, name: album.name, size: { images: count } }] };
+					try {
+						if (renewed && args.accountId) { AccountCreds.save(args.accountId, renewed); }
+						var count = 0;
+						entries.forEach(function (e) { if (PhotoLib.isImage(e)) { count++; } });
+						// aid = bare token (strip the trailing slash); listPhotos re-adds it.
+						var aid = String(album.path).replace(/\/+$/, "");
+						future.result = { returnValue: true,
+							albums: [{ aid: aid, name: album.name, size: { images: count } }] };
+					} catch (e5) { future.setException(e5); }
 				});
 			});
 		});

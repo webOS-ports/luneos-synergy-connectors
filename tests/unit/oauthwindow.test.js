@@ -19,6 +19,7 @@ const COPIES = [
 function load(file) {
 	const popups = [];
 	const timers = [];
+	const listeners = {};
 	const win = {
 		navigator: { mimeTypes: {} },
 		open(url, name, features) {
@@ -26,8 +27,8 @@ function load(file) {
 			popups.push(p);
 			return p;
 		},
-		addEventListener() {},
-		removeEventListener() {},
+		addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+		removeEventListener(type, fn) { listeners[type] = (listeners[type] || []).filter((f) => f !== fn); },
 		setInterval(fn) { timers.push(fn); return timers.length; },
 		clearInterval() {},
 		setTimeout() { return 0; },
@@ -36,7 +37,11 @@ function load(file) {
 	win.window = win;
 	vm.createContext(win);
 	vm.runInContext(fs.readFileSync(file, "utf8"), win, { filename: file });
-	return { OAuthWindow: win.OAuthWindow, popups, tick: () => timers.slice().forEach((fn) => fn()) };
+	// What WAM does: run script in this page that dispatches a webOSOAuthWindow event.
+	const wam = (state, url = "") => (listeners.webOSOAuthWindow || []).slice()
+		.forEach((fn) => fn({ detail: { state, url } }));
+	return { OAuthWindow: win.OAuthWindow, popups, win, wam, listeners,
+		tick: () => timers.slice().forEach((fn) => fn()) };
 }
 
 const REDIRECT = "http://localhost/boxnet/oauth2callback";
@@ -88,11 +93,82 @@ for (const file of COPIES) {
 for (const file of COPIES) {
 	const name = path.basename(path.dirname(path.dirname(file)));
 	test(`${name}: the window gets no size unless the caller asks for one`, () => {
+		const watch = 'attributes={"redirectPrefix":"' + REDIRECT + '"}';
 		let r = load(file);
 		r.OAuthWindow.open({ url: "https://example.com/a", redirectPrefix: REDIRECT });
-		assert.strictEqual(r.popups[0].features, "");
+		assert.strictEqual(r.popups[0].features, watch);
 		r = load(file);
 		r.OAuthWindow.open({ url: "https://example.com/a", redirectPrefix: REDIRECT, features: "height=300" });
-		assert.strictEqual(r.popups[0].features, "height=300");
+		assert.strictEqual(r.popups[0].features, "height=300," + watch);
+	});
+
+	test(`${name}: only an http(s) prefix with a host asks WAM to watch`, () => {
+		for (const [prefix, asked] of [
+			["https://tidal.com/login/auth", true], ["http://localhost/koofr/oauth2callback", true],
+			["msauth.com.microsoft.teams://auth", false], ["https:///x", false], [undefined, false],
+		]) {
+			const r = load(file);
+			r.OAuthWindow.open({ url: "https://example.com/a", redirectPrefix: prefix });
+			assert.strictEqual(r.popups[0].features.includes("attributes="), asked, String(prefix));
+		}
+	});
+
+	test(`${name}: WAM's "redirect" is the hit, also after COOP made the window look closed`, () => {
+		const r = load(file);
+		const got = [];
+		r.OAuthWindow.open({ url: "https://login.tidal.com/authorize", redirectPrefix: "https://tidal.com/login/auth",
+			onRedirect: (u) => got.push(u), onError: (m) => got.push("error: " + m) });
+		r.wam("watching");
+		r.popups[0].closed = true; // Cross-Origin-Opener-Policy cut the handle off
+		r.popups[0].location = null;
+		r.tick();
+		assert.deepStrictEqual(got, []);
+		r.wam("redirect", "https://tidal.com/login/auth?code=AbC");
+		assert.deepStrictEqual(got, ["https://tidal.com/login/auth?code=AbC"]);
+		r.wam("redirect", "https://tidal.com/login/auth?code=again");
+		r.wam("closed");
+		assert.strictEqual(got.length, 1);
+		assert.deepStrictEqual(r.listeners.webOSOAuthWindow, []);
+	});
+
+	test(`${name}: a caller's own attributes are not added to`, () => {
+		// A second attributes= would replace the caller's: WAM takes the last one.
+		const r = load(file);
+		r.OAuthWindow.open({ url: "https://example.com/a", redirectPrefix: REDIRECT, features: 'attributes={"window":"card"}' });
+		assert.strictEqual(r.popups[0].features, 'attributes={"window":"card"}');
+	});
+
+	test(`${name}: WAM's "closed" cancels`, () => {
+		const r = load(file);
+		const got = [];
+		r.OAuthWindow.open({ url: "https://app.koofr.net/oauth2/auth", redirectPrefix: "http://localhost/koofr/oauth2callback",
+			onRedirect: (u) => got.push(u), onError: (m) => got.push("error: " + m) });
+		r.wam("watching");
+		r.wam("closed");
+		assert.deepStrictEqual(got, ["error: Sign-in was cancelled."]);
+	});
+
+	test(`${name}: a missed "redirect" event is picked up from window.webOSOAuthRedirectUrl`, () => {
+		const r = load(file);
+		const got = [];
+		r.win.webOSOAuthRedirectUrl = "http://localhost/koofr/oauth2callback?code=stale";
+		r.OAuthWindow.open({ url: "https://app.koofr.net/oauth2/auth", redirectPrefix: "http://localhost/koofr/oauth2callback",
+			onRedirect: (u) => got.push(u) });
+		r.wam("watching");
+		r.tick();
+		assert.deepStrictEqual(got, [], "a URL left from an earlier sign-in counts");
+		r.win.webOSOAuthRedirectUrl = "http://localhost/koofr/oauth2callback?code=new";
+		r.tick();
+		assert.deepStrictEqual(got, ["http://localhost/koofr/oauth2callback?code=new"]);
+	});
+
+	test(`${name}: without "watching" (older WAM) a closed window still cancels`, () => {
+		const r = load(file);
+		const got = [];
+		r.OAuthWindow.open({ url: "https://account.box.com/api/oauth2/authorize", redirectPrefix: REDIRECT,
+			onError: (m) => got.push(m) });
+		r.popups[0].closed = true;
+		r.tick();
+		assert.deepStrictEqual(got, ["Sign-in was cancelled."]);
 	});
 }

@@ -150,9 +150,12 @@ var OAuth1 = {
 	getRequestToken: function () {
 		var self = this;
 		var f = new Future();
-		var url = this.signedUrl("GET", Config.REQUEST_TOKEN_URL,
-			{ oauth_callback: Config.CALLBACK_URL }, null, "");
-		f.now(this, function () { return HttpCurl.request({ method: "GET", url: url }); });
+		// Signed inside now(), as in FlickrApi.rest: a signing failure fails f instead of throwing.
+		f.now(this, function () {
+			var url = self.signedUrl("GET", Config.REQUEST_TOKEN_URL,
+				{ oauth_callback: Config.CALLBACK_URL }, null, "");
+			return HttpCurl.request({ method: "GET", url: url });
+		});
 		f.then(this, function () {
 			var r = f.result;
 			if (!r || r.status !== 200) {
@@ -182,9 +185,11 @@ var OAuth1 = {
 	getAccessToken: function (requestToken, requestTokenSecret, verifier) {
 		var self = this;
 		var f = new Future();
-		var url = this.signedUrl("GET", Config.ACCESS_TOKEN_URL,
-			{ oauth_verifier: verifier }, requestToken, requestTokenSecret);
-		f.now(this, function () { return HttpCurl.request({ method: "GET", url: url }); });
+		f.now(this, function () {
+			var url = self.signedUrl("GET", Config.ACCESS_TOKEN_URL,
+				{ oauth_verifier: verifier }, requestToken, requestTokenSecret);
+			return HttpCurl.request({ method: "GET", url: url });
+		});
 		f.then(this, function () {
 			var r = f.result;
 			if (!r || r.status !== 200) {

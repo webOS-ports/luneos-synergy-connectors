@@ -9,5 +9,6 @@
     "org.webosports.app.documents": ["synergy-s3.operation"],
     "org.webosports.app.photos-*": ["synergy-s3.operation"],
     "org.webosports.app.photos": ["synergy-s3.operation"],
-    "com.palm.service.photos": ["synergy-s3.operation"]
+    "com.palm.service.photos": ["synergy-s3.operation"],
+    "com.palm.stark.files.service": ["synergy-s3.operation"]
 }

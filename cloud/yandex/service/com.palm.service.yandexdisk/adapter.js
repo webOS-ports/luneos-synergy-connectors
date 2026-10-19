@@ -1,4 +1,4 @@
-/*global IMPORTS, Config, OAuth2, HttpCurl, console */
+/*global IMPORTS, Config, OAuth2, HttpCurl, console, setTimeout */
 /* adapter.js - Yandex Disk provider ADAPTER for _cloudcore. Yandex Disk is PATH-based
  * (like Dropbox): a resource is addressed by "disk:/Folder/file.docx", so a locator handed
  * to consumers IS a real path. Every request sends "Authorization: OAuth <token>" (NOT the
@@ -54,15 +54,22 @@ var Adapter = {
 			if (r && r.status === 401 && creds.refreshToken) {
 				var rf = OAuth2.refresh(creds.refreshToken);
 				rf.then(self, function () {
-					var t = null, tErr = null;
-						try { t = rf.result; } catch (e) { tErr = e; }
-						if (tErr) { f.setException(tErr); return; }
-					var nc = { accessToken: t.accessToken,
-						refreshToken: t.refreshToken || creds.refreshToken,
-						expiresAt: Date.now() + (t.expiresIn * 1000) };
-					if (onRenewed) { onRenewed(nc); }
-					var retry = fire(nc);
-					retry.then(self, function () { f.result = retry.result; });
+					// A refresh that failed, or anything thrown here, fails f: thrown inside rf's or retry's
+					// callback it would stay on that Future, and the request would never answer.
+					try {
+						var t = null, tErr = null;
+							try { t = rf.result; } catch (e) { tErr = e; }
+							if (tErr) { f.setException(tErr); return; }
+						var nc = { accessToken: t.accessToken,
+							refreshToken: t.refreshToken || creds.refreshToken,
+							expiresAt: Date.now() + (t.expiresIn * 1000) };
+						if (onRenewed) { onRenewed(nc); }
+						var retry = fire(nc);
+						retry.then(self, function () {
+							try { f.result = retry.result; }
+							catch (e2) { f.setException(e2); }
+						});
+					} catch (e) { f.setException(e); }
 				});
 				return;
 			}
@@ -107,15 +114,18 @@ var Adapter = {
 			try {
 				var res = self._parse(call.result) || {};
 				var items = (res._embedded && res._embedded.items) || [];
-				f.result = { entries: items.map(function (e) {
-					var isFolder = (e.type === "dir");
-					return { id: e.path, type: (isFolder ? "folder" : "file"),
-						name: e.name, size: e.size, modified: e.modified, path: e.path,
-						mimeType: e.mime_type };
-				}) };
+				f.result = { entries: items.map(function (e) { return self._entry(e); }) };
 			} catch (e) { f.setException(e); }   // reject, don't hang, on non-2xx / parse error
 		});
 		return f;
+	},
+
+	// One Yandex Resource object -> the normalised entry listFolder hands out (id = path).
+	_entry: function (e) {
+		var isFolder = (e.type === "dir");
+		return { id: e.path, type: (isFolder ? "folder" : "file"),
+			name: e.name, size: e.size, modified: e.modified, path: e.path,
+			mimeType: e.mime_type };
 	},
 
 	// Two-step download: GET /resources/download?path=.. -> { href, method }; then GET the
@@ -190,6 +200,124 @@ var Adapter = {
 				});
 			} catch (e) { f.setException(e); }
 		});
+		return f;
+	},
+
+	// --- File-manager operations (fileOps_commands.js) ----------------------------------
+	// Yandex Disk REST (https://yandex.com/dev/disk-api/doc/en/reference/create-folder, /move,
+	// /delete, /operations):
+	//   PUT    /resources?path=                       create a folder (201, a Link to it)
+	//   POST   /resources/move?from=&path=&overwrite=false   move and/or rename: path is the NEW
+	//          full path (201 done; 202 = a non-empty folder moving asynchronously)
+	//   DELETE /resources?path=                       to the Trash (no permanently=true);
+	//          204 done, 202 = asynchronous
+	// A 202 carries a Link to the operation; it is polled (GET, status "success" | "failed" |
+	// "in-progress") a bounded number of times. The new entry is read back with
+	// GET /resources?path=..&limit=0 because create/move only answer with a Link.
+	_POLL_TRIES: 30,
+	_POLL_DELAY_MS: 1000,
+	_later: function (fn, ms) { setTimeout(fn, ms); },
+
+	_tracker: function (creds, cb) {
+		var t = { creds: creds };
+		t.renew = function (nc) { t.creds = nc; if (cb) { cb(nc); } };
+		return t;
+	},
+
+	// The parent folder of a "disk:/a/b" locator ("disk:/a"; "disk:/" for a top-level item).
+	_parentOf: function (p) {
+		var s = String(p).replace(/\/+$/, "");
+		var i = s.lastIndexOf("/");
+		var d = (i >= 0) ? s.substring(0, i) : "";
+		return (!d || d.charAt(d.length - 1) === ":") ? d + "/" : d;
+	},
+	// Last path component, as is (Disk paths are not URL-encoded, unlike _leaf's album names).
+	_base: function (p) {
+		var s = String(p).replace(/\/+$/, "");
+		return s.substring(s.lastIndexOf("/") + 1);
+	},
+
+	// Settle `f` once the request answered: 2xx done -> next(); 202 -> poll the operation first.
+	_settle: function (t, call, f, next) {
+		var self = this;
+		call.then(this, function () {
+			var r, link;
+			// All in the try, next() too: call is not f, so a throw here would stay on call.
+			try {
+				r = call.result; link = self._parse(r);
+				if (r.status !== 202) { next(); return; }
+				self._poll(t, link && link.href, 0, f, next);
+			} catch (e) { f.setException(e); }
+		});
+	},
+
+	// The operation href must be on the API host: it gets the OAuth header.
+	_poll: function (t, href, n, f, next) {
+		var self = this;
+		var origin = String(Config.API_BASE).replace(/^(https:\/\/[^\/]+\/).*$/, "$1");
+		if (!href || String(href).indexOf(origin) !== 0) {
+			f.setException({ returnValue: false, errorCode: "YANDEX_BAD_OPERATION", href: href || null });
+			return;
+		}
+		var st = this._req({ method: "GET", url: href }, t.creds, t.renew);
+		st.then(this, function () {
+			var op;
+			try { op = self._parse(st.result) || {}; } catch (e) { f.setException(e); return; }
+			if (op.status === "success") {
+				try { next(); } catch (e1) { f.setException(e1); }   // st is not f: a throw would stay on st
+				return;
+			}
+			if (op.status === "failed") {
+				f.setException({ returnValue: false, errorCode: "YANDEX_OPERATION_FAILED", href: href });
+				return;
+			}
+			if (n + 1 >= self._POLL_TRIES) {
+				f.setException({ returnValue: false, errorCode: "YANDEX_OPERATION_TIMEOUT", href: href,
+					status: op.status });
+				return;
+			}
+			self._later(function () { self._poll(t, href, n + 1, f, next); }, self._POLL_DELAY_MS);
+		});
+	},
+
+	// GET /resources?path=..&limit=0 -> { entry } into `f`.
+	_entryAt: function (t, path, f) {
+		var self = this;
+		var url = Config.API_BASE + "/resources?path=" + encodeURIComponent(path) + "&limit=0";
+		var call = this._req({ method: "GET", url: url }, t.creds, t.renew);
+		call.then(this, function () {
+			try { f.result = { entry: self._entry(self._parse(call.result) || {}) }; }
+			catch (e) { f.setException(e); }
+		});
+	},
+
+	createFolder: function (creds, parent, name, cb) {
+		var self = this, f = new Future(), t = this._tracker(creds, cb);
+		var path = this._join(parent, name);
+		var call = this._req({ method: "PUT",
+			url: Config.API_BASE + "/resources?path=" + encodeURIComponent(path) }, creds, t.renew);
+		this._settle(t, call, f, function () { self._entryAt(t, path, f); });
+		return f;
+	},
+
+	// toFolder null = rename in place; name null = keep the name; both = one move to the new path.
+	moveItem: function (creds, item, toFolder, name, cb) {
+		var self = this, f = new Future(), t = this._tracker(creds, cb);
+		var from = this._normPath(item);
+		var dst = this._join(toFolder ? toFolder : this._parentOf(from),
+			(name === null || name === undefined) ? this._base(from) : name);
+		var call = this._req({ method: "POST", url: Config.API_BASE + "/resources/move?from=" +
+			encodeURIComponent(from) + "&path=" + encodeURIComponent(dst) + "&overwrite=false" }, creds, t.renew);
+		this._settle(t, call, f, function () { self._entryAt(t, dst, f); });
+		return f;
+	},
+
+	// To the Trash (permanently is not sent; deletePhoto is the one that deletes for good).
+	deleteItem: function (creds, item, cb) {
+		var f = new Future(), t = this._tracker(creds, cb);
+		var call = this._req({ method: "DELETE",
+			url: Config.API_BASE + "/resources?path=" + encodeURIComponent(this._normPath(item)) }, creds, t.renew);
+		this._settle(t, call, f, function () { f.result = {}; });
 		return f;
 	},
 

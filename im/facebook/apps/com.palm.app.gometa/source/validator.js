@@ -40,7 +40,7 @@ enyo.kind({
                       oninput: "validateInput", onkeydown: "checkForEnter" }
                 ]},
                 { kind: "RowGroup", caption: "PASSWORD", className: "accounts-group", components: [
-                    { kind: "Input", name: "password", type: "password", hint: "Facebook password",
+                    { kind: "PasswordInput", name: "password", hint: "Facebook password",
                       spellcheck: false, autocorrect: false, autoWordComplete: false, autoCapitalize: "lowercase",
                       oninput: "validateInput", onkeydown: "checkForEnter" }
                 ]},

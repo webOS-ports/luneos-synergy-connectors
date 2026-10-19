@@ -30,7 +30,10 @@ ListPhotosCommandAssistant.prototype = {
 				var entries;
 				try { entries = (lf.result && lf.result.entries) || []; }
 				catch (e2) { future.setException(e2); return; }
-				var images = entries.filter(PhotoLib.isImage);
+				// Here and around next(): lf (and each link's Future) is not future, so a throw in
+				// their callbacks would stay there and the command never answer.
+				var images;
+				try { images = entries.filter(PhotoLib.isImage); } catch (e3) { future.setException(e3); return; }
 				var photos = [], i = 0;
 
 				function finish() {
@@ -50,10 +53,10 @@ ListPhotosCommandAssistant.prototype = {
 						} else {
 							console.log("mega: listPhotos - could not fetch/decrypt " + e.id);
 						}
-						next();
+						try { next(); } catch (eN) { future.setException(eN); }
 					});
 				}
-				next();
+				try { next(); } catch (eN) { future.setException(eN); }
 			});
 		});
 	}

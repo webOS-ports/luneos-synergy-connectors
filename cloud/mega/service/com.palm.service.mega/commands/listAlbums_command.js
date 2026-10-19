@@ -25,16 +25,19 @@ ListAlbumsCommandAssistant.prototype = {
 			af.then(self, function () {
 				var albums;
 				try { albums = (af.result && af.result.albums) || []; } catch (e2) { albums = []; }
-				if (renewed && args.accountId) { AccountCreds.save(args.accountId, renewed); }
-				var out = albums.map(function (a) {
-					return { aid: a.aid, name: a.name, size: { images: a.images || 0 } };
-				});
-				if (!out.length) {
-					// No images anywhere yet - keep the source visible with an empty placeholder.
-					out = [{ aid: "", name: (Config && Config.PHOTO_ALBUM_NAME) || "Camera Uploads",
-						size: { images: 0 } }];
-				}
-				future.result = { returnValue: true, albums: out };
+				// af is not future: a throw here would stay on af and the command never answer.
+				try {
+					if (renewed && args.accountId) { AccountCreds.save(args.accountId, renewed); }
+					var out = albums.map(function (a) {
+						return { aid: a.aid, name: a.name, size: { images: a.images || 0 } };
+					});
+					if (!out.length) {
+						// No images anywhere yet - keep the source visible with an empty placeholder.
+						out = [{ aid: "", name: (Config && Config.PHOTO_ALBUM_NAME) || "Camera Uploads",
+							size: { images: 0 } }];
+					}
+					future.result = { returnValue: true, albums: out };
+				} catch (e3) { future.setException(e3); }
 			});
 		});
 	}

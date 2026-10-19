@@ -10,6 +10,9 @@
  * the same situation as the pCloud/Google connectors). Set the redirect URI to REDIRECT_URI
  * below. Request scope "user,rw". Paste the Client ID + Client secret into CLIENT_ID/SECRET.
  */
+/* The OAuth app's credentials are not kept here. The build fills the PLACEHOLDER_HIDRIVE_*
+ * values in from HIDRIVE_CLIENT_ID / HIDRIVE_CLIENT_SECRET (meta-luneos
+ * cloud-synergy-connector.inc); a package built without them cannot sign in. */
 var Config = {
 	// Modern-TLS HTTP: device node is OpenSSL 0.9.8k and cannot handshake with HiDrive, so ALL
 	// HiDrive HTTPS shells out to the bundled modern curl (same binary + CA store as the others).
@@ -17,10 +20,10 @@ var Config = {
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
 
-	CLIENT_ID:     "2c0b0760455d5390b9a682232f844c8e",   // HiDrive "Synergy connector for webOS and LuneOS"
+	CLIENT_ID:     "PLACEHOLDER_HIDRIVE_CLIENT_ID", // from the build, see config.js header
 	// REQUIRED for HiDrive (no PKCE - the token exchange must send the secret). It ships in the
 	// package; oauth2.js sends it because it is not left as the PLACEHOLDER sentinel.
-	CLIENT_SECRET: "10f40a8e67a590a758d507026bc0d7fc",   // HiDrive app Client secret
+	CLIENT_SECRET: "PLACEHOLDER_HIDRIVE_CLIENT_SECRET", // from the build, see config.js header
 	// HiDrive "native" apps require a localhost redirect WITH a port (http://localhost:<port>).
 	// The cloud-auth webview captures it by URL-prefix match, so nothing listens on the port -
 	// this value MUST match the redirect URI registered for the app verbatim.
@@ -50,7 +53,7 @@ var Config = {
 	AUTHORIZE_EXTRA:  "",
 	TOKEN_SEND_SCOPE: false,            // HiDrive derives scope from the grant
 	AUTH_APP_IDS:  ["com.palm.app.cloud-auth"],
-	FILE_APP_IDS:  ["org.webosports.app.documents", "org.webosports.app.documents-*"]
+	FILE_APP_IDS:  ["org.webosports.app.documents", "org.webosports.app.documents-*", "com.palm.stark.files.service"]
 };
 
 if (typeof exports !== "undefined") { exports.Config = Config; }

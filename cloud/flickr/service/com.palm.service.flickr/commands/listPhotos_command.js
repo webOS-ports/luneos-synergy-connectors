@@ -36,15 +36,18 @@ ListPhotosCommandAssistant.prototype = {
 					return;
 				}
 				// people.getPhotos -> data.photos.photo[]; photosets.getPhotos -> data.photoset.photo[].
-				var raw = (data.photos && data.photos.photo) ||
-					(data.photoset && data.photoset.photo) || [];
-				var photos = [];
-				raw.forEach(function (p) {
-					if (!PhotoLib.isImage(p)) { return; }
-					var entry = PhotoLib.toPhotoEntry(p);
-					if (entry) { photos.push(entry); }
-				});
-				future.result = { returnValue: true, photos: photos };
+				// listF is not future: a throw here would stay on listF and the command never answer.
+				try {
+					var raw = (data.photos && data.photos.photo) ||
+						(data.photoset && data.photoset.photo) || [];
+					var photos = [];
+					raw.forEach(function (p) {
+						if (!PhotoLib.isImage(p)) { return; }
+						var entry = PhotoLib.toPhotoEntry(p);
+						if (entry) { photos.push(entry); }
+					});
+					future.result = { returnValue: true, photos: photos };
+				} catch (e3) { future.setException(e3); }
 			});
 		});
 	}

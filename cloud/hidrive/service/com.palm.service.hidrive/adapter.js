@@ -55,15 +55,22 @@ var Adapter = {
 			if (r && r.status === 401 && creds.refreshToken) {
 				var rf = OAuth2.refresh(creds.refreshToken);
 				rf.then(self, function () {
-					var t = null, tErr = null;
-					try { t = rf.result; } catch (e) { tErr = e; }
-					if (tErr) { f.setException(tErr); return; }
-					var nc = { accessToken: t.accessToken,
-						refreshToken: t.refreshToken || creds.refreshToken,
-						expiresAt: Date.now() + (t.expiresIn * 1000) };
-					if (onRenewed) { onRenewed(nc); }
-					var retry = fire(nc);
-					retry.then(self, function () { f.result = retry.result; });
+					// A refresh that failed, or anything thrown here, fails f: thrown inside rf's or retry's
+					// callback it would stay on that Future, and the request would never answer.
+					try {
+						var t = null, tErr = null;
+						try { t = rf.result; } catch (e) { tErr = e; }
+						if (tErr) { f.setException(tErr); return; }
+						var nc = { accessToken: t.accessToken,
+							refreshToken: t.refreshToken || creds.refreshToken,
+							expiresAt: Date.now() + (t.expiresIn * 1000) };
+						if (onRenewed) { onRenewed(nc); }
+						var retry = fire(nc);
+						retry.then(self, function () {
+							try { f.result = retry.result; }
+							catch (e2) { f.setException(e2); }
+						});
+					} catch (e) { f.setException(e); }
 				});
 				return;
 			}
@@ -139,18 +146,21 @@ var Adapter = {
 				try {
 					var res = self._parse(call.result) || {};
 					var members = res.members || [];
-					f.result = { entries: members.map(function (m) {
-						var isFolder = (m.type === "dir");
-						var name = self._dec(m.name), path = self._dec(m.path);
-						return { id: path, type: (isFolder ? "folder" : "file"),
-							name: name, size: m.size || 0,
-							modified: m.mtime ? (m.mtime * 1000) : 0, path: path,
-							mimeType: self._mime(name, isFolder) };
-					}) };
+					f.result = { entries: members.map(function (m) { return self._entry(m); }) };
 				} catch (e) { f.setException(e); }
 			});
 		});
 		return f;
+	},
+
+	// One HiDrive member/meta object -> the normalised entry listFolder hands out (id = path).
+	_entry: function (m) {
+		var isFolder = (m.type === "dir");
+		var name = this._dec(m.name), path = this._dec(m.path);
+		return { id: path, type: (isFolder ? "folder" : "file"),
+			name: name, size: m.size || 0,
+			modified: m.mtime ? (m.mtime * 1000) : 0, path: path,
+			mimeType: this._mime(name, isFolder) };
 	},
 
 	// GET /file?path=.. -> bytes to disk.
@@ -178,7 +188,8 @@ var Adapter = {
 		f.then(this, function () {
 			var dir;
 			try { dir = pf.result; } catch (e0) { f.setException(e0); return; }
-			f.result = self._put(creds, dir, name, localPath, cb);
+			// nest: Foundations stores a Future assigned to .result as the result itself.
+			f.nest(self._put(creds, dir, name, localPath, cb));
 		});
 		return f;
 	},
@@ -201,6 +212,129 @@ var Adapter = {
 		return f;
 	},
 
+	// --- File-manager operations (fileOps_commands.js) ----------------------------------
+	// HiDrive REST 2.1 (https://api.hidrive.strato.com/2.1/static/apidoc/api.json):
+	//   POST /dir?path=          create (201, the new dir's metadata)
+	//   POST /file|dir/rename?path=&name=      rename in place (200/201, the object's metadata)
+	//   POST /file|dir/move?src=&dst=          move, dst = the object's NEW full path (200)
+	//   DELETE /file?path= | /dir?path=&recursive=true   (204)
+	// There is no trash in the 2.1 API, so deleteItem deletes for good. A path does not say
+	// whether it is a file or a directory and every endpoint above is per type, so moveItem and
+	// deleteItem first ask GET /meta?path=&fields=type (one small request; /fs/move cannot
+	// rename and /fs/delete answers a multi-status batch). No on_exist is sent: a name that is
+	// already taken fails with 409 instead of overwriting or auto-renaming.
+
+	// The credentials to use after a refresh: later requests of one operation use the renewed
+	// token instead of hitting 401 again with the old one.
+	_tracker: function (creds, cb) {
+		var t = { creds: creds };
+		t.renew = function (nc) { t.creds = nc; if (cb) { cb(nc); } };
+		return t;
+	},
+
+	// Authenticated request -> Future of the parsed JSON body; a non-2xx is a failed Future.
+	_api: function (t, method, url) {
+		var self = this, f = new Future();
+		var call = this._authCall(t.creds, { method: method, url: url }, t.renew);
+		call.then(this, function () {
+			try { f.result = self._parse(call.result) || {}; } catch (e) { f.setException(e); }
+		});
+		return f;
+	},
+
+	// "dir" or "file" (a symlink is handled through the /file endpoints).
+	_kind: function (t, p) {
+		var f = new Future();
+		var meta = this._api(t, "GET", Config.API_BASE + "/meta?path=" + this._enc(p) + "&fields=type");
+		meta.then(this, function () {
+			try { f.result = (meta.result.type === "dir") ? "dir" : "file"; } catch (e) { f.setException(e); }
+		});
+		return f;
+	},
+
+	_child: function (dir, name) { return String(dir).replace(/\/+$/, "") + "/" + name; },
+
+	// Entry from an operation's metadata reply; falls back to the path the call addressed.
+	_opEntry: function (m, path) {
+		var e = this._entry(m || {});
+		if (!m || !m.path) { e.id = e.path = path; }
+		if (!m || !m.name) { e.name = this._leaf(e.path); e.mimeType = this._mime(e.name, e.type === "folder"); }
+		return { entry: e };
+	},
+
+	createFolder: function (creds, parent, name, cb) {
+		var self = this, f = new Future(), t = this._tracker(creds, cb);
+		var pf = this._resolve(creds, parent, t.renew);
+		pf.then(this, function () {
+			var dir;
+			try { dir = pf.result; } catch (e0) { f.setException(e0); return; }
+			var path, call;
+			// In a try: pf is not f, so a throw in this callback would stay on pf.
+			try {
+				path = self._child(dir, name);
+				call = self._api(t, "POST", Config.API_BASE + "/dir?path=" + self._enc(path));
+			} catch (e1) { f.setException(e1); return; }
+			call.then(self, function () {
+				try { f.result = self._opEntry(call.result, path); } catch (e) { f.setException(e); }
+			});
+		});
+		return f;
+	},
+
+	// toFolder null = rename in place; name null = keep the name; both = move and rename at once.
+	moveItem: function (creds, item, toFolder, name, cb) {
+		var self = this, f = new Future(), t = this._tracker(creds, cb);
+		var kf = this._kind(t, item);
+		kf.then(this, function () {
+			var kind;
+			try { kind = kf.result; } catch (e0) { f.setException(e0); return; }
+			function done(call, path) {
+				call.then(self, function () {
+					try { f.result = self._opEntry(call.result, path); } catch (e) { f.setException(e); }
+				});
+			}
+			// The steps below in try blocks: kf and df are not f, so a throw in their callbacks
+			// would stay there and the move would never answer.
+			if (!toFolder) {
+				try {
+					done(self._api(t, "POST", Config.API_BASE + "/" + kind + "/rename?path=" + self._enc(item) +
+						"&name=" + self._enc(name)), self._child(self._dirOf(item), name));
+				} catch (e2) { f.setException(e2); }
+				return;
+			}
+			var df = self._resolve(t.creds, toFolder, t.renew);
+			df.then(self, function () {
+				try {
+					var dir = df.result;
+					var dst = self._child(dir, (name === null || name === undefined) ? self._leaf(item) : name);
+					done(self._api(t, "POST", Config.API_BASE + "/" + kind + "/move?src=" + self._enc(item) +
+						"&dst=" + self._enc(dst)), dst);
+				} catch (e1) { f.setException(e1); }
+			});
+		});
+		return f;
+	},
+
+	// Permanent: HiDrive's API has no trash. A directory goes with its contents.
+	deleteItem: function (creds, item, cb) {
+		var self = this, f = new Future(), t = this._tracker(creds, cb);
+		var kf = this._kind(t, item);
+		kf.then(this, function () {
+			var kind;
+			var call;
+			// In a try: kf is not f, so a throw in this callback would stay on kf.
+			try {
+				kind = kf.result;
+				call = self._api(t, "DELETE", Config.API_BASE + "/" + kind + "?path=" + self._enc(item) +
+					(kind === "dir" ? "&recursive=true" : ""));
+			} catch (e0) { f.setException(e0); return; }
+			call.then(self, function () {
+				try { call.result; f.result = {}; } catch (e) { f.setException(e); }
+			});
+		});
+		return f;
+	},
+
 	// --- PHOTO.UPLOAD helpers ------------------------------------------------------------
 	// Enumerate BROWSABLE photo albums: the account HOME (its direct image children - people keep
 	// photos at the top level, as this account does) plus every immediate sub-folder that holds at
@@ -218,31 +352,37 @@ var Adapter = {
 			var home;
 			try { home = hf.result; } catch (e) { f.setException(e); return; }
 			var lf = self.listFolder(creds, home, cb);
+			// Everything in lf's and each sf's callback in a try: neither is f, so a throw there
+			// would stay on it and the album list would never answer.
 			lf.then(self, function () {
 				var entries;
 				try { entries = (lf.result && lf.result.entries) || []; } catch (e2) { entries = []; }
 				var albums = [], homeImgs = 0, folders = [];
-				entries.forEach(function (e) {
-					if (self._isImg(e)) { homeImgs++; }
-					else if (e.type === "folder") { folders.push(e); }
-				});
-				if (homeImgs) { albums.push({ aid: home, name: "HiDrive", images: homeImgs }); }
-				// Probe each immediate sub-folder for images (bounded to one level).
 				var i = 0;
 				function nextFolder() {
 					if (i >= folders.length) { f.result = { albums: albums }; return; }
 					var fld = folders[i++];
 					var sf = self.listFolder(creds, fld.id, cb);
 					sf.then(self, function () {
-						var se;
-						try { se = (sf.result && sf.result.entries) || []; } catch (e3) { se = []; }
-						var c = 0;
-						se.forEach(function (x) { if (self._isImg(x)) { c++; } });
-						if (c) { albums.push({ aid: fld.id, name: fld.name, images: c }); }
-						nextFolder();
+						try {
+							var se;
+							try { se = (sf.result && sf.result.entries) || []; } catch (e3) { se = []; }
+							var c = 0;
+							se.forEach(function (x) { if (self._isImg(x)) { c++; } });
+							if (c) { albums.push({ aid: fld.id, name: fld.name, images: c }); }
+							nextFolder();
+						} catch (e4) { f.setException(e4); }
 					});
 				}
-				nextFolder();
+				try {
+					entries.forEach(function (e) {
+						if (self._isImg(e)) { homeImgs++; }
+						else if (e.type === "folder") { folders.push(e); }
+					});
+					if (homeImgs) { albums.push({ aid: home, name: "HiDrive", images: homeImgs }); }
+					// Probe each immediate sub-folder for images (bounded to one level).
+					nextFolder();
+				} catch (e5) { f.setException(e5); }
 			});
 		});
 		return f;
@@ -278,7 +418,9 @@ var Adapter = {
 			var call = self._authCall(creds, { method: "POST",
 				url: Config.API_BASE + "/dir?path=" + self._enc(path) }, cb);
 			call.then(self, function () {
-				var r = call.result;
+				// A request that got no answer throws here; caught, or it would stay on call.
+				var r;
+				try { r = call.result; } catch (e2) { f.setException(e2); return; }
 				// 201 Created or 409 (exists) are both success.
 				if (r && (r.status === 409 || (r.status >= 200 && r.status < 300))) { f.result = path; }
 				else { f.setException({ returnValue: false, errorCode: "HIDRIVE_MKDIR_FAILED", status: r && r.status }); }
@@ -302,7 +444,8 @@ var Adapter = {
 		var call = this._authCall(creds, { method: "DELETE",
 			url: Config.API_BASE + "/file?path=" + this._enc(fileId) }, cb);
 		call.then(this, function () {
-			var r = call.result;
+			var r;
+			try { r = call.result; } catch (e) { f.setException(e); return; }
 			if (r && (r.status === 204 || (r.status >= 200 && r.status < 300))) { f.result = { deleted: true }; }
 			else { f.setException({ returnValue: false, errorCode: "HIDRIVE_DELETE_FAILED", status: r && r.status }); }
 		});
