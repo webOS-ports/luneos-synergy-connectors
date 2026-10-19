@@ -8,6 +8,9 @@
  *   uploadFile(creds, folderId, localPath, name, mimeType, cb) -> { id, name, size }
  *   uploadReplace(creds, fileId, localPath, mimeType, cb)      -> { id, name, size }
  *   getAccountInfo(creds, cb)                        -> { user:{ displayName, emailAddress } }
+ *   createFolder(creds, parent, name, cb)            -> { entry }   (listFolder-shaped)
+ *   moveItem(creds, item, toFolder|null, name|null, cb) -> { entry }
+ *   deleteItem(creds, item, cb)                      -> {}          (to the Drive trash)
  *
  * Drive quirks other providers don't have:
  *   - children are found by QUERY (files?q='{parentId}' in parents), not a path walk; a folder
@@ -71,6 +74,20 @@ var Adapter = {
 		return this.get("/about?fields=user", creds, cb);
 	},
 
+	// The metadata every entry needs; listFolder asks for files(FIELDS), the file ops for FIELDS.
+	FIELDS: "id,name,mimeType,size,modifiedTime",
+	FOLDER_MIME: "application/vnd.google-apps.folder",
+
+	// One Drive file resource -> the NORMALISED entry listFolder hands out.
+	_entry: function (e) {
+		var isFolder = (e.mimeType === "application/vnd.google-apps.folder");
+		var isGoogleDoc = (!isFolder && e.mimeType &&
+			e.mimeType.indexOf("application/vnd.google-apps.") === 0);
+		return { id: e.id, type: (isFolder ? "folder" : "file"),
+			name: e.name, size: e.size, modified: e.modifiedTime, path: e.id,
+			mimeType: e.mimeType, googleDoc: isGoogleDoc };
+	},
+
 	// List a folder's children by query, returning NORMALISED entries.
 	// NOTE: capped at pageSize 1000; folders with more are truncated (no pagination loop).
 	listFolder: function (creds, folderId, cb) {
@@ -78,20 +95,13 @@ var Adapter = {
 		var id = folderId || Config.ROOT_FOLDER;
 		var q = "'" + id + "' in parents and trashed = false";
 		var url = "/files?q=" + encodeURIComponent(q) +
-			"&fields=" + encodeURIComponent("files(id,name,mimeType,size,modifiedTime),nextPageToken") +
+			"&fields=" + encodeURIComponent("files(" + this.FIELDS + "),nextPageToken") +
 			"&pageSize=1000&orderBy=folder,name";
 		var call = this.get(url, creds, cb);
 		f.now(this, function () { return call; });
 		f.then(this, function () {
 			var data = f.result || {};
-			f.result = { entries: (data.files || []).map(function (e) {
-				var isFolder = (e.mimeType === "application/vnd.google-apps.folder");
-				var isGoogleDoc = (!isFolder && e.mimeType &&
-					e.mimeType.indexOf("application/vnd.google-apps.") === 0);
-				return { id: e.id, type: (isFolder ? "folder" : "file"),
-					name: e.name, size: e.size, modified: e.modifiedTime, path: e.id,
-					mimeType: e.mimeType, googleDoc: isGoogleDoc };
-			}) };
+			f.result = { entries: (data.files || []).map(function (e) { return self._entry(e); }) };
 		});
 		return f;
 	},
@@ -146,6 +156,89 @@ var Adapter = {
 				"?uploadType=media&fields=id,name,size",
 			headers: { "Content-Type": mimeType || "application/octet-stream" },
 			dataFile: localPath }, creds, cb, false);
+	},
+
+	// A Future that settles with fn(call's result), or with call's exception.
+	_map: function (call, fn) {
+		var self = this, f = new Future();
+		call.then(this, function () {
+			try { f.result = fn.call(self, call.result); }
+			catch (e) { f.setException(e); }
+		});
+		return f;
+	},
+
+	// A JSON metadata request against API_BASE (path starts with "/files").
+	_json: function (method, path, body, creds, onRenewed) {
+		return this._req({ method: method, url: Config.API_BASE + path,
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body) }, creds, onRenewed, false);
+	},
+
+	// files.create with the folder mimeType. parent is a listFolder locator (an id or "root").
+	// -> { entry }
+	createFolder: function (creds, parent, name, cb) {
+		var call = this._json("POST", "/files?fields=" + encodeURIComponent(this.FIELDS),
+			{ name: name, mimeType: this.FOLDER_MIME, parents: [parent || Config.ROOT_FOLDER] },
+			creds, cb);
+		return this._map(call, function (r) { return { entry: this._entry(r) }; });
+	},
+
+	// Rename and/or move: files.update. A move needs the current parents (removeParents) and,
+	// for the "root" alias, the root's real id, since files.get reports parents by real id and
+	// adding and removing the same folder must not happen. -> { entry }
+	moveItem: function (creds, item, toFolder, name, cb) {
+		var self = this, f = new Future();
+		var renewed = null;
+		function onR(nc) { renewed = nc; if (cb) { cb(nc); } }
+		function cur() { return renewed || creds; }
+		var fileUrl = "/files/" + encodeURIComponent(item);
+		var body = (name === null || name === undefined) ? {} : { name: name };
+
+		function patch(query) {
+			var p = self._map(self._json("PATCH", fileUrl + "?" + query + "fields=" +
+				encodeURIComponent(self.FIELDS), body, cur(), onR),
+				function (r) { return { entry: this._entry(r) }; });
+			p.then(self, function () {
+				try { f.result = p.result; }
+				catch (e) { f.setException(e); }
+			});
+		}
+
+		if (!toFolder) { patch(""); return f; }
+
+		var parentsF = self.get(fileUrl + "?fields=parents", creds, onR);
+		parentsF.then(self, function () {
+			var parents;
+			try { parents = parentsF.result.parents || []; }
+			catch (e) { f.setException(e); return; }
+			function withTarget(targetId) {
+				var stays = parents.indexOf(targetId) >= 0;
+				var others = parents.filter(function (p) { return p !== targetId; });
+				var q = "";
+				if (!stays) { q += "addParents=" + encodeURIComponent(targetId) + "&"; }
+				if (others.length) { q += "removeParents=" + encodeURIComponent(others.join(",")) + "&"; }
+				patch(q);
+			}
+			if (toFolder !== Config.ROOT_FOLDER) { withTarget(toFolder); return; }
+			var rootF = self.get("/files/" + encodeURIComponent(Config.ROOT_FOLDER) + "?fields=id",
+				cur(), onR);
+			rootF.then(self, function () {
+				var rootId;
+				try { rootId = rootF.result.id; }
+				catch (e2) { f.setException(e2); return; }
+				withTarget(rootId);
+			});
+		});
+		return f;
+	},
+
+	// To the Drive trash (files.update trashed:true), not files.delete, so it can be restored.
+	// Only the owner can trash a file; anyone else gets 403 insufficientFilePermissions. -> {}
+	deleteItem: function (creds, item, cb) {
+		var call = this._json("PATCH", "/files/" + encodeURIComponent(item) + "?fields=id",
+			{ trashed: true }, creds, cb);
+		return this._map(call, function () { return {}; });
 	}
 };
 
