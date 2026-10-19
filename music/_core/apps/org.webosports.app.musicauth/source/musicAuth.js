@@ -68,7 +68,7 @@ enyo.kind({
 			// ------- credential / info entry -------
 			{ name: "entryBox", className: "box-center", components: [
 				{ name: "emailGroup", showing: false, kind: "RowGroup", caption: "EMAIL", className: "accounts-group", components: [
-					{ kind: "Input", name: "email", hint: "you@example.com", type: "text", spellcheck: false,
+					{ kind: "Input", name: "email", hint: "you@example.com", spellcheck: false,
 					  autocorrect: false, autoWordComplete: false, autoCapitalize: "lowercase", oninput: "validateInput" }
 				]},
 				{ name: "passwordGroup", showing: false, kind: "RowGroup", caption: "PASSWORD", className: "accounts-group", components: [
@@ -77,7 +77,7 @@ enyo.kind({
 					{ kind: "PasswordInput", name: "password", hint: "Password", autoWordComplete: false, oninput: "validateInput" }
 				]},
 				{ name: "arlGroup", showing: false, kind: "RowGroup", caption: "ARL COOKIE", className: "accounts-group", components: [
-					{ kind: "Input", name: "arl", hint: "Paste your deezer ARL", type: "text", spellcheck: false,
+					{ kind: "Input", name: "arl", hint: "Paste your deezer ARL", spellcheck: false,
 					  autocorrect: false, autoWordComplete: false, autoCapitalize: "none", oninput: "validateInput" }
 				]},
 				{ name: "errorBox", kind: "HFlexBox", showing: false, align: "center", className: "error-box", style: "padding:8px 16px;", components: [
