@@ -1,376 +1,273 @@
-/*global IMPORTS, Config, HttpCurl, console */
-/* adapter.js - Infomaniak kDrive REST provider ADAPTER for _cloudcore. kDrive is RESTful and
- * numeric-ID addressed (drive root dir id = 1) with two traits baked in here:
- *   1. TOKEN AUTH. A personal API token is sent as a Bearer header (creds.accessToken). The
- *      per-account drive id rides in creds.driveId (discovered at account-add). There is NO
- *      refresh flow - the token is long-lived - so the cb/onRenewed arg is accepted only for
- *      call-site symmetry and never invoked.
- *   2. RESULT ENVELOPE + MIXED VERSIONS. Responses are HTTP 200 with { result, data } (a
- *      nonzero/"error" result -> exception via _parse). files list/metadata + upload use the
- *      v3 path; drive list + download use v2. _url(version, path) builds each explicitly.
- * All HTTPS runs through _cloudcore/httpcurl because the device node is OpenSSL 0.9.8k.
+/* adapter.js - Infomaniak kDrive REST API for _cloudcore/node (commands.js there has the interface).
  *
- * Uniform _cloudcore adapter interface (normalised shapes):
- *   listFolder(creds, folderId, cb) -> { entries:[{id,type,name,size,modified,path,mimeType}] }
- *   downloadFile(creds, fileId, localDest, exportMime, cb) -> { path }   (exportMime ignored)
- *   uploadFile(creds, folderId, localPath, name, mimeType, cb) -> kDrive file object
- *   uploadReplace(creds, fileId, localPath, mimeType, cb)      -> kDrive file object
- *   getAccountInfo(creds, cb) -> { user:{ displayName, emailAddress } }
- * Plus listDrives()/getProfile() used by the token-verify command to auto-discover the drive.
+ * kDrive is REST and addressed by numeric ids, per drive: /{version}/drive/{driveId}/files/{id}.
+ * The versions differ per endpoint (https://developer.infomaniak.com/docs/api): listing, file
+ * info, new folders, moves and uploads are v3; the drive list, the profile, download, rename and
+ * delete are v2. Replies are an envelope, { result:"success", data, cursor?, has_more? }, or
+ * { result:"error", error:{ code, description } } (with a 4xx/5xx status as a rule).
+ *
+ * The drive root (id 1, ROOT_FOLDER) is a container that cannot be written to; the user's files
+ * live in the private space under it (visibility "is_private_space"), which is what this adapter
+ * treats as the root: "", "root", "/" and 1 all mean the private space. The ids handed out are
+ * strings (Documents and QuickOffice do string operations on them).
+ *
+ * The credentials (common) carry, next to the token, what was found from it: accountId, driveId
+ * and rootFolderId. verifyToken / exchangeCode fill them in at account-add; credentials without
+ * them (an inline token, an older account) find them on first use, and the session then reports
+ * and saves them like a renewed token. A refresh (an OAuth account, on a 401) keeps them, as
+ * creds.js's renewedFrom keeps every other field.
+ *
+ * Every failure rejects: a reply outside 2xx is KDRIVE_HTTP_ERROR with its status and body
+ * (KDRIVE_DOWNLOAD_FAILED for a download, KDRIVE_DELETE_FAILED for deletePhoto, as before);
+ * an error envelope on a 2xx is KDRIVE_API_ERROR.
  */
-var Foundations = IMPORTS.foundations;
-var Future = Foundations.Control.Future;
+"use strict";
 
-// Local fs, used only to size uploads (kDrive requires total_size up front). require() is
-// available in the service context, same as _cloudcore/httpcurl; fall back to IMPORTS.require.
-var _fs = (function () {
+const fsp = require("node:fs/promises");
+
+const ERROR = "KDRIVE_HTTP_ERROR";
+const API_ERROR = "KDRIVE_API_ERROR";
+const PAGE = 1000;   // the listing's largest page (limit 5..1000, default 10)
+const IMAGE_RE = /\.(jpe?g|png|gif|bmp|tiff?|heic|heif|webp)$/i;
+
+// The errorText of a kDrive error reply: its error code and description where it has them.
+function describe(status, body) {
+	let why = "";
 	try {
-		var r = (typeof require !== "undefined") ? require : (IMPORTS.require || null);
-		return r ? r("fs") : null;
-	} catch (e) { return null; }
-})();
+		const e = (JSON.parse(body) || {}).error || {};
+		why = [e.code, e.description].filter((x) => typeof x === "string" && x).join(": ");
+	} catch (x) { why = String(body || "").replace(/\s+/g, " ").trim().slice(0, 200); }
+	return "kDrive answered HTTP " + status + (why ? ": " + why : "");
+}
 
-var Adapter = {
-	_url: function (version, path) {
-		return Config.API_HOST + "/" + version + path;
-	},
+// One kDrive file object -> the listFolder entry. last_modified_at is in Unix seconds; the
+// consumers want an ISO string (QuickOffice's File.parseUtcDate splits it at "T").
+function entry(e, type) {
+	const isFolder = type ? (type === "folder") : (e.type === "dir");
+	return { id: String(e.id), type: isFolder ? "folder" : "file", name: e.name, size: e.size,
+		modified: (typeof e.last_modified_at === "number" && isFinite(e.last_modified_at))
+			? new Date(e.last_modified_at * 1000).toISOString() : undefined,
+		path: String(e.id), mimeType: e.mime_type };
+}
 
-	// GET a JSON endpoint with the Bearer token. version = "2" | "3".
-	_get: function (creds, version, path) {
-		var self = this, f = new Future();
-		f.now(this, function () {
-			return HttpCurl.request({ method: "GET", url: self._url(version, path),
-				bearer: creds.accessToken });
-		});
-		f.then(this, function () { f.result = self._parse(f.result); });
-		return f;
-	},
+// A listFolder entry that is an image: by its mime type or its name.
+function isImage(e) {
+	return !!(e && e.type === "file" &&
+		((typeof e.mimeType === "string" && e.mimeType.indexOf("image/") === 0) || IMAGE_RE.test(e.name || "")));
+}
 
-	// Validate transport status + kDrive's { result } envelope; return the `data` payload.
-	_parse: function (r) {
-		if (!r || r.status < 200 || r.status >= 300) {
-			throw { returnValue: false, errorCode: "KDRIVE_HTTP_ERROR",
-				status: r && r.status, body: r && r.responseText };
+function createAdapter({ config, http, errors }) {
+	const { CloudError } = errors;
+	const seg = (id) => encodeURIComponent(String(id));
+	const url = (version, p) => config.API_HOST + "/" + version + p;
+	const isRoot = (id) => id === undefined || id === null || id === "" || id === "root" || id === "/" ||
+		String(id) === String(config.ROOT_FOLDER);
+
+	// One JSON call with the session's token -> the whole envelope, once it says success. A move
+	// or delete of a large folder may answer "asynchronous": accepted, it has been queued.
+	async function call(s, method, version, p, opts) {
+		const j = await s.authorized((token) => http.json(Object.assign({ method, url: url(version, p), bearer: token }, opts || {})));
+		if (j && typeof j === "object" && j.result !== undefined && j.result !== "success" && j.result !== "asynchronous") {
+			const e = (j.error && typeof j.error === "object") ? j.error : {};
+			throw new CloudError(API_ERROR, "kDrive: " + ([e.code, e.description].filter(Boolean).join(": ") || String(j.result)));
 		}
-		var j = r.responseText ? JSON.parse(r.responseText) : {};
-		if (j.result && j.result !== "success") {
-			throw { returnValue: false, errorCode: "KDRIVE_API_ERROR",
-				error: j.error, body: r.responseText };
-		}
-		return (j.data !== undefined) ? j.data : j;
-	},
-
-	// GET /2/profile -> the logged-in user; also carries preferences.account.current_account_id.
-	getProfile: function (creds, cb) {
-		return this._get(creds, "2", "/profile");
-	},
-
-	// GET /2/drive?account_id={id} -> [ drive ] the account can reach.
-	listDrives: function (creds, accountId, cb) {
-		return this._get(creds, "2", "/drive?account_id=" + encodeURIComponent(accountId));
-	},
-
-	// Auto-discover account_id + drive_id (+ identity) from JUST the token. The verifyToken
-	// validator calls this to enrich the stored credentials, so the user never types an id.
-	// Picks the FIRST drive the account owns.
-	// Resolves to { accountId, driveId, email, displayName }.
-	discoverAccount: function (creds, cb) {
-		var self = this, f = new Future();
-		var pf = this.getProfile(creds, cb);
-		f.now(this, function () { return pf; });
-		f.then(this, function () {
-			var p;
-			try { p = pf.result || {}; }
-			catch (e) { f.setException(e); return; }
-			var accountId = (p.preferences && p.preferences.account &&
-				p.preferences.account.current_account_id) || null;
-			if (!accountId) {
-				f.setException({ returnValue: false, errorCode: "KDRIVE_NO_ACCOUNT", detail: p });
-				return;
-			}
-			var dr = self.listDrives(creds, accountId, cb);
-			dr.then(self, function () {
-				var drives;
-				try { drives = dr.result || []; }
-				catch (e2) { f.setException(e2); return; }
-				if (!drives.length) {
-					f.setException({ returnValue: false, errorCode: "KDRIVE_NO_DRIVE",
-						detail: accountId });
-					return;
-				}
-				var driveId = drives[0].id;
-					// Discover the writable private-space root now so it is stored in the
-					// credentials and later file ops skip the extra lookup.
-					var pr = self.findPrivateRoot({ accessToken: creds.accessToken, driveId: driveId });
-					pr.then(self, function () {
-						f.result = { accountId: accountId, driveId: driveId,
-							rootFolderId: pr.result, email: p.email, displayName: p.display_name };
-					});
-			});
-		});
-		return f;
-	},
-
-	// Find the account's WRITABLE root. kDrive's drive-root (id 1) is a non-writable container
-	// (visibility "is_root", capabilities.can_write=false); user files live one level down in the
-	// private space (visibility "is_private_space"). List the root children and pick it. Resolves
-	// to a numeric folder id (falls back to the drive root if none is found).
-	// True for the "account root" locators QuickOffice/commands pass (null, "", "root", or the
-	// configured ROOT_FOLDER=1 default) - all of which must resolve to the writable private root,
-	// since the kDrive drive-root itself (id 1) refuses listing-as-target / uploads.
-	_isRootTarget: function (folderId) {
-		return folderId == null || folderId === "" || folderId === "root" ||
-			String(folderId) === String(Config.ROOT_FOLDER);
-	},
-
-	findPrivateRoot: function (creds, cb) {
-		var self = this, f = new Future();
-		var call = this._get(creds, "3", "/drive/" + creds.driveId + "/files/1/files");
-		call.then(this, function () {
-			var kids = call.result || [], priv = null, i;
-			for (i = 0; i < kids.length; i++) {
-				if (kids[i] && kids[i].visibility === "is_private_space") { priv = kids[i]; break; }
-			}
-			if (!priv) {   // no explicit private space -> first directory child
-				for (i = 0; i < kids.length; i++) {
-					if (kids[i] && kids[i].type === "dir") { priv = kids[i]; break; }
-				}
-			}
-			f.result = priv ? priv.id : Config.ROOT_FOLDER;
-		});
-		return f;
-	},
-
-	// Resolve the writable root folder id, preferring the value discovered at account-add
-	// (creds.rootFolderId), else discovering once and caching it on the creds object for the
-	// rest of this request. Always resolves to a numeric id.
-	_resolveRoot: function (creds) {
-		var self = this, f = new Future();
-		if (creds.rootFolderId) { f.result = creds.rootFolderId; return f; }
-		var d = this.findPrivateRoot(creds);
-		f.now(this, function () { return d; });
-		f.then(this, function () { creds.rootFolderId = d.result; f.result = d.result; });
-		return f;
-	},
-
-	// --- Photos-provider helpers (PHOTO.UPLOAD role) ------------------------------------
-	// Resolve the numeric id of a named child folder directly under the writable private root
-	// (the configured photo album). Resolves to the folder id, or null if no such folder exists.
-	findAlbumFolder: function (creds, name, cb) {
-		var self = this, f = new Future();
-		var rootF = this._resolveRoot(creds);
-		f.now(this, function () { return rootF; });
-		f.then(this, function () {
-			var lf = self.listFolder(creds, rootF.result, cb);
-			lf.then(self, function () {
-				var entries = (lf.result && lf.result.entries) || [], hit = null,
-					want = String(name).toLowerCase(), i;
-				for (i = 0; i < entries.length; i++) {
-					if (entries[i].type === "folder" &&
-						String(entries[i].name).toLowerCase() === want) { hit = entries[i].id; break; }
-				}
-				f.result = hit;
-			});
-		});
-		return f;
-	},
-
-	// Find the named album folder under the private root, creating it if it does not yet exist.
-	// Only used when the aggregator supplies no albumId (e.g. an as-yet-empty "Pictures" album);
-	// the normal path uploads straight into the album id surfaced by listAlbums. Resolves to a
-	// numeric folder id.
-	ensureAlbumFolder: function (creds, name, cb) {
-		var self = this, f = new Future();
-		var findF = this.findAlbumFolder(creds, name, cb);
-		f.now(this, function () { return findF; });
-		f.then(this, function () {
-			var hit;
-			try { hit = findF.result; }
-			catch (e) { f.setException(e); return; }
-			if (hit) { f.result = hit; return; }
-			// Not there - create it under the writable private root.
-			var rootF = self._resolveRoot(creds);
-			var g = new Future();
-			g.now(self, function () { return rootF; });
-			g.then(self, function () {
-				var create = HttpCurl.request({ method: "POST",
-					url: self._url("3", "/drive/" + creds.driveId + "/files/" +
-						encodeURIComponent(rootF.result) + "/directory"),
-					bearer: creds.accessToken,
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({ name: name }) });
-				create.then(self, function () {
-					var d = self._parse(create.result) || {};
-					f.result = (d.id != null) ? d.id : rootF.result;
-				});
-			});
-		});
-		return f;
-	},
-
-	// Full-res photo URL that self-authenticates via ?access_token= (the Photos aggregator fetch
-	// sends NO Authorization header). 302 -> pre-signed host; curl -L follows across the redirect.
-	photoDownloadUrl: function (creds, fileId) {
-		return Config.API_HOST + "/2/drive/" + creds.driveId + "/files/" +
-			encodeURIComponent(fileId) + "/download?access_token=" +
-			encodeURIComponent(creds.accessToken);
-	},
-
-	// Thumbnail URL (direct 200 bytes) for the grid small image; same headerless ?access_token=.
-	photoThumbUrl: function (creds, fileId) {
-		return Config.API_HOST + "/2/drive/" + creds.driveId + "/files/" +
-			encodeURIComponent(fileId) + "/thumbnail?access_token=" +
-			encodeURIComponent(creds.accessToken);
-	},
-
-	// GET /2/profile -> normalise to { user:{ displayName, emailAddress } } (generic
-	// checkCredentials contract). Verifies the token is still valid as a side effect.
-	getAccountInfo: function (creds, cb) {
-		var self = this, f = new Future();
-		var call = this.getProfile(creds, cb);
-		call.then(this, function () {
-			var u = call.result || {};
-			f.result = { user: { emailAddress: u.email, displayName: u.display_name } };
-		});
-		return f;
-	},
-
-	// GET /3/drive/{drive}/files/{id}/files -> normalised children. kDrive items carry
-	// type("dir"|"file"), id, name, size, last_modified_at, parent_id; the locator is the
-	// numeric id, handed back as the next folderId/fileId.
-	listFolder: function (creds, folderId, cb) {
-		var self = this, f = new Future();
-		var isRoot = self._isRootTarget(folderId);
-		var go = function (id) {
-			var call = self._get(creds, "3",
-				"/drive/" + creds.driveId + "/files/" + encodeURIComponent(id) + "/files");
-			call.then(self, function () {
-				var data = call.result || [];
-				f.result = { entries: data.map(function (e) {
-					// Locators are STRINGS: kDrive ids are numeric, but QuickOffice/consumers do
-					// string ops on id/path (e.g. .replace()), so a raw number breaks them.
-					// modified is an ISO-8601 UTC string: kDrive gives last_modified_at as UNIX
-					// SECONDS, but consumers (QuickOffice's File.parseUtcDate) expect an ISO string
-					// and .split("T") a number -> the date is dropped and the file row collapses to
-					// one line (misaligning the row icon). Convert seconds -> ISO here.
-					return { id: String(e.id), type: (e.type === "dir" ? "folder" : "file"),
-						name: e.name, size: e.size,
-						modified: (e.last_modified_at ?
-							new Date(e.last_modified_at * 1000).toISOString() : undefined),
-						path: String(e.id), mimeType: e.mime_type };
-				}) };
-			});
-		};
-		if (isRoot) {
-			var rootF = this._resolveRoot(creds);
-			f.now(this, function () { return rootF; });
-			f.then(this, function () { go(rootF.result); });
-		} else {
-			go(folderId);
-		}
-		return f;
-	},
-
-	// GET /2/drive/{drive}/files/{id}/download -> 302 to a pre-signed download host (curl -L
-	// follows and drops the Authorization header on the cross-host redirect) -> bytes to disk.
-	// exportMime ignored (kDrive serves native bytes).
-	downloadFile: function (creds, fileId, localDest, exportMime, cb) {
-		var self = this, f = new Future();
-		f.now(this, function () {
-			return HttpCurl.request({ method: "GET",
-				url: self._url("2", "/drive/" + creds.driveId + "/files/" +
-					encodeURIComponent(fileId) + "/download"),
-				bearer: creds.accessToken, follow: true, outFile: localDest });
-		});
-		f.then(this, function () {
-			var r = f.result;
-			if (!r || r.status < 200 || r.status >= 300) {
-				f.setException({ returnValue: false, errorCode: "KDRIVE_DOWNLOAD_FAILED",
-					status: r && r.status });
-				return;
-			}
-			f.result = { path: localDest };
-		});
-		return f;
-	},
-
-	// POST /3/drive/{drive}/upload?directory_id={folder}&file_name={name}&conflict=version
-	// with the raw file bytes as the body. folderId falsy -> root. `conflict=version` makes a
-	// same-name upload create a new VERSION (create-or-overwrite), matching Dropbox/OneDrive.
-	// Returns the kDrive file object (data).
-	uploadFile: function (creds, folderId, localPath, name, mimeType, cb) {
-		var self = this, f = new Future();
-		// kDrive requires total_size up front, and refuses uploads into the drive root (id 1) -
-		// a folder id (falsy -> the private-space root) must be given. conflict=version makes a
-		// same-name upload a new VERSION (create-or-overwrite), matching Dropbox/OneDrive.
-		var send = function (dir) {
-			var total = 0;
-			try { if (_fs) { total = _fs.statSync(localPath).size; } } catch (e) {}
-			var q = "?directory_id=" + encodeURIComponent(dir) +
-				"&file_name=" + encodeURIComponent(name) +
-				"&conflict=version&total_size=" + total;
-			var up = HttpCurl.request({ method: "POST",
-				url: self._url("3", "/drive/" + creds.driveId + "/upload" + q),
-				bearer: creds.accessToken,
-				headers: { "Content-Type": "application/octet-stream" },
-				dataFile: localPath });
-			up.then(self, function () {
-				var d = self._parse(up.result);
-				if (d && d.id != null) { d.id = String(d.id); }   // string locator (see listFolder)
-				f.result = d;
-			});
-		};
-		if (self._isRootTarget(folderId)) {
-			var rootF = this._resolveRoot(creds);
-			f.now(this, function () { return rootF; });
-			f.then(this, function () { send(rootF.result); });
-		} else {
-			send(folderId);
-		}
-		return f;
-	},
-
-	// Overwrite an EXISTING file by id (QuickOffice save-back). Look up its name + parent dir,
-	// then upload the same name into the same folder with conflict=version (kDrive has no
-	// upload-by-file-id; a new version is keyed on directory_id + file_name). mimeType ignored.
-	uploadReplace: function (creds, fileId, localPath, mimeType, cb) {
-		var self = this, f = new Future();
-		var info = this._get(creds, "3",
-			"/drive/" + creds.driveId + "/files/" + encodeURIComponent(fileId));
-		f.now(this, function () { return info; });
-		f.then(this, function () {
-			var meta;
-			try { meta = info.result || {}; }
-			catch (e) { f.setException(e); return; }
-			if (meta.name == null || meta.parent_id == null) {
-				f.setException({ returnValue: false, errorCode: "KDRIVE_NO_FILEINFO", detail: meta });
-				return;
-			}
-			var up = self.uploadFile(creds, meta.parent_id, localPath, meta.name, mimeType, cb);
-			up.then(self, function () {
-				try { f.result = up.result; }
-				catch (e2) { f.setException(e2); }
-			});
-		});
-		return f;
-	},
-
-	// DELETE /2/drive/{driveId}/files/{id} -> remove a photo (Photos delete button). pid is the
-	// kDrive numeric file id. kDrive tokens are long-lived (no OAuth refresh); any 2xx = success,
-	// reject otherwise so the aggregator keeps the local copy.
-	deletePhoto: function (creds, fileId, cb) {
-		var self = this, f = new Future();
-		var del = HttpCurl.request({ method: "DELETE",
-			url: self._url("2", "/drive/" + creds.driveId + "/files/" + encodeURIComponent(fileId)),
-			bearer: creds.accessToken });
-		del.then(this, function () {
-			var r = del.result;
-			if (r && r.status >= 200 && r.status < 300) { f.result = { deleted: true }; }
-			else { f.setException({ returnValue: false, errorCode: "KDRIVE_DELETE_FAILED",
-				status: r && r.status, body: r && r.responseText }); }
-		});
-		return f;
+		return j || {};
 	}
-};
+	const data = async (...a) => (await call(...a)).data;
 
-if (typeof exports !== "undefined") { exports.Adapter = Adapter; }
+	// Keep what was found from the token in the session's credentials, to be reported and saved.
+	function remember(s, fields) {
+		s.creds = Object.assign({}, s.creds, fields);
+		s.renewed = s.creds;
+	}
+
+	// Every child of a folder (the listing is paged, cursor and has_more).
+	async function children(s, driveId, folderId) {
+		const base = "/drive/" + seg(driveId) + "/files/" + seg(folderId) + "/files?limit=" + PAGE;
+		let j = await call(s, "GET", "3", base);
+		const out = Array.isArray(j.data) ? j.data.slice() : [];
+		while (j.has_more && j.cursor) {
+			j = await call(s, "GET", "3", base + "&cursor=" + encodeURIComponent(j.cursor));
+			if (Array.isArray(j.data)) { out.push(...j.data); }
+		}
+		return out;
+	}
+
+	const adapter = {
+		// GET /2/profile -> account_id; GET /2/drive?account_id= -> the first drive; then the
+		// private space under its root. -> { accountId, driveId, rootFolderId, email, displayName }
+		async discoverAccount(s) {
+			const p = (await data(s, "GET", "2", "/profile")) || {};
+			const accountId = (p.preferences && p.preferences.account && p.preferences.account.current_account_id) || null;
+			if (!accountId) { throw new CloudError("KDRIVE_NO_ACCOUNT", "the kDrive profile names no account"); }
+			const drives = await data(s, "GET", "2", "/drive?account_id=" + encodeURIComponent(accountId));
+			const drive = Array.isArray(drives) ? drives.find((d) => d && d.id !== undefined && d.id !== null) : null;
+			if (!drive) { throw new CloudError("KDRIVE_NO_DRIVE", "account " + accountId + " has no kDrive"); }
+			const rootFolderId = await adapter.findPrivateRoot(s, drive.id);
+			return { accountId, driveId: drive.id, rootFolderId, email: p.email, displayName: p.display_name };
+		},
+
+		// The writable root: the private space among the drive root's children, else the first
+		// folder there, else the drive root itself.
+		async findPrivateRoot(s, driveId) {
+			const kids = await children(s, driveId, config.ROOT_FOLDER);
+			const priv = kids.find((k) => k && k.visibility === "is_private_space") || kids.find((k) => k && k.type === "dir");
+			return priv ? priv.id : config.ROOT_FOLDER;
+		},
+
+		// The account's drive id, found from the token the first time.
+		async drive(s) {
+			if (s.creds.driveId) { return s.creds.driveId; }
+			const a = await adapter.discoverAccount(s);
+			remember(s, { accountId: a.accountId, driveId: a.driveId, rootFolderId: a.rootFolderId });
+			return a.driveId;
+		},
+
+		// The private space's id.
+		async root(s) {
+			await adapter.drive(s);
+			if (s.creds.rootFolderId) { return s.creds.rootFolderId; }
+			const id = await adapter.findPrivateRoot(s, s.creds.driveId);
+			remember(s, { rootFolderId: id });
+			return id;
+		},
+
+		// A folder locator -> a folder id: the root ones are the private space.
+		async folder(s, folderId) { return isRoot(folderId) ? adapter.root(s) : folderId; },
+
+		async getAccountInfo(s) {
+			const u = (await data(s, "GET", "2", "/profile")) || {};
+			return { user: { emailAddress: u.email, displayName: u.display_name } };
+		},
+
+		// GET /3/drive/{d}/files/{id}/files, every page.
+		async listFolder(s, folderId) {
+			const d = await adapter.drive(s);
+			const id = await adapter.folder(s, folderId);
+			return { entries: (await children(s, d, id)).filter((e) => e && typeof e === "object").map((e) => entry(e)) };
+		},
+
+		// GET /2/drive/{d}/files/{id}/download: a 302 to a pre-signed host, which fetch follows
+		// (without the Authorization header, as it does on any cross-origin redirect).
+		async downloadFile(s, fileId, localDest) {
+			const d = await adapter.drive(s);
+			await s.authorized((token) => http.request({ method: "GET", url: url("2", "/drive/" + seg(d) + "/files/" + seg(fileId) + "/download"),
+				bearer: token, toFile: localDest, errorCode: "KDRIVE_DOWNLOAD_FAILED" }));
+			return { path: localDest };
+		},
+
+		// POST /3/drive/{d}/upload?directory_id&file_name&conflict=version&total_size, the file as
+		// the body. total_size is required; conflict=version makes an upload over an existing name
+		// a new version of that file (create or overwrite, as Dropbox's).
+		async uploadTo(s, dir, localPath, name) {
+			const d = await adapter.drive(s);
+			let size;
+			try { size = (await fsp.stat(localPath)).size; }
+			catch (e) { throw new CloudError("LOCAL_FILE_ERROR", "cannot read " + localPath + ": " + ((e && e.code) || e)); }
+			const q = "?directory_id=" + seg(dir) + "&file_name=" + encodeURIComponent(name) + "&conflict=version&total_size=" + size;
+			const f = (await data(s, "POST", "3", "/drive/" + seg(d) + "/upload" + q,
+				{ file: localPath, headers: { "Content-Type": "application/octet-stream" } })) || {};
+			return Object.assign({}, f, { id: (f.id === undefined || f.id === null) ? undefined : String(f.id) });
+		},
+
+		async uploadFile(s, folderId, localPath, name) {
+			await adapter.drive(s);
+			return adapter.uploadTo(s, await adapter.folder(s, folderId), localPath, name);
+		},
+
+		// A save-back over the file fileId: its name and folder (GET /3/.../files/{id}), then the
+		// same upload, which makes it a new version.
+		async uploadReplace(s, fileId, localPath) {
+			const meta = await adapter.info(s, fileId);
+			if (meta.name === undefined || meta.name === null || meta.parent_id === undefined || meta.parent_id === null) {
+				throw new CloudError("KDRIVE_NO_FILEINFO", "kDrive gave no name or folder for " + fileId);
+			}
+			return adapter.uploadTo(s, meta.parent_id, localPath, meta.name);
+		},
+
+		// GET /3/drive/{d}/files/{id} -> the file object.
+		async info(s, fileId) {
+			const d = await adapter.drive(s);
+			const f = await data(s, "GET", "3", "/drive/" + seg(d) + "/files/" + seg(fileId));
+			return (f && typeof f === "object") ? f : {};
+		},
+
+		// POST /3/drive/{d}/files/{parent}/directory { name }.
+		async createFolder(s, parent, name) {
+			const d = await adapter.drive(s);
+			const dir = await adapter.folder(s, parent);
+			const f = (await data(s, "POST", "3", "/drive/" + seg(d) + "/files/" + seg(dir) + "/directory", { json: { name } })) || {};
+			return { entry: entry(f, "folder") };
+		},
+
+		// A move: POST /3/.../files/{id}/move/{to} { conflict:"error", name? }; a rename only:
+		// POST /2/.../files/{id}/rename { name }. Both answer a cancel id, not the item, so the
+		// entry comes from GET /3/.../files/{id} afterwards. The root is never moved.
+		async moveItem(s, item, toFolder, name) {
+			const d = await adapter.drive(s);
+			await adapter.refuseRoot(s, item, "moved");
+			const given = (v) => v !== null && v !== undefined;
+			if (given(toFolder)) {
+				const to = await adapter.folder(s, toFolder);
+				const body = { conflict: "error" };
+				if (given(name)) { body.name = name; }
+				await call(s, "POST", "3", "/drive/" + seg(d) + "/files/" + seg(item) + "/move/" + seg(to), { json: body });
+			} else {
+				await call(s, "POST", "2", "/drive/" + seg(d) + "/files/" + seg(item) + "/rename", { json: { name } });
+			}
+			return { entry: entry(await adapter.info(s, item)) };
+		},
+
+		// DELETE /2/drive/{d}/files/{id}: into the trash, restorable from kDrive's web app.
+		async deleteItem(s, item) {
+			const d = await adapter.drive(s);
+			await adapter.refuseRoot(s, item, "deleted");
+			await call(s, "DELETE", "2", "/drive/" + seg(d) + "/files/" + seg(item));
+			return {};
+		},
+
+		// The drive root and the private space are never moved or deleted.
+		async refuseRoot(s, item, what) {
+			if (isRoot(item) || String(item) === String(await adapter.root(s))) {
+				throw new CloudError("BAD_ARGS", "the root folder cannot be " + what);
+			}
+		},
+
+		// The Photos delete button: pid is the file id.
+		async deletePhoto(s, fileId) {
+			const d = await adapter.drive(s);
+			await call(s, "DELETE", "2", "/drive/" + seg(d) + "/files/" + seg(fileId), { errorCode: "KDRIVE_DELETE_FAILED" });
+			return { deleted: true };
+		},
+
+		// --- Photos (photos.js, and the generic upload) ---------------------------------------
+
+		// The id (a string) of the folder called `name`, any case, directly under the private
+		// space; null when there is none.
+		async findAlbumFolder(s, name) {
+			const r = await adapter.root(s);
+			const want = String(name).toLowerCase();
+			const hit = (await children(s, s.creds.driveId, r)).find((e) => e && e.type === "dir" && String(e.name).toLowerCase() === want);
+			return hit ? String(hit.id) : null;
+		},
+
+		// The album folder, made under the private space when it is not there yet.
+		async ensureAlbumFolder(s, name) {
+			const hit = await adapter.findAlbumFolder(s, name);
+			if (hit) { return hit; }
+			const made = await adapter.createFolder(s, "root", name);
+			return (made.entry && made.entry.id !== "undefined") ? made.entry.id : String(await adapter.root(s));
+		},
+
+		// A photo's bytes (download) or thumbnail, with the token in the query: the Photos service
+		// fetches these with no Authorization header. The token goes stale with a short-lived
+		// OAuth token (a personal API token does not expire).
+		photoUrl(s, fileId, kind) {
+			return config.API_HOST + "/2/drive/" + seg(s.creds.driveId) + "/files/" + seg(fileId) + "/" + kind +
+				"?access_token=" + encodeURIComponent(s.creds.accessToken);
+		},
+	};
+	return adapter;
+}
+
+module.exports = Object.assign(createAdapter, { ERROR, API_ERROR, PAGE, describe, entry, isImage, IMAGE_RE });
