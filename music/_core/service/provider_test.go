@@ -29,11 +29,20 @@ func (f *fakeProvider) StreamURL(ctx context.Context, trackID string) (string, e
 	return f.url[trackID], nil
 }
 
-// formatProvider also picks a URL by format, as YouTube does.
+// formatProvider also picks a URL by format, as YouTube does, and reports it among
+// the two it has ("aac" when asked for none).
 type formatProvider struct{ fakeProvider }
 
 func (f *formatProvider) StreamURLFormat(ctx context.Context, trackID, format string) (string, error) {
+	if format == "" {
+		format = "aac"
+	}
+	reportFormats(ctx, format, []string{"aac", "opus"})
 	return "https://example.com/" + trackID + "." + format, nil
+}
+
+func (f *formatProvider) StreamURL(ctx context.Context, trackID string) (string, error) {
+	return f.StreamURLFormat(ctx, trackID, "")
 }
 
 func withProviders(t *testing.T, ps ...MusicProvider) {
@@ -52,12 +61,25 @@ func withProviders(t *testing.T, ps ...MusicProvider) {
 	})
 }
 
+// resolve returns the reply's status and its string fields.
 func resolve(t *testing.T, provider, body string) (int, map[string]string) {
+	t.Helper()
+	code, all := resolveRaw(t, provider, body)
+	out := map[string]string{}
+	for k, v := range all {
+		if s, ok := v.(string); ok {
+			out[k] = s
+		}
+	}
+	return code, out
+}
+
+func resolveRaw(t *testing.T, provider, body string) (int, map[string]interface{}) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/provider/"+provider+"/resolve", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handleProviderRoute(rec, req)
-	out := map[string]string{}
+	out := map[string]interface{}{}
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)
 	return rec.Code, out
 }
@@ -86,6 +108,33 @@ func TestResolveWithFormat(t *testing.T) {
 	withProviders(t, &formatProvider{fakeProvider{id: "youtube"}})
 	code, out := resolve(t, "youtube", `{"trackId":"abc","format":"opus"}`)
 	if code != http.StatusOK || out["url"] != "https://example.com/abc.opus" {
+		t.Fatalf("got %d %v", code, out)
+	}
+}
+
+// The QML player plays the URL itself: the format resolved and the ones to switch to
+// come with it, not through the daemon's own player's /stream/status.
+func TestResolveReportsFormats(t *testing.T) {
+	withProviders(t, &formatProvider{fakeProvider{id: "soundcloud"}})
+	for _, c := range []struct{ body, format string }{
+		{`{"trackId":"abc"}`, "aac"},
+		{`{"trackId":"abc","format":"opus"}`, "opus"},
+	} {
+		code, out := resolveRaw(t, "soundcloud", c.body)
+		if code != http.StatusOK || out["format"] != c.format {
+			t.Fatalf("%s: got %d %v, want format %q", c.body, code, out, c.format)
+		}
+		fs, _ := out["formats"].([]interface{})
+		if len(fs) != 2 || fs[0] != "aac" || fs[1] != "opus" {
+			t.Fatalf("%s: formats %v", c.body, out["formats"])
+		}
+	}
+}
+
+func TestResolveWithoutFormatsLeavesThemOut(t *testing.T) {
+	withProviders(t, &fakeProvider{id: "jamendo", url: map[string]string{"7": "https://example.com/7.mp3"}})
+	code, out := resolveRaw(t, "jamendo", `{"trackId":"7"}`)
+	if _, has := out["formats"]; code != http.StatusOK || has || out["format"] != nil {
 		t.Fatalf("got %d %v", code, out)
 	}
 }

@@ -24,8 +24,9 @@ type MusicProvider interface {
 }
 
 // formatSelector is an OPTIONAL provider capability: resolve a stream URL preferring a
-// specific format label (e.g. "OPUS 160") for the tap-to-switch selector. Only YouTube
-// implements it; resolveStream falls back to plain StreamURL for everyone else.
+// specific format label (e.g. "OPUS 160") for the format selector. YouTube and
+// SoundCloud implement it and say what they picked with reportFormats; resolveStream
+// falls back to plain StreamURL for everyone else.
 type formatSelector interface {
 	StreamURLFormat(ctx context.Context, trackID, format string) (string, error)
 }
@@ -143,7 +144,7 @@ func handleProviders(w http.ResponseWriter, r *http.Request) {
 
 // GET /provider/<id>/search?q=&limit=
 // POST /provider/<id>/play  {trackId}
-// POST /provider/<id>/resolve  {trackId, format?} -> {url}
+// POST /provider/<id>/resolve  {trackId, format?} -> {url, format?, formats?}
 func handleProviderRoute(w http.ResponseWriter, r *http.Request) {
 	// path: /provider/<id>/<action>
 	rest := strings.TrimPrefix(r.URL.Path, "/provider/")
@@ -209,7 +210,11 @@ func handleProviderRoute(w http.ResponseWriter, r *http.Request) {
 			httpErr(w, http.StatusBadRequest, "trackId is required")
 			return
 		}
-		url, err := resolveStream(r.Context(), p, body.TrackID, body.Format)
+		// With the URL go the format resolved and the others the track has, from a
+		// provider that has a choice (formatSelector); the client passes one of
+		// them back as format to switch.
+		ctx, formats := withFormatReport(r.Context())
+		url, err := resolveStream(ctx, p, body.TrackID, body.Format)
 		if err != nil {
 			httpErr(w, http.StatusBadGateway, err.Error())
 			return
@@ -218,7 +223,11 @@ func handleProviderRoute(w http.ResponseWriter, r *http.Request) {
 			httpErr(w, http.StatusConflict, id+" has no stream URL (plays via its own engine)")
 			return
 		}
-		writeJSON(w, map[string]string{"url": url})
+		writeJSON(w, struct {
+			URL     string   `json:"url"`
+			Format  string   `json:"format,omitempty"`
+			Formats []string `json:"formats,omitempty"`
+		}{url, formats.format, formats.formats})
 	case "resolveVideo":
 		var body struct {
 			TrackID string `json:"trackId"`
