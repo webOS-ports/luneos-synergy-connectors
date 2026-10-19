@@ -64,10 +64,24 @@ function createBus({ palmbus, name, idleMs = IDLE_MS, callTimeoutMs = CALL_TIMEO
 	let stopped = false;
 
 	// The idle clock runs only while no request is being worked on: an upload can take minutes.
+	// Timers run before the loop polls for I/O, so a request already waiting on the bus socket
+	// when the clock runs out would be lost with the process (the caller gets "Message status
+	// unknown"). The exit therefore waits for the loop to poll once more (setImmediate runs after
+	// the poll phase), and is called off if a request arrived meanwhile.
+	let generation = 0;
 	function touch() {
+		generation++;
 		if (idle) { clearTimeout(idle); idle = null; }
 		if (stopped || inflight > 0 || !idleMs) { return; }
-		idle = setTimeout(() => { log.log(name + ": idle, exiting"); exit(0); }, idleMs);
+		const mine = generation;
+		idle = setTimeout(() => {
+			idle = null;
+			setImmediate(() => setImmediate(() => {
+				if (mine !== generation || stopped || inflight > 0) { return; }
+				log.log(name + ": idle, exiting");
+				exit(0);
+			}));
+		}, idleMs);
 	}
 
 	function builtin(method) {
@@ -117,8 +131,10 @@ function createBus({ palmbus, name, idleMs = IDLE_MS, callTimeoutMs = CALL_TIMEO
 			reply.returnValue = true;
 			send(reply);
 		} catch (e) {
+			const reply = toReply(e);
 			if (isUnexpected(e)) { log.error(name + ": " + method + " threw: " + ((e && e.stack) || e)); }
-			send(toReply(e));
+			else { log.log(name + ": " + method + " failed: " + reply.errorCode + ": " + reply.errorText); }
+			send(reply);
 		}
 	}
 

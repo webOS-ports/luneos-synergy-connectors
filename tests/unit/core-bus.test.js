@@ -137,6 +137,21 @@ test("idle exit: only after the idle time with no request in flight", async () =
 	assert.deepStrictEqual(exits, [0]);
 });
 
+test("idle exit: a request that is already waiting when the idle clock runs out is served, no exit", async (t) => {
+	// Only setTimeout is mocked: the bus's check after the poll phase uses the real setImmediate.
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const turns = async () => { for (let i = 0; i < 4; i++) { await new Promise((r) => setImmediate(r)); } };
+	const { handle, exits } = setup({ fast: { handler: () => ({ ok: 1 }) } }, { idleMs: 40 });
+	t.mock.timers.tick(40);   // the idle clock runs out ...
+	const r = handle.request("fast", {});   // ... with a request read in the same loop turn
+	assert.deepStrictEqual(await r.first, { returnValue: true, ok: 1 });
+	await turns();
+	assert.deepStrictEqual(exits, [], "the request called the exit off");
+	t.mock.timers.tick(40);
+	await turns();
+	assert.deepStrictEqual(exits, [0], "and the idle clock ran again after it");
+});
+
 test("quit answers, then exits", async () => {
 	const { handle, exits } = setup({});
 	assert.deepStrictEqual(await ask(handle, "quit", {}), { returnValue: true, status: "quitting" });
