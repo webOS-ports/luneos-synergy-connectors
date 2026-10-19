@@ -9,11 +9,22 @@
  * does have is window.open(), which builds a real top-level WAM window that neither restriction
  * applies to.
  *
- * Capturing the redirect needs two mechanisms, because providers split into two kinds:
+ * Capturing the redirect needs these mechanisms, because providers split into two kinds:
  *
- *   http/https redirect_uri (every cloud connector)
- *       WAM runs with --disable-web-security, so the opener can read the popup's cross-origin
- *       location. Poll it until it starts with the expected redirect_uri.
+ *   http/https redirect_uri (every cloud connector, Tidal)
+ *       WAM watches the window for it: window.open() passes the prefix as
+ *       attributes={"redirectPrefix": ...}, and WAM reports to this page with a
+ *       'webOSOAuthWindow' event, detail {state, url}: "watching" right after the window
+ *       opens, then "redirect" (WAM has stopped and closed the window; url is the redirect, code
+ *       included) or "closed" (it went without one). WAM matches where navigations start,
+ *       commit and fail to load, so a redirect_uri nothing serves (http://localhost/...) is
+ *       caught, and it tells this page itself, so the provider's Cross-Origin-Opener-Policy
+ *       (Koofr, Tidal), which cuts the window off from this page, does not matter.
+ *
+ *       A WAM without that watch sends no "watching". Then the window's location is polled.
+ *       The renderers do not run with --disable-web-security, so that only works while the
+ *       window is same-origin with this page: WAM's own load-error page, which a redirect to an
+ *       unserved localhost URL turns into (unwrapLoadError), and nothing else.
  *
  *   native scheme (Teams: msauth.<client>://auth)
  *       The engine cannot load that scheme, so it aborts the navigation and location never
@@ -37,6 +48,24 @@
 			} catch (e) {
 				return false;
 			}
+		},
+
+		// WAM watches only an http(s) prefix with a host (web_page_blink.cc
+		// IsWatchableRedirectPrefix); for anything else the window is polled.
+		watchable: function (prefix) {
+			return /^https?:\/\/[^\/]/.test(prefix || "");
+		},
+
+		// The window.open() features: the caller's, plus WAM's redirect watch where it applies.
+		// Chromium lowercases the whole string before WAM sees it; WAM accepts the key and
+		// matches the prefix either way, and reports the redirect with its case intact.
+		features: function (opts) {
+			var f = opts.features || "";
+			if (!this.watchable(opts.redirectPrefix) || f.toLowerCase().indexOf("attributes=") >= 0) {
+				return f;
+			}
+			var watch = "attributes=" + JSON.stringify({ redirectPrefix: opts.redirectPrefix });
+			return f ? f + "," + watch : watch;
 		},
 
 		// A redirect_uri that nothing on the device serves (Box's http://localhost/...) fails to
@@ -76,12 +105,14 @@
 				done = false,
 				win = null,
 				poll = null,
-				deadline = null;
+				deadline = null,
+				watched = false; // WAM confirmed it watches this window
 
 			function cleanup() {
 				if (poll) { window.clearInterval(poll); poll = null; }
 				if (deadline) { window.clearTimeout(deadline); deadline = null; }
 				try { window.removeEventListener("webOSExternalProtocol", onExternal, false); } catch (e) {}
+				try { window.removeEventListener("webOSOAuthWindow", onWatch, false); } catch (e1) {}
 				if (win) {
 					try { win.close(); } catch (e2) {}
 					win = null;
@@ -107,15 +138,25 @@
 				if (self.matches(url, opts.redirectPrefix)) { hit(url); }
 			}
 
-			// Arm the native-scheme path before opening, so a redirect that lands immediately
-			// (a cached Microsoft session signs in without showing a page) is not missed.
+			function onWatch(ev) {
+				var d = (ev && ev.detail) || {};
+				if (d.state === "watching") { watched = true; }
+				else if (d.state === "redirect" && d.url) { hit(d.url); }
+				else if (d.state === "closed") { fail("Sign-in was cancelled."); }
+			}
+
+			// Arm both paths before opening: a redirect can land immediately (a cached Microsoft
+			// session signs in without showing a page), and WAM sends "watching" as the window
+			// opens. A redirect URL left from an earlier sign-in must not count for this one.
 			window.addEventListener("webOSExternalProtocol", onExternal, false);
+			window.addEventListener("webOSOAuthWindow", onWatch, false);
+			try { window.webOSOAuthRedirectUrl = undefined; } catch (e0) {}
 
 			// No size by default: WAM makes a window.open() window a card like the app's own, and
 			// "height=600" made it a 600 px surface in the 679 px card slot on a 480x800 phone,
 			// which the keyboard then left a band of wallpaper above (MindPhone, Box sign-in).
 			try {
-				win = window.open(opts.url, opts.name || "oauth", opts.features || "");
+				win = window.open(opts.url, opts.name || "oauth", self.features(opts));
 			} catch (e) {
 				win = null;
 			}
@@ -127,9 +168,19 @@
 			poll = window.setInterval(function () {
 				if (done) { return; }
 
+				if (watched) {
+					// WAM reports on its own; this only catches a "redirect" event that was missed.
+					// The window cannot be polled: Cross-Origin-Opener-Policy makes win.closed true
+					// while it is still open.
+					var reported = null;
+					try { reported = window.webOSOAuthRedirectUrl; } catch (e4) {}
+					if (reported) { hit(String(reported)); }
+					return;
+				}
+
 				var here = null;
-				// Reading a cross-origin location is allowed here (--disable-web-security); a throw
-				// just means it is not readable yet, which is not an error.
+				// A cross-origin location throws (the renderers keep web security); only WAM's
+				// load-error page, same-origin with this one, reads.
 				try { here = self.unwrapLoadError(String(win.location.href)); } catch (e) {}
 				if (self.matches(here, opts.redirectPrefix)) { hit(here); return; }
 
