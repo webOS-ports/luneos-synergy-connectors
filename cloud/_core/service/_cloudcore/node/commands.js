@@ -58,13 +58,21 @@ function badName(name) {
 }
 
 // Run fn(session) with the request's credentials, and save the credentials back to the account
-// when a refresh renewed them. -> { out, renewed }
+// when a refresh renewed them -> { out, renewed }. They are saved even when fn then fails:
+// providers that rotate refresh tokens (Box, OneDrive) have already retired the stored one.
 function createAccountRunner({ store, oauth }) {
 	return async function withAccount(params, fn) {
 		const creds = await store.resolve(params);
 		const s = new Session(creds, { refresh: oauth ? oauth.refresh : null });
-		const out = await fn(s);
-		if (s.renewed && params.accountId) { await store.save(params.accountId, s.renewed); }
+		const save = () => (s.renewed && params.accountId ? store.save(params.accountId, s.renewed) : null);
+		let out;
+		try {
+			out = await fn(s);
+		} catch (e) {
+			try { await save(); } catch (_) { /* the request's own error is the one to report */ }
+			throw e;
+		}
+		await save();
 		return { out, renewed: s.renewed };
 	};
 }

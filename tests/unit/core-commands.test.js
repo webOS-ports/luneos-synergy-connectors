@@ -116,6 +116,15 @@ test("inline credentials renewed are reported but not saved (no accountId)", asy
 	assert.deepStrictEqual(saved, []);
 });
 
+test("a refresh is saved even when the request then fails (rotated refresh tokens)", async () => {
+	const { run, saved } = setup({ moveItem: (s) => s.authorized(async (tok) => {
+		if (tok === "tok") { const e = new CloudError("X", "401"); e.status = 401; throw e; }
+		throw new CloudError("BOX_API_ERROR", "409 item_name_in_use");
+	}) });
+	assert.strictEqual(await code(run("moveItem", { accountId: "acc", fileId: "F", name: "b" })), "BOX_API_ERROR");
+	assert.deepStrictEqual(saved.map(([id, c]) => [id, c.accessToken]), [["acc", "fresh"]]);
+});
+
 test("downloadFile: fileId | path | dropboxPath, localPath, exportMime", async () => {
 	const calls = [];
 	const { run } = setup({ downloadFile: async (s, id, local, mime) => { calls.push([id, local, mime]); return { path: local }; } });
