@@ -137,19 +137,25 @@ test("idle exit: only after the idle time with no request in flight", async () =
 	assert.deepStrictEqual(exits, [0]);
 });
 
-test("idle exit: a request that is already waiting when the idle clock runs out is served, no exit", async (t) => {
-	// Only setTimeout is mocked: the bus's check after the poll phase uses the real setImmediate.
-	t.mock.timers.enable({ apis: ["setTimeout"] });
-	const turns = async () => { for (let i = 0; i < 4; i++) { await new Promise((r) => setImmediate(r)); } };
-	const { handle, exits } = setup({ fast: { handler: () => ({ ok: 1 }) } }, { idleMs: 40 });
-	t.mock.timers.tick(40);   // the idle clock runs out ...
-	const r = handle.request("fast", {});   // ... with a request read in the same loop turn
+test("idle exit: a request dispatched in the turn the idle clock runs out is served, no exit; then unregister, exit", async (t) => {
+	// palmbus dispatches bus messages later in the same loop turn as the timers (a check handle):
+	// the request is delivered right after the bus's idle callback has run.
+	let r = null, handle = null;
+	const realSetTimeout = global.setTimeout;
+	global.setTimeout = (fn, ms, ...a) => realSetTimeout(ms === 40 && !r ? () => { fn(); r = handle.request("fast", {}); } : fn, ms, ...a);
+	t.after(() => { global.setTimeout = realSetTimeout; });
+	const b = setup({ fast: { handler: () => ({ ok: 1 }) } }, { idleMs: 40 });
+	handle = b.handle;
+	let unregistered = 0;
+	handle.unregister = () => { unregistered++; assert.deepStrictEqual(b.exits, [], "unregister comes before the exit"); };
+	await new Promise((res) => realSetTimeout(res, 60));
+	assert.ok(r, "the request was sent");
 	assert.deepStrictEqual(await r.first, { returnValue: true, ok: 1 });
-	await turns();
-	assert.deepStrictEqual(exits, [], "the request called the exit off");
-	t.mock.timers.tick(40);
-	await turns();
-	assert.deepStrictEqual(exits, [0], "and the idle clock ran again after it");
+	assert.deepStrictEqual(b.exits, [], "the request called the exit off");
+	assert.strictEqual(unregistered, 0);
+	await new Promise((res) => realSetTimeout(res, 80));
+	assert.deepStrictEqual(b.exits, [0], "and the idle clock ran again after it");
+	assert.strictEqual(unregistered, 1);
 });
 
 test("quit answers, then exits", async () => {

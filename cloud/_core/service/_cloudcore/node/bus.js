@@ -64,23 +64,30 @@ function createBus({ palmbus, name, idleMs = IDLE_MS, callTimeoutMs = CALL_TIMEO
 	let stopped = false;
 
 	// The idle clock runs only while no request is being worked on: an upload can take minutes.
-	// Timers run before the loop polls for I/O, so a request already waiting on the bus socket
-	// when the clock runs out would be lost with the process (the caller gets "Message status
-	// unknown"). The exit therefore waits for the loop to poll once more (setImmediate runs after
-	// the poll phase), and is called off if a request arrived meanwhile.
+	// Leaving must not drop a request the hub is already sending us, or its caller gets "Message
+	// status unknown". palmbus hands bus messages over from a libuv check handle (after the poll),
+	// so the exit is decided in the next turn's timers, after any message read in this one was
+	// dispatched, and called off if one came in. Then the name is given back to the hub at once
+	// (unregister), so it starts a new instance for the next request instead of routing it to a
+	// process that is still tearing down; the process exits after that.
 	let generation = 0;
+	function leave(code, why) {
+		log.log(name + ": " + why + ", exiting");
+		try { if (typeof handle.unregister === "function") { handle.unregister(); } }
+		catch (e) { log.error(name + ": unregister failed: " + ((e && e.message) || e)); }
+		exit(code);
+	}
 	function touch() {
 		generation++;
 		if (idle) { clearTimeout(idle); idle = null; }
 		if (stopped || inflight > 0 || !idleMs) { return; }
 		const mine = generation;
 		idle = setTimeout(() => {
-			idle = null;
-			setImmediate(() => setImmediate(() => {
+			idle = setTimeout(() => {
+				idle = null;
 				if (mine !== generation || stopped || inflight > 0) { return; }
-				log.log(name + ": idle, exiting");
-				exit(0);
-			}));
+				leave(0, "idle");
+			}, 0);
 		}, idleMs);
 	}
 
@@ -89,7 +96,7 @@ function createBus({ palmbus, name, idleMs = IDLE_MS, callTimeoutMs = CALL_TIMEO
 			return { handler: () => ({ id: name, methods: Object.keys(methods).concat(["quit", "info"]) }) };
 		}
 		if (method === "quit") {
-			return { handler: () => { setTimeout(() => exit(0), 200); return { status: "quitting" }; } };
+			return { handler: () => { setTimeout(() => leave(0, "asked to quit"), 200); return { status: "quitting" }; } };
 		}
 		return null;
 	}

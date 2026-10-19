@@ -59,6 +59,10 @@ test.after(() => { server.closeAllConnections(); server.close(); });
 const client = (o) => createHttp(Object.assign({ errorCode: "TEST_API_ERROR" }, o || {}));
 const last = () => seen[seen.length - 1];
 
+test("connects get 2.5 s per address, not Node's 250 ms (slow Wi-Fi was ETIMEDOUT)", () => {
+	assert.ok(require("node:net").getDefaultAutoSelectFamilyAttemptTimeout() >= 2500);
+});
+
 test("json: POST a JSON body with bearer and headers; the reply parsed", async () => {
 	const r = await client().json({ method: "POST", url: base + "/echo", bearer: "tok", headers: { "X-A": "1" }, json: { a: [1, "é"] } });
 	assert.strictEqual(r.method, "POST");

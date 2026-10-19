@@ -31,6 +31,7 @@
 
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
+const net = require("node:net");
 const path = require("node:path");
 const { Readable, Transform } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
@@ -41,6 +42,14 @@ const LOCAL_FILE_ERROR = "LOCAL_FILE_ERROR";
 const TIMEOUT_MS = 60000;
 const IDLE_TIMEOUT_MS = 30000;
 const BODY_MAX = 2000;
+// Node tries a host's addresses in turn (happy eyeballs) and gives each 250 ms to connect by
+// default. A phone on Wi-Fi often takes longer (60-400 ms measured to cloud-api.yandex.net), and
+// with no IPv6 route the IPv6 attempts fail at once, so a slow IPv4 connect became ETIMEDOUT
+// (CURL_FAILED) on a working network. fetch's connections use this process-wide default.
+const CONNECT_ATTEMPT_MS = 2500;
+if (net.getDefaultAutoSelectFamilyAttemptTimeout() < CONNECT_ATTEMPT_MS) {
+	net.setDefaultAutoSelectFamilyAttemptTimeout(CONNECT_ATTEMPT_MS);
+}
 
 class HttpError extends CloudError {
 	constructor(errorCode, errorText, { status, body, method, url }) {
