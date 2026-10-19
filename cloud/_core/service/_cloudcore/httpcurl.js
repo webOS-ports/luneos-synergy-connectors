@@ -78,10 +78,16 @@ var HttpCurl = {
 			args.push("--create-dirs", "-o", opts.outFile);
 		}
 		if (opts.multipart) {
-			// [{name, value} | {name, file}] -> curl -F. Box wants an "attributes" JSON
-			// part plus a "file" part reading the local file with @.
+			// [{name, value} | {name, file, filename?}] -> curl -F. Box wants an "attributes" JSON
+			// part plus a "file" part reading the local file with @. A file part is named after
+			// the local file unless `filename` says otherwise; providers that take the name from
+			// the part (pCloud) need that, quoted as curl reads it.
 			opts.multipart.forEach(function (p) {
-				args.push("-F", p.file ? (p.name + "=@" + p.file) : (p.name + "=" + p.value));
+				var part = p.file ? (p.name + "=@" + p.file) : (p.name + "=" + p.value);
+				if (p.file && p.filename) {
+					part += ';filename="' + String(p.filename).replace(/(["\\])/g, "\\$1") + '"';
+				}
+				args.push("-F", part);
 			});
 		} else if (opts.form) {
 			Object.keys(opts.form).forEach(function (k) {

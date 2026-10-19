@@ -200,7 +200,7 @@ var Adapter = {
 			var url = Config.CONTENT_BASE + "/mounts/" + mid + "/files/put?path=" + self._enc(folderPath) +
 				"&filename=" + self._enc(name) + "&info=true&overwrite=true";
 			var call = self._req(creds, { method: "POST", url: url,
-				multipart: [{ name: "file", file: localPath }] }, cb);
+				multipart: [{ name: "file", file: localPath, filename: name }] }, cb);
 			call.then(self, function () {
 				try {
 					var meta = self._parse(call.result) || {};

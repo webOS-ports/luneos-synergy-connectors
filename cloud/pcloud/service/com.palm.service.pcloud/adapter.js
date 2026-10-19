@@ -167,7 +167,8 @@ var Adapter = {
 		var self = this, f = new Future();
 		f.now(this, function () {
 			return HttpCurl.request({ method: "POST", url: url,
-				multipart: [{ name: "file", file: localPath }] });
+				// pCloud names a multipart upload after the part, not the filename parameter.
+				multipart: [{ name: "file", file: localPath, filename: name }] });
 		});
 		f.then(this, function () { f.result = self._parse(f.result); });
 		return f;

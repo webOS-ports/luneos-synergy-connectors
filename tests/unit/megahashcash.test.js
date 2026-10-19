@@ -199,3 +199,15 @@ test("EAGAIN (-3) is retried and the retry's reply is the result", async () => {
 	assert.strictEqual(sent.length, 2);
 	assert.strictEqual(JSON.stringify(f.result), "[{\"v\":2}]");
 });
+
+test("httpcurl names a multipart file part when asked, quoted for curl", () => {
+	const { HttpCurl, calls } = curlWith("ok\n200");
+	HttpCurl.request({ url: "https://x", multipart: [
+		{ name: "file", file: "/media/internal/tmp-1.bin", filename: 'my "odd"; file.txt' },
+		{ name: "attributes", value: "{}" },
+		{ name: "plain", file: "/media/internal/a.txt" },
+	] }).result;
+	const parts = calls[0].filter((a, i) => calls[0][i - 1] === "-F");
+	assert.deepStrictEqual(JSON.parse(JSON.stringify(parts)), ['file=@/media/internal/tmp-1.bin;filename="my \\"odd\\"; file.txt"',
+		"attributes={}", "plain=@/media/internal/a.txt"]);
+});

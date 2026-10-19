@@ -278,3 +278,10 @@ test("createFolder accepts the root as the commands name it with no folder", () 
 		assert.deepStrictEqual(asked(k.sent), [["createfolder", { folderid: "0", name: "New" }]], String(root));
 	}
 });
+
+test("uploadFile names the uploaded part, which is what pCloud stores it as", () => {
+	const { Adapter, sent } = pcloud([ok({ metadata: [FILE] })]);
+	outcome(Adapter.uploadFile(creds(), 5, "/media/internal/.cache/tmp-123.bin", "note.txt", "text/plain", null));
+	assert.strictEqual(sent[0].method_, "uploadfile");
+	assert.deepStrictEqual(plain(sent[0].multipart), [{ name: "file", file: "/media/internal/.cache/tmp-123.bin", filename: "note.txt" }]);
+});
