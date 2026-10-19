@@ -8,6 +8,7 @@
 	{ "source": "../_cloudcore/httpcurl.js" },
 	{ "source": "./bignum.js" },
 	{ "source": "./megacrypto.js" },
+	{ "source": "./hashcash.js" },
 	{ "source": "./megaapi.js" },
 	{ "source": "./adapter.js" },
 	{ "source": "../_cloudcore/creds.js" },

@@ -27,8 +27,9 @@ var reqf = (typeof require !== "undefined") ? require : (IMPORTS.require || null
 var cp = reqf ? reqf("child_process") : null;
 
 var HttpCurl = {
-	// request({ method, url, headers:{}, form:{k:v}, body:"", bearer:"" }) -> Future
-	// resolves to { status: <int>, responseText: <string> }
+	// request({ method, url, headers:{}, form:{k:v}, body:"", bearer:"", responseHeader:"" })
+	// -> Future resolving to { status: <int>, responseText: <string> }, plus header: <string>
+	// (the named response header's value, "" when absent) when responseHeader is given.
 	request: function (opts) {
 		opts = opts || {};
 		var f = new Future();
@@ -45,8 +46,12 @@ var HttpCurl = {
 		// files..." spinner. --connect-timeout caps the handshake; --max-time is a total backstop
 		// (generous so large up/downloads still complete). A hard fail here becomes CURL_FAILED,
 		// which the consumer can retry, instead of an indefinite hang.
+		// One response header can come back too: curl's %header{} write-out (curl >= 7.84) puts its
+		// value on a line of its own before the status code. Header names hold no "}".
+		var wantHeader = opts.responseHeader && /^[A-Za-z0-9-]+$/.test(opts.responseHeader);
 		var args = ["-s", "-S", "--tlsv1.2", "--connect-timeout", "15", "--max-time", "90",
-			"-w", "\n%{http_code}", "-X", method];
+			"-w", wantHeader ? "\n%header{" + opts.responseHeader + "}\n%{http_code}" : "\n%{http_code}",
+			"-X", method];
 
 		// Point curl at the system CA store (/etc/ssl/certs/ca-certificates.crt). The
 		// stock rootfs stub is from 2011; the deployment-bundle prerequisite refreshes
@@ -113,7 +118,15 @@ var HttpCurl = {
 				var cut = stdout.lastIndexOf("\n");
 				var head = (cut >= 0) ? stdout.substring(0, cut) : stdout;
 				var tail = (cut >= 0) ? stdout.substring(cut + 1) : "";
-				f.result = { status: parseInt(tail, 10) || 0, responseText: head };
+				var result = { status: parseInt(tail, 10) || 0 };
+				if (wantHeader) {
+					// ...and before it, the header line.
+					var hcut = head.lastIndexOf("\n");
+					result.header = (hcut >= 0) ? head.substring(hcut + 1) : head;
+					head = (hcut >= 0) ? head.substring(0, hcut) : "";
+				}
+				result.responseText = head;
+				f.result = result;
 			});
 
 		return f;

@@ -1,4 +1,4 @@
-/*global IMPORTS, Config, HttpCurl, MegaCrypto, console */
+/*global IMPORTS, Config, HttpCurl, MegaCrypto, MegaHashcash, console */
 /* megaapi.js - the Mega "cs" command queue + login handshake + node-tree fetch.
  *
  * Every call POSTs a JSON array of commands to https://g.api.mega.co.nz/cs (through the modern
@@ -6,6 +6,8 @@
  * is a JSON array of per-command results, OR a bare negative integer = a global API error
  * (e.g. -3 EAGAIN "try again", -15 ESID "session expired", -9 ENOENT, -16 blocked). Negative
  * ints inside the array are per-command errors. -3 is transparently retried with backoff.
+ * HTTP 402 with an X-Hashcash challenge asks for a proof of work first (hashcash.js); the request
+ * is sent again, under the same id, with the answer.
  *
  * LOGIN (us0 -> us): us0 tells us the account version (v1 legacy AES key derivation, or v2
  * PBKDF2-SHA512 with a server salt). We derive the password AES key + login hash accordingly,
@@ -33,22 +35,36 @@ var MegaApi = (function () {
 
 	// POST one JSON array of commands. Resolves to the parsed reply (array or negative int).
 	// Retries -3 (EAGAIN) up to 4 times with linear backoff. `sidOverride` lets login pass the
-	// not-yet-stored session id; otherwise the caller's creds.accessToken is the sid.
-	function post(commands, sid, tries) {
+	// not-yet-stored session id; otherwise the caller's creds.accessToken is the sid. `hashcash`
+	// and `id` are for the resend after a 402: the answer to send, and the id it was asked for.
+	function post(commands, sid, tries, hashcash, id) {
 		var f = new Future();
-		var url = Config.API_BASE + "?id=" + (_seq++);
+		if (id === undefined) { id = _seq++; }
+		var url = Config.API_BASE + "?id=" + id;
 		if (sid) { url += "&sid=" + sid; }
 		var body = JSON.stringify(commands);
+		var headers = { "Content-Type": "application/json" };
+		if (hashcash) { headers["X-Hashcash"] = hashcash; }
 		var call = HttpCurl.request({
-			method: "POST", url: url, body: body,
-			headers: { "Content-Type": "application/json" }
+			method: "POST", url: url, body: body, headers: headers, responseHeader: "X-Hashcash"
 		});
 		// Same shape as the OAuth connectors' _req (device-proven): f.now sequences on the curl
-		// call, f.then inspects the reply. On -3 (EAGAIN) pipe a retry future into f.result.
+		// call, f.then inspects the reply. On -3 (EAGAIN) f nests the retry's future.
 		f.now(this, function () { return call; });
 		f.then(this, function () {
 			var r;
 			try { r = call.result; } catch (e) { f.setException(e); return; }
+			if (r && r.status === 402 && r.header && (tries || 0) < 4) {
+				// Proof of work first. Several rounds are allowed, as megajs does; each answers the
+				// newest challenge. f is left pending and settled later, as on EAGAIN below.
+				var work = MegaHashcash.solve(r.header);
+				work.then(this, function () {
+					var answer;
+					try { answer = work.result; } catch (e3) { f.setException(e3); return; }
+					f.nest(post(commands, sid, (tries || 0) + 1, answer, id));
+				});
+				return;
+			}
 			if (!r || r.status < 200 || r.status >= 300) {
 				f.setException(apiError("HTTP_" + (r && r.status), r && r.responseText)); return;
 			}
@@ -58,9 +74,10 @@ var MegaApi = (function () {
 			// A bare negative number is a global error.
 			if (typeof parsed === "number") {
 				if (parsed === -3 && (tries || 0) < 4 && typeof setTimeout !== "undefined") {
-					// EAGAIN - wait and retry (linear backoff); adopting the retry future's result.
+					// EAGAIN - wait and retry (linear backoff), taking the retry's outcome with nest():
+					// assigning a Future to .result would make the Future itself the result.
 					setTimeout(function () {
-						f.result = post(commands, sid, (tries || 0) + 1);
+						f.nest(post(commands, sid, (tries || 0) + 1));
 					}, 500 * ((tries || 0) + 1));
 					return;
 				}
