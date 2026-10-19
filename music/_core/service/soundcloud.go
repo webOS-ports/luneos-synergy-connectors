@@ -76,6 +76,44 @@ type scTrack struct {
 	} `json:"media"`
 }
 
+// streamTranscoding is the URL of the transcoding to play: progressive (plain MP3)
+// first, then HLS (gst hlsdemux). "" when there is none - label tracks often come
+// only as cbc-/ctr-encrypted-hls, which is DRM the stream player cannot decode.
+func (t *scTrack) streamTranscoding() string {
+	for _, proto := range []string{"progressive", "hls"} {
+		for _, tr := range t.Media.Transcodings {
+			if tr.Format.Protocol == proto {
+				return tr.URL
+			}
+		}
+	}
+	return ""
+}
+
+// parseSoundcloudTracks turns a search reply into the tracks that can be played;
+// ones with only encrypted streams are left out instead of failing when picked.
+func parseSoundcloudTracks(body string) ([]providerTrack, error) {
+	var r struct {
+		Collection []scTrack `json:"collection"`
+	}
+	if err := json.Unmarshal([]byte(body), &r); err != nil {
+		return nil, fmt.Errorf("soundcloud search parse: %w", err)
+	}
+	out := []providerTrack{}
+	for i := range r.Collection {
+		t := &r.Collection[i]
+		if t.ID == 0 || t.streamTranscoding() == "" {
+			continue
+		}
+		out = append(out, providerTrack{
+			ID: strconv.FormatInt(t.ID, 10), Provider: "soundcloud", Title: t.Title,
+			Artist: t.User.Username, Thumbnail: t.ArtworkURL, DurationMs: t.Duration,
+			Path: "soundcloud:" + strconv.FormatInt(t.ID, 10),
+		})
+	}
+	return out, nil
+}
+
 func (s *soundcloudProvider) Search(ctx context.Context, query string, limit int) ([]providerTrack, error) {
 	if query == "" {
 		return []providerTrack{}, nil
@@ -101,24 +139,7 @@ func (s *soundcloudProvider) Search(ctx context.Context, query string, limit int
 			return nil, err
 		}
 	}
-	var r struct {
-		Collection []scTrack `json:"collection"`
-	}
-	if err := json.Unmarshal([]byte(body), &r); err != nil {
-		return nil, fmt.Errorf("soundcloud search parse: %w", err)
-	}
-	out := []providerTrack{}
-	for _, t := range r.Collection {
-		if t.ID == 0 {
-			continue
-		}
-		out = append(out, providerTrack{
-			ID: strconv.FormatInt(t.ID, 10), Provider: "soundcloud", Title: t.Title,
-			Artist: t.User.Username, Thumbnail: t.ArtworkURL, DurationMs: t.Duration,
-			Path: "soundcloud:" + strconv.FormatInt(t.ID, 10),
-		})
-	}
-	return out, nil
+	return parseSoundcloudTracks(body)
 }
 
 func (s *soundcloudProvider) StreamURL(ctx context.Context, trackID string) (string, error) {
@@ -137,21 +158,16 @@ func (s *soundcloudProvider) StreamURL(ctx context.Context, trackID string) (str
 	if err := json.Unmarshal([]byte(body), &t); err != nil {
 		return "", fmt.Errorf("soundcloud track parse: %w", err)
 	}
-	// Prefer a progressive (plain MP3) transcoding; fall back to HLS (gst hlsdemux).
-	pick := func(proto string) string {
-		for _, tr := range t.Media.Transcodings {
-			if tr.Format.Protocol == proto {
-				return tr.URL
-			}
+	if t.ID == 0 {
+		// Not a track: api-v2's error replies (401, 404, 429) come with a body too.
+		return "", fmt.Errorf("soundcloud: no track %s", trackID)
+	}
+	tcURL := t.streamTranscoding()
+	if tcURL == "" {
+		if len(t.Media.Transcodings) > 0 {
+			return "", fmt.Errorf("soundcloud: %q is only available encrypted (DRM)", t.Title)
 		}
-		return ""
-	}
-	tcURL := pick("progressive")
-	if tcURL == "" {
-		tcURL = pick("hls")
-	}
-	if tcURL == "" {
-		return "", fmt.Errorf("no playable transcoding")
+		return "", fmt.Errorf("soundcloud: %q has no stream", t.Title)
 	}
 	sep := "?"
 	if strings.Contains(tcURL, "?") {
