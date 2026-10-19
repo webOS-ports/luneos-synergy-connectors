@@ -199,7 +199,18 @@ install(FILES data/telegram22.png DESTINATION "${PURPLE_DATA_DIR}/pixmaps/pidgin
 install(FILES data/telegram48.png DESTINATION "${PURPLE_DATA_DIR}/pixmaps/pidgin/protocols/48" RENAME telegram.png)
 install(FILES data/tdlib-purple.metainfo.xml DESTINATION "${SHARE_INSTALL_PREFIX}/metainfo")
 
-# add_subdirectory(test)  # webOS: plugin only, skip gtest-based tests
+# webOS: the device build wants the plugin only, so the gtest suite is off by default.
+#
+# It does not currently compile either: the suite is written against the tdlib 1.7.9 API this
+# port has moved off (tdlibParameters, chat::chat_list_, the old viewMessages signature), and
+# building it against 1.8.66 gives ~186 errors of that kind. Porting it is its own job, and
+# worth doing - the auth-prompt fallback that reaches the Messaging app was broken for want of
+# a test over it. Turn it on with -DWithTests=TRUE against a sysroot carrying tdlib, libpurple
+# and gtest once the suite has been brought forward.
+set(WithTests FALSE CACHE BOOL "Build the gtest suite (host only; needs porting to tdlib 1.8)")
+if (WithTests)
+    add_subdirectory(test)
+endif (WithTests)
 
 add_custom_command(
     OUTPUT libtelegram-tdlib-stripped.dll
