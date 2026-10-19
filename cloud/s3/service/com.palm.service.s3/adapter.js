@@ -53,7 +53,8 @@ var Adapter = {
 				headers: opts.headers || {},
 				payloadHash: opts.payloadHash,
 				region: creds.region || Config.DEFAULT_REGION, service: "s3",
-				accessKeyId: creds.accessToken, secretAccessKey: creds.secretAccessKey
+				accessKeyId: creds.accessToken, secretAccessKey: creds.secretAccessKey,
+				scheme: creds.scheme
 			});
 		} catch (e) { f.setException(e); return f; }
 		var reqOpts = { method: opts.method || "GET", url: signed.url, headers: signed.headers };
@@ -509,7 +510,7 @@ var Adapter = {
 		var t = this._target(creds, fileId);
 		var url = S3Sig.presignUrl({ method: "GET", host: t.host, path: t.path,
 			expires: 3600, region: creds.region || Config.DEFAULT_REGION, service: "s3",
-			accessKeyId: creds.accessToken, secretAccessKey: creds.secretAccessKey });
+			accessKeyId: creds.accessToken, secretAccessKey: creds.secretAccessKey, scheme: creds.scheme });
 		var f = new Future();
 		f.result = { link: url, method: "GET" };
 		return f;

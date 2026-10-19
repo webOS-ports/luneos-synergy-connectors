@@ -132,7 +132,9 @@ var S3Sig = (function () {
 			headers.Authorization = "AWS4-HMAC-SHA256 Credential=" + o.accessKeyId + "/" + scope +
 				", SignedHeaders=" + signedHeaders + ", Signature=" + sig;
 
-			var url = "https://" + o.host + canonPath;
+			// "http" only for a self-hosted endpoint given as http://; the host (port included) is
+			// signed as it is sent.
+			var url = (o.scheme === "http" ? "http://" : "https://") + o.host + canonPath;
 			var qs = canonicalQuery(o.query);
 			if (qs) { url += "?" + qs; }
 			return { headers: headers, url: url, signature: sig, canonicalRequest: canonicalRequest, stringToSign: stringToSign };
@@ -166,7 +168,7 @@ var S3Sig = (function () {
 			var sig = hmac(signingKey(o.secretAccessKey, d.stamp, region, service), stringToSign, "hex");
 			query["X-Amz-Signature"] = sig;
 
-			return "https://" + o.host + canonPath + "?" + canonicalQuery(query);
+			return (o.scheme === "http" ? "http://" : "https://") + o.host + canonPath + "?" + canonicalQuery(query);
 		},
 
 		hasNodeCrypto: !!_nc

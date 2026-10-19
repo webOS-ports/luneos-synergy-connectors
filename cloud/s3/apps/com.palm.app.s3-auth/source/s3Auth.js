@@ -19,7 +19,7 @@ enyo.kind({
 			{ className: "box-center", style: "padding:16px;", components: [
 				{ className: "accounts-body-text", style: "line-height:1.5; padding-bottom:10px;",
 					content: "Connect any S3-compatible storage (Amazon S3, IDrive e2, Backblaze B2, Wasabi, MinIO…). Enter the endpoint and your access keys — they stay on the device." },
-				{ kind: "Input", name: "endpointField", hint: "Endpoint host (e.g. s3.us-west-1.idrivee2.com)",
+				{ kind: "Input", name: "endpointField", hint: "Endpoint (e.g. s3.us-west-1.idrivee2.com, or http://nas.local:9000)",
 					spellcheck: false, autoCapitalize: "lowercase", style: "width:100%;" },
 				{ kind: "Input", name: "regionField", hint: "Region (e.g. us-east-1)",
 					spellcheck: false, autoCapitalize: "lowercase", style: "width:100%; margin-top:8px;" },

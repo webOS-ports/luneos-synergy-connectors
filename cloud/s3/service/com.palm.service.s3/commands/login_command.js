@@ -12,7 +12,11 @@ function LoginCommandAssistant() {}
 LoginCommandAssistant.prototype = {
 	run: function (future) {
 		var args = this.controller.args || {};
-		var endpoint = (args.endpoint || "").replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+		// "host[:port]", or with a scheme: "http://nas.local:9000" for a self-hosted server that
+		// speaks plain HTTP (MinIO, Garage); HTTPS otherwise.
+		var raw = String(args.endpoint || "").replace(/^\s+|\s+$/g, "");
+		var plainHttp = /^http:\/\//i.test(raw);
+		var endpoint = raw.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
 		var bucket   = (args.bucket || "").replace(/^\/+|\/+$/g, "");
 		var region   = args.region || (Config && Config.DEFAULT_REGION) || "us-east-1";
 		var accessKeyId = args.accessKeyId || args.accessKey;
@@ -32,6 +36,7 @@ LoginCommandAssistant.prototype = {
 			bucket:          bucket,
 			pathStyle:       pathStyle
 		};
+		if (plainHttp) { creds.scheme = "http"; }   // only then, so other accounts stay as they were
 		// Validate by signing a real request against the bucket.
 		var info = Adapter.getAccountInfo(creds);
 		info.then(this, function () {

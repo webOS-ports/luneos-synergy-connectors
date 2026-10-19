@@ -401,3 +401,39 @@ test("deleteItem on a folder: the bound, per-key errors and a rejected batch fai
 	assert.deepStrictEqual(plain(s.Adapter.deleteItem(CREDS, "Gone/").result), {}, "an empty prefix is already gone");
 	assert.ok(!s.sent.some((r) => r.method === "POST"));
 });
+
+test("an http:// endpoint with a port (self-hosted) is called over http, its host:port signed", () => {
+	const { Adapter, sent } = setup(() => ({ status: 200, responseText: listXml(["a.txt"]) }));
+	const creds = Object.assign({}, CREDS, { endpoint: "127.0.0.1:3900", scheme: "http" });
+	Adapter.listFolder(creds, "").result;
+	const u = new URL(sent[0].url);
+	assert.strictEqual(u.protocol, "http:");
+	assert.strictEqual(u.host, "127.0.0.1:3900");
+	assert.strictEqual(sent[0].headers.host || sent[0].headers.Host, "127.0.0.1:3900", "the Host header carries the port");
+	verifySig(sent[0]);
+	// without a scheme in the credentials, https as before
+	const t2 = setup(() => ({ status: 200, responseText: listXml([]) }));
+	t2.Adapter.listFolder(CREDS, "").result;
+	assert.strictEqual(new URL(t2.sent[0].url).protocol, "https:");
+});
+
+test("login keeps http only for an endpoint given as http://, and the host:port either way", () => {
+	const seen = [];
+	const run = (endpoint) => {
+		const ctx = { Future: Fut, Config: { DEFAULT_REGION: "us-east-1" }, console,
+			Adapter: { getAccountInfo(c) { seen.push(c); const f = new Fut(); f.result = { user: { emailAddress: "x" } }; return f; } } };
+		vm.createContext(ctx);
+		const f = path.join(S3, "commands", "login_command.js");
+		vm.runInContext(fs.readFileSync(f, "utf8"), ctx, { filename: f });
+		const a = new ctx.LoginCommandAssistant();
+		a.controller = { args: { endpoint, bucket: "b", accessKeyId: "k", secretAccessKey: "s" } };
+		const fut = new Fut();
+		a.run(fut);
+		return fut;
+	};
+	run(" http://127.0.0.1:3900/ ");
+	run("https://s3.eu-central-1.amazonaws.com");
+	run("s3.us-west-1.idrivee2.com");
+	assert.deepStrictEqual(seen.map((c) => [c.endpoint, c.scheme]), [
+		["127.0.0.1:3900", "http"], ["s3.eu-central-1.amazonaws.com", undefined], ["s3.us-west-1.idrivee2.com", undefined]]);
+});
