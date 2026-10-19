@@ -1,27 +1,26 @@
-/* config.js - Mega (mega.nz) endpoints + wiring for the modern connector.
+/* config.js - MEGA (mega.nz) endpoint and the _cloudcore wiring.
  *
- * Mega is the ODD ONE OUT among the connectors: it is NOT OAuth2 and NOT a plaintext REST
- * API. It is a zero-knowledge, end-to-end-encrypted store. There is a single JSON command
- * endpoint (the "cs" API) at https://g.api.mega.co.nz/cs to which we POST a JSON array of
- * commands and read back a JSON array of results. Everything else - the login handshake and
- * all file/attribute crypto - happens client-side in megacrypto.js. See adapter.js/megaapi.js.
+ * MEGA is not OAuth2 and not a plaintext REST API: it is a zero-knowledge, end-to-end-encrypted
+ * store with one JSON command endpoint (the "cs" API) at https://g.api.mega.co.nz/cs, to which
+ * a JSON array of commands is POSTed and a JSON array of results read back. The login handshake
+ * and all the file and name crypto happen on the device (megacrypto.js, megaapi.js).
  *
- * There is NOTHING to register and NO client id/secret: the account owner signs in with their
- * OWN Mega email + password (the mega-auth app collects them, the `login` command runs the
- * us0/us handshake). So the identical package ships to every device, same as the PKCE ones.
+ * There is nothing to register and no client id or secret: the account owner signs in with
+ * their own MEGA email and password (the mega-auth app collects them, login.js runs the us0/us
+ * handshake), so the same package ships to every device.
  */
+/* A plain file, read with require(). */
 var Config = {
-	// Modern-TLS HTTP: the device node is OpenSSL 0.9.8k and cannot handshake with
-	// g.api.mega.co.nz, so ALL Mega HTTPS is shelled out to the modern system curl (the
-	// same binary + CA store the Dropbox/OneDrive connectors use): /usr/bin/curl,
-	// curl 7.88.1 + OpenSSL 1.1.1w (TLS 1.3), from the companion OpenSSL-11 update.
+	// Not used by the service, which speaks HTTPS through node's own fetch (_cloudcore/node/
+	// http.js). The on-device harness (tests/suites/cloud.py tls_reachable) still runs this curl
+	// with this CA bundle to check the provider can be reached, so the keys stay.
 	CURL:                 "/usr/bin/curl",
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
 
-	// The Mega "cs" (client->server) command endpoint. Requests are POSTed as a JSON array
+	// The MEGA "cs" (client->server) command endpoint. Requests are POSTed as a JSON array
 	// [ {a:'...', ...} ] and answered with a JSON array (or a bare negative int on error).
-	// A monotonically-increasing &id=<seq> and, once logged in, &sid=<session> are appended.
+	// An increasing ?id=<seq> and, once signed in, &sid=<session> are appended (megaapi.js).
 	API_BASE:   "https://g.api.mega.co.nz/cs",
 
 	// Mega node handles are opaque 8-char base64 tokens; the account root is the "Cloud Drive"
@@ -36,12 +35,13 @@ var Config = {
 	// named folder under the Cloud Drive root (created on first upload).
 	PHOTO_ALBUM_NAME: "Camera Uploads",
 
-	// --- generic wiring (consumed by ../_cloudcore) -------------------------------------
+	// --- _cloudcore generic wiring (read by _cloudcore/node) ----------------------------
 	SERVICE_NAME:  "com.palm.service.mega",
 	DISPLAY_NAME:  "MEGA",
 	STATE:         "mega",
-	// The credentials-collecting customUI app (email+password form). Mega has no OAuth webview,
-	// so it is its OWN app, NOT the shared com.palm.app.cloud-auth.
+	// The credentials-collecting customUI app (email+password form). MEGA has no OAuth webview,
+	// so it is its own app, not the shared com.palm.app.cloud-auth. Not checked: login is open
+	// (login.js).
 	AUTH_APP_IDS:  ["com.palm.app.mega-auth"],
 	FILE_APP_IDS:  ["org.webosports.app.documents", "org.webosports.app.documents-*", "com.palm.stark.files.service"]
 };

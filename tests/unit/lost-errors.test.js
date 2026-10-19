@@ -8,10 +8,10 @@
 // the luna command hung until its timeout. Here each entry point of each adapter is driven with
 // a stand-in HttpCurl whose N-th request fails (a Future carrying an exception, and separately a
 // 500 reply), for N = 1, 2, ... until the operation needs fewer requests, so the later steps of
-// multi-step operations (MEGA's tree then command...)
+// multi-step operations (a lookup, then the change...)
 // fail as well as the first one. The Future the entry point returns must settle with an error.
 //
-// Dropbox, Box, Flickr, HiDrive, kDrive, Koofr, pCloud, S3 and Yandex are not here: they run on _cloudcore/node
+// Dropbox, Box, Flickr, HiDrive, kDrive, Koofr, MEGA, pCloud, S3 and Yandex are not here: they run on _cloudcore/node
 // (async/await, no Futures), and their own test files do the same to them over the bus.
 //
 // The stand-in Future follows future.js on the point that matters: a throw inside a then()
@@ -146,27 +146,6 @@ const OAUTH = { accessToken: "tok", refreshToken: "rt", expiresAt: Date.now() + 
 const dl = () => path.join(TMP, "dl-" + crypto.randomBytes(4).toString("hex"));
 const urlOf = (o) => new URL(o.url);
 
-// A MEGA account, as in mega-fileops.test.js: Cloud Drive R { Docs D { a.txt F, Sub E }, notes N }.
-function megaAccount() {
-	const ctx = { IMPORTS: { foundations: { Control: { Future } } }, Buffer, require, Date };
-	vm.createContext(ctx);
-	const mc = path.join(serviceDir("mega"), "megacrypto.js");
-	vm.runInContext(fs.readFileSync(mc, "utf8"), ctx, { filename: mc });
-	const MC = ctx.MegaCrypto;
-	const master = MC.bytesToA32([...crypto.randomBytes(16)]);
-	const wrap = (k) => MC.a32ToB64(MC.ecbEncryptA32(master, k));
-	const raw = [{ h: "RRRRRRRR", t: 2, p: "" }, { h: "BBBBBBBB", t: 4, p: "" }];
-	const folder = (h, p, n) => { const k = MC.bytesToA32([...crypto.randomBytes(16)]);
-		raw.push({ h, p, t: 1, a: MC.encryptAttr({ n }, k), k: `u:${wrap(k)}`, ts: 1700000000 }); };
-	const file = (h, p, n) => { const k = MC.bytesToA32([...crypto.randomBytes(32)]);
-		raw.push({ h, p, t: 0, a: MC.encryptAttr({ n }, MC.unpackFileKey(k).aesKeyA32), k: `u:${wrap(k)}`, s: 3, ts: 1700000100 }); };
-	folder("DDDDDDDD", "RRRRRRRR", "Docs");
-	file("FFFFFFFF", "DDDDDDDD", "a.jpg");
-	folder("EEEEEEEE", "DDDDDDDD", "Sub");
-	file("NNNNNNNN", "RRRRRRRR", "notes.txt");
-	return { creds: { accessToken: "SID", mk: MC.a32ToB64(master), email: "u@example.test" }, tree: { f: raw, ok: [] } };
-}
-const MEGA = megaAccount();
 
 
 // Each entry: [label, call(Adapter, creds) -> Future, { tolerant, endsFailed, minSteps }].
@@ -201,30 +180,6 @@ const CONNECTORS = {
 		["moveItem (to the root)", (A, c) => A.moveItem(c, "F", "root", null, () => {}), { minSteps: 2 }],
 		["deleteItem", (A, c) => A.deleteItem(c, "F", () => {})],
 	] },
-	mega: { dir: "mega", creds: MEGA.creds, files: ["megacrypto.js", "megaapi.js"],
-		setup: (ctx) => { ctx.Config.PHOTO_TMP_DIR = TMP; },
-		reply: () => (o) => {
-			if (!/g\.api\.mega\.co\.nz\/cs/.test(o.url)) { return ok(o.method === "POST" ? "UPLOADTOKEN" : ""); }
-			const a = JSON.parse(o.body)[0].a;
-			const res = { f: MEGA.tree, ug: { email: "u@example.test", name: "U" }, g: { g: "https://dl.example.test/x" },
-				u: { p: "https://up.example.test" }, p: { f: [{ h: "HHHHHHHH", ts: 1700000200 }] } }[a];
-			return ok([res === undefined ? 0 : res]);
-		},
-		entries: [
-			["getAccountInfo", (A, c) => A.getAccountInfo(c, () => {})],
-			["listFolder", (A, c) => A.listFolder(c, "root", () => {})],
-			["downloadFile", (A, c) => A.downloadFile(c, "FFFFFFFF", dl(), null, () => {}), { minSteps: 3, endsFailed: true }],
-			["uploadFile", (A, c) => A.uploadFile(c, "root", LOCAL, "n.bin", null, () => {}), { minSteps: 4 }],
-			["uploadReplace", (A, c) => A.uploadReplace(c, "FFFFFFFF", LOCAL, null, () => {}), { minSteps: 4 }],
-			["createFolder", (A, c) => A.createFolder(c, "root", "New", () => {}), { minSteps: 2 }],
-			["moveItem", (A, c) => A.moveItem(c, "FFFFFFFF", "EEEEEEEE", "b.jpg", () => {}), { minSteps: 3 }],
-			["deleteItem", (A, c) => A.deleteItem(c, "NNNNNNNN", () => {}), { minSteps: 2 }],
-			["deletePhoto", (A, c) => A.deletePhoto(c, "NNNNNNNN", () => {})],
-			["ensureAlbumFolder", (A, c) => A.ensureAlbumFolder(c, "Album", () => {}), { minSteps: 2 }],
-			["photoAlbums", (A, c) => A.photoAlbums(c, () => {})],
-			["getPhotoLocalPath", (A, c) => A.getPhotoLocalPath(c, "FFFFFFFF", "a.jpg", () => {}), { minSteps: 3, endsFailed: true }],
-			["resolvePhotoAlbum", (A, c) => A.resolvePhotoAlbum(c, () => {}), { tolerant: true }],
-		] },
 };
 
 const MAX_STEPS = 12;
@@ -285,7 +240,7 @@ function command(files, ctor, args, extra = {}) {
 	return future;
 }
 
-const PHOTO_SERVICES = ["mega", "onedrive"];
+const PHOTO_SERVICES = ["onedrive"];
 for (const svc of PHOTO_SERVICES) {
 	const dir = serviceDir(svc);
 	for (const [file, ctor] of [["listAlbums_command.js", "ListAlbumsCommandAssistant"],
@@ -313,15 +268,6 @@ const CORE_COMMANDS = [
 for (const [file, ctor, args] of CORE_COMMANDS) {
 	test(`_cloudcore ${ctor}: a reply of an unexpected shape still answers`, async () => {
 		const out = await outcome(command([path.join(CORE, "commands", file)], ctor, args));
-		assert.ok(!out.pending, "the command never answered");
-	});
-}
-
-for (const [svc, file, ctor, args] of [
-	["mega", "login_command.js", "LoginCommandAssistant", { email: "u@example.test", password: "p" }],
-]) {
-	test(`${svc} ${ctor}: a reply of an unexpected shape still answers`, async () => {
-		const out = await outcome(command([path.join(serviceDir(svc), "commands", file)], ctor, args));
 		assert.ok(!out.pending, "the command never answered");
 	});
 }
