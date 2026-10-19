@@ -244,6 +244,8 @@ var Adapter = {
 	},
 	// "123" / 123 -> { id:"123", kind:null }; "d123" -> folder; "f456" -> file; else null.
 	_loc: function (x) {
+		// The root as the commands may name it when given no folder.
+		if (x === "root" || x === "" || x === "/") { x = "d" + Config.ROOT_FOLDER; }
 		var m = /^([df]?)(\d+)$/.exec(String(x == null ? "" : x));
 		if (!m) { return null; }
 		return { id: m[2], kind: (m[1] === "d") ? "folder" : (m[1] === "f") ? "file" : null };

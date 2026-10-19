@@ -10,7 +10,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
-const SRC = path.join(__dirname, "../../cloud/_core/service/_cloudcore/commands/fileOps_commands.js");
+const CORE = path.join(__dirname, "../../cloud/_core/service/_cloudcore");
+const SRC = path.join(CORE, "commands/fileOps_commands.js");
 
 class FakeFuture {
 	constructor() { this.cbs = []; this.done = false; }
@@ -33,8 +34,12 @@ function setup(adapter, { allow = true, config = {} } = {}) {
 			save: (id, c) => saved.push([id, c]),
 		},
 	};
+	ctx.console = { log() {} };
 	vm.createContext(ctx);
-	vm.runInContext(fs.readFileSync(SRC, "utf8"), ctx, { filename: SRC });
+	// cloudservice.js first, as sources.json loads it before the commands (cloudRoot).
+	for (const f of [path.join(CORE, "cloudservice.js"), SRC]) {
+		vm.runInContext(fs.readFileSync(f, "utf8"), ctx, { filename: f });
+	}
 	const call = (assistant, args) => {
 		const a = new ctx[assistant]();
 		a.controller = { args };
@@ -118,4 +123,18 @@ test("an adapter failure is the command's failure; the ACL comes first", () => {
 	({ call } = setup({ deleteItem: () => { reached++; return failed; } }, { allow: false }));
 	assert.strictEqual(err(call("DeleteItemCommandAssistant", { accountId: "a", path: "/a" })), "PERMISSION_DENIED");
 	assert.strictEqual(reached, 1);
+});
+
+test("a root of 0 (pCloud) is the root, not \"root\"", () => {
+	const calls = [];
+	const { call } = setup({
+		createFolder(creds, parent, name) { calls.push(["create", parent]); return settled({ entry: {} }); },
+		moveItem(creds, item, to) { calls.push(["move", to]); return settled({ entry: {} }); },
+		deleteItem(creds, item) { calls.push(["delete", item]); return settled({}); },
+	}, { config: { ROOT_FOLDER: 0 } });
+	call("CreateFolderCommandAssistant", { accountId: "a", name: "x" });
+	call("MoveItemCommandAssistant", { accountId: "a", fileId: "5", toRoot: true });
+	assert.strictEqual(err(call("DeleteItemCommandAssistant", { accountId: "a", fileId: 0 })), "MISSING_ARGS");   // 0 is no item
+	assert.strictEqual(err(call("DeleteItemCommandAssistant", { accountId: "a", path: "0" })), "BAD_ARGS");
+	assert.deepStrictEqual(calls, [["create", 0], ["move", 0]]);
 });

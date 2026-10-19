@@ -270,3 +270,11 @@ test("bad credentials give a failed Future, never a throw", () => {
 		assert.ok(outcome(call()).error);
 	}
 });
+
+test("createFolder accepts the root as the commands name it with no folder", () => {
+	for (const root of ["root", "", "/", 0, "0", "d0"]) {
+		const k = pcloud([ok({ metadata: FOLDER })]);
+		outcome(k.Adapter.createFolder(creds(), root, "New", null));
+		assert.deepStrictEqual(asked(k.sent), [["createfolder", { folderid: "0", name: "New" }]], String(root));
+	}
+});

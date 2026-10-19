@@ -68,6 +68,13 @@ var CloudGuard = {
 
 if (typeof Adapter !== "undefined") { CloudGuard.wrap(Adapter); }
 
+/* The provider's root folder locator, for a command given no folder. Config.ROOT_FOLDER may be
+ * falsy and still be the root (pCloud's is the number 0), so it is taken whenever it is set. */
+function cloudRoot() {
+	var r = (typeof Config !== "undefined") ? Config.ROOT_FOLDER : undefined;
+	return (r === undefined || r === null || r === "") ? "root" : r;
+}
+
 function CloudService() {}
 CloudService.prototype = {
 	setup: function () {

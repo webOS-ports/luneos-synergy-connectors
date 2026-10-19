@@ -1,4 +1,4 @@
-/*global Adapter, AccountCreds, Acl, Config, console */
+/*global Adapter, AccountCreds, Acl, Config, console, cloudRoot */
 /* listFolder - browse a folder. args: { accountId | credentials, path | folderId }
  * The locator (`path`/`folderId`) is provider-defined: a real path for path-based providers
  * (Dropbox/Yandex) or an opaque id for id-based ones (Box/OneDrive/Drive). Adapter.listFolder
@@ -15,7 +15,7 @@ ListFolderCommandAssistant.prototype = {
 	run: function (future) {
 		if (!Acl.enforce(this, future)) { return; }
 		var self = this, args = this.controller.args || {};
-		var folderId = args.folderId || args.path || (Config && Config.ROOT_FOLDER) || "root";
+		var folderId = args.folderId || args.path || cloudRoot();
 		var credF = AccountCreds.resolve(args);
 		credF.then(this, function () {
 			var creds;

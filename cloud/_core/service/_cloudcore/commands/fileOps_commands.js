@@ -1,4 +1,4 @@
-/*global Adapter, AccountCreds, Acl, Config, Future */
+/*global Adapter, AccountCreds, Acl, Config, Future, cloudRoot */
 /* fileOps_commands.js - createFolder, moveItem and deleteItem: what a file manager needs besides
  * listFolder/downloadFile/uploadFile. GENERIC across all connectors; caller allow-list from
  * Config.FILE_APP_IDS, as for the other file commands.
@@ -72,7 +72,7 @@ CreateFolderCommandAssistant.prototype = {
 	run: function (future) {
 		CloudFileOp.run(this, future, "createFolder", function (args) {
 			if (CloudFileOp.badName(args.name)) { return CloudFileOp.missing("name: one path component"); }
-			var parent = args.folderId || args.path || (Config && Config.ROOT_FOLDER) || "root";
+			var parent = args.folderId || args.path || cloudRoot();
 			return [parent, args.name];
 		}, CloudFileOp.withEntry);
 	}
@@ -85,10 +85,10 @@ MoveItemCommandAssistant.prototype = {
 		CloudFileOp.run(this, future, "moveItem", function (args) {
 			var item = args.fileId || args.path;
 			var to = args.toFolderId || args.toPath ||
-				(args.toRoot === true ? ((Config && Config.ROOT_FOLDER) || "root") : null);
+				(args.toRoot === true ? cloudRoot() : null);
 			var name = (args.name === undefined || args.name === null) ? null : args.name;
 			if (!item) { return CloudFileOp.missing("fileId or path"); }
-			if (!to && name === null) { return CloudFileOp.missing("toFolderId, toPath or name"); }
+			if (to === null && name === null) { return CloudFileOp.missing("toFolderId, toPath or name"); }
 			if (name !== null && CloudFileOp.badName(name)) { return CloudFileOp.missing("name: one path component"); }
 			return [item, to, name];
 		}, CloudFileOp.withEntry);
@@ -103,8 +103,8 @@ DeleteItemCommandAssistant.prototype = {
 			var item = args.fileId || args.path;
 			if (!item) { return CloudFileOp.missing("fileId or path"); }
 			// Never the root: a provider would delete or refuse the whole drive.
-			var root = (Config && Config.ROOT_FOLDER) || "root";
-			if (item === root || item === "/" || item === "root") {
+			var root = String(cloudRoot());
+			if (String(item) === root || item === "/" || item === "root") {
 				return { returnValue: false, errorCode: "BAD_ARGS", errorText: "the root folder cannot be deleted" };
 			}
 			return [item];

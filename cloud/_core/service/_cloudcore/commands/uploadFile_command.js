@@ -1,4 +1,4 @@
-/*global Adapter, AccountCreds, Acl, Config, console */
+/*global Adapter, AccountCreds, Acl, Config, console, cloudRoot */
 /* uploadFile - upload a local file into a folder, or overwrite an existing file. args:
  *   { accountId | credentials, folderId | path, localPath, name, mimeType }  (create new file)
  *   { accountId | credentials, fileId | path | dropboxPath, localPath, replace:true } (overwrite by id)
@@ -20,7 +20,7 @@ UploadFileCommandAssistant.prototype = {
 			return;
 		}
 		var replaceId = args.replace ? (args.fileId || args.path || args.dropboxPath) : null;
-		var folderId = args.folderId || args.path || (Config && Config.ROOT_FOLDER) || "root";
+		var folderId = args.folderId || args.path || cloudRoot();
 		var name = args.name || args.localPath.split("/").pop();
 		var credF = AccountCreds.resolve(args);
 		credF.then(this, function () {
