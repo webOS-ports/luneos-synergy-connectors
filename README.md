@@ -14,8 +14,8 @@ and plugs a network or service into the stock apps.
 Every connector has its own folder; what the family shares lives in `_core/`.
 
 ```
-cloud/_core/service/_cloudcore     shared runtime: node/ for the ported connectors (Dropbox), the
-                                   mojoservice files (OAuth2/PKCE, curl, ACL, commands) for the rest
+cloud/_core/service/_cloudcore     shared runtime of every connector: node/ (bus, http, OAuth2/PKCE,
+                                   credentials, the common commands), on LuneOS's node 22
 cloud/_core/apps/                  com.palm.app.cloud-auth, the shared OAuth sign-in app
 cloud/<name>/account/              account template + icons  -> /usr/palm/public/accounts/
 cloud/<name>/service/              the connector's service -> /usr/palm/services/
