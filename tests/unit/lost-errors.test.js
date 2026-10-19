@@ -11,8 +11,8 @@
 // multi-step operations (MEGA's tree then command, S3's list then copy...)
 // fail as well as the first one. The Future the entry point returns must settle with an error.
 //
-// Dropbox and Box are not here: they run on _cloudcore/node (async/await, no Futures), and
-// dropbox.test.js and box.test.js do the same to them over the bus.
+// Dropbox, Box and Flickr are not here: they run on _cloudcore/node (async/await, no Futures), and
+// dropbox.test.js, box.test.js and flickr.test.js do the same to them over the bus.
 //
 // The stand-in Future follows future.js on the point that matters: a throw inside a then()
 // callback stays on that Future. Set FOUNDATIONS_FUTURE to the path of Foundations'
@@ -409,7 +409,7 @@ function command(files, ctor, args, extra = {}) {
 		Config: { ROOT_FOLDER: "root", sanitizeHost: () => null, hostForLocation: () => null },
 		Acl: { enforce: () => true }, cloudRoot: () => "root",
 		AccountCreds: { resolve: () => settledF({ accessToken: "tok" }), save: () => settledF({}) },
-		Adapter: answering(null), OAuth2: answering(null), FlickrApi: answering(null), MegaApi: answering(null),
+		Adapter: answering(null), OAuth2: answering(null), MegaApi: answering(null),
 		...extra,
 	};
 	vm.createContext(ctx);
@@ -421,15 +421,14 @@ function command(files, ctor, args, extra = {}) {
 	return future;
 }
 
-const PHOTO_SERVICES = ["hidrive", "koofr", "mega", "onedrive", "pcloud", "s3", "yandex", "flickr"];
+const PHOTO_SERVICES = ["hidrive", "koofr", "mega", "onedrive", "pcloud", "s3", "yandex"];
 for (const svc of PHOTO_SERVICES) {
 	const dir = serviceDir(svc);
-	const extra = svc === "flickr" ? { FlickrApi: Object.assign(answering(null), {}) } : {};
 	for (const [file, ctor] of [["listAlbums_command.js", "ListAlbumsCommandAssistant"],
 		["listPhotos_command.js", "ListPhotosCommandAssistant"]]) {
 		test(`${svc} ${file}: a reply of an unexpected shape still answers`, async () => {
 			const out = await outcome(command([path.join(dir, "commands/photolib.js"), path.join(dir, "commands", file)],
-				ctor, { accountId: "acc", aid: "album" }, extra));
+				ctor, { accountId: "acc", aid: "album" }));
 			assert.ok(!out.pending, "the command never answered");
 		});
 	}
@@ -466,7 +465,7 @@ for (const [svc, file, ctor, args] of [
 }
 
 // HttpCurl.request answers with a failed Future instead of throwing when it cannot even start.
-for (const file of [path.join(CORE, "httpcurl.js"), path.join(serviceDir("flickr"), "httpcurl.js")]) {
+for (const file of [path.join(CORE, "httpcurl.js")]) {
 	test(`${path.relative(CLOUD, file)}: a request that cannot start fails its Future, it does not throw`, () => {
 		const ctx = { IMPORTS: { foundations: { Control: { Future } } }, Config: {}, process, console: { log() {} },
 			require: (m) => (m === "child_process" ? { execFile() { throw new TypeError("bad argument"); } } : require(m)) };

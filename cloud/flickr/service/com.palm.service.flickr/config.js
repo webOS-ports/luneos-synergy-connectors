@@ -10,20 +10,15 @@
  * is no documents/files role here, so read=only "read" perms are requested.
  */
 var Config = {
-	// Modern-TLS HTTP: the device node is OpenSSL 0.9.8k and cannot handshake with
-	// api.flickr.com / www.flickr.com / live.staticflickr.com, so ALL Flickr HTTPS is
-	// shelled out to the modern system curl at /usr/bin/curl (curl 7.88.1 +
-	// OpenSSL 1.1.1w, TLS 1.3), installed by the companion OpenSSL-11 update - the same
-	// prerequisite every connector relies on; no private bundle or LD_LIBRARY_PATH.
+	// Not used by the service, which speaks HTTPS through node's own fetch (_cloudcore/node/
+	// http.js). The on-device harness (tests/suites/cloud.py tls_reachable) still runs this curl
+	// with this CA bundle to check the provider can be reached, so the keys stay.
 	CURL:                 "/usr/bin/curl",
 	CURL_LD_LIBRARY_PATH: "",
-	// CA bundle = the SYSTEM store, refreshed to a current bundle by the deployment-bundle
-	// prerequisite (the stock rootfs ships a 2011 stub that fails modern verify).
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
 
 	// OAuth 1.0a consumer credentials. CONSUMER_KEY is also the REST "api_key".
-	// The signature (HMAC-SHA1) is built IN node (oauth1.js) - only the resulting
-	// signed HTTPS GET is handed to curl. HMAC-SHA1 works on the old node runtime.
+	// oauth1.js signs every request (HMAC-SHA1) with CONSUMER_SECRET and the token secret.
 	CONSUMER_KEY:    "PUT_YOUR_FLICKR_API_KEY_HERE",       // Flickr API key (= api_key)
 	CONSUMER_SECRET: "PUT_YOUR_FLICKR_API_SECRET_HERE",    // Flickr API secret (signs requests)
 
