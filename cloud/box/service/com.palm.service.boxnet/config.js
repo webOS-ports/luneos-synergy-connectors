@@ -3,13 +3,14 @@
  * it is REST (GET /folders/{id}/items) not RPC, and it addresses everything by
  * numeric ID (root folder id = "0") rather than by path.
  *
- * SCAFFOLD: register a free Box app at https://app.box.com/developers/console
- * (Custom App -> "User Authentication (OAuth 2.0)") and paste CLIENT_ID below. Add
- * REDIRECT_URI verbatim to the app's "OAuth 2.0 Redirect URIs" list.
+ * The Box app (https://app.box.com/developers/console, Custom App -> "User
+ * Authentication (OAuth 2.0)") lists REDIRECT_URI verbatim among its OAuth 2.0 Redirect
+ * URIs. oauth2.js sends PKCE and CLIENT_SECRET: Box's token endpoint refuses a code
+ * without the secret ("invalid_client").
  *
- * PKCE (public client) is preferred, exactly like Dropbox - see oauth2.js. If your
- * Box app type still requires a confidential secret, set CLIENT_SECRET and oauth2.js
- * will include it; leave it as the placeholder to run as a pure PKCE public client.
+ * The app's id and secret are not kept here. The build fills in the two placeholders
+ * from BOX_CLIENT_ID / BOX_CLIENT_SECRET (meta-luneos cloud-synergy-connector.inc); a
+ * package built without them cannot sign in.
  */
 var Config = {
 	// Modern-TLS HTTP: device node is OpenSSL 0.9.8k, so ALL Box HTTPS shells out to
@@ -18,10 +19,8 @@ var Config = {
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
 
-	CLIENT_ID:     "PLACEHOLDER_BOX_CLIENT_ID",       // TODO: from Box dev console
-	// Leave as the placeholder for a PKCE public client (no secret shipped). Only set
-	// this if your Box app mandates a confidential secret; prefer keymanager-wrapping.
-	CLIENT_SECRET: "PLACEHOLDER_BOX_CLIENT_SECRET",
+	CLIENT_ID:     "PLACEHOLDER_BOX_CLIENT_ID",     // from the build, see above
+	CLIENT_SECRET: "PLACEHOLDER_BOX_CLIENT_SECRET", // likewise
 	REDIRECT_URI:  "http://localhost/boxnet/oauth2callback",
 
 	// OAuth2 (confirmed present in com.box.android 7.1.515)
