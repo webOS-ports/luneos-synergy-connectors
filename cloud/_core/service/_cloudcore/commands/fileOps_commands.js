@@ -4,12 +4,14 @@
  * Config.FILE_APP_IDS, as for the other file commands.
  *
  * Items and folders are addressed by the locators listFolder hands out (entry.path, or entry.id
- * where a provider has no paths), so a consumer stays provider-generic:
+ * where a provider has no paths), so a consumer stays provider-generic. The root has no entry to
+ * take a locator from: leaving the folder out means the root, and moveItem takes toRoot:true.
  *
  *   createFolder { accountId | credentials, folderId | path (parent; default the root), name }
  *     -> { returnValue, renewedCredentials, entry }        the new folder, listFolder-shaped
  *   moveItem     { accountId | credentials, fileId | path (the item),
- *                  toFolderId | toPath (destination folder; omit to stay), name (omit to keep) }
+ *                  toFolderId | toPath | toRoot:true (destination folder; omit to stay),
+ *                  name (omit to keep) }
  *     -> { returnValue, renewedCredentials, entry }        the item where it now is
  *   deleteItem   { accountId | credentials, fileId | path }
  *     -> { returnValue, renewedCredentials }               to the provider's trash where it has one
@@ -82,7 +84,8 @@ MoveItemCommandAssistant.prototype = {
 	run: function (future) {
 		CloudFileOp.run(this, future, "moveItem", function (args) {
 			var item = args.fileId || args.path;
-			var to = args.toFolderId || args.toPath || null;
+			var to = args.toFolderId || args.toPath ||
+				(args.toRoot === true ? ((Config && Config.ROOT_FOLDER) || "root") : null);
 			var name = (args.name === undefined || args.name === null) ? null : args.name;
 			if (!item) { return CloudFileOp.missing("fileId or path"); }
 			if (!to && name === null) { return CloudFileOp.missing("toFolderId, toPath or name"); }

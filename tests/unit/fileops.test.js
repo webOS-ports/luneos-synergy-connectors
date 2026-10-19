@@ -82,11 +82,13 @@ test("moveItem: rename, move, or both; one of them is required", () => {
 	call("MoveItemCommandAssistant", { accountId: "a", path: "/a.txt", name: "b.txt" });
 	call("MoveItemCommandAssistant", { accountId: "a", fileId: "id1", toFolderId: "id2" });
 	call("MoveItemCommandAssistant", { accountId: "a", path: "/a.txt", toPath: "/Dir", name: "c.txt" });
-	assert.deepStrictEqual(plain(calls), [["/a.txt", null, "b.txt"], ["id1", "id2", null], ["/a.txt", "/Dir", "c.txt"]]);
+	call("MoveItemCommandAssistant", { accountId: "a", fileId: "id3", toRoot: true });
+	assert.deepStrictEqual(plain(calls), [["/a.txt", null, "b.txt"], ["id1", "id2", null], ["/a.txt", "/Dir", "c.txt"], ["id3", "root", null]]);
 	assert.strictEqual(err(call("MoveItemCommandAssistant", { accountId: "a", path: "/a.txt" })), "MISSING_ARGS");
 	assert.strictEqual(err(call("MoveItemCommandAssistant", { accountId: "a", name: "x" })), "MISSING_ARGS");
 	assert.strictEqual(err(call("MoveItemCommandAssistant", { accountId: "a", path: "/a", name: "x/y" })), "MISSING_ARGS");
-	assert.strictEqual(calls.length, 3);
+	assert.strictEqual(err(call("MoveItemCommandAssistant", { accountId: "a", path: "/a", toRoot: "yes" })), "MISSING_ARGS");
+	assert.strictEqual(calls.length, 4);
 });
 
 test("deleteItem: the item reaches the adapter, the root never does", () => {
