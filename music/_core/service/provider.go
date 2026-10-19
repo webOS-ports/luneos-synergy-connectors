@@ -228,6 +228,8 @@ func handleProviderRoute(w http.ResponseWriter, r *http.Request) {
 			Format  string   `json:"format,omitempty"`
 			Formats []string `json:"formats,omitempty"`
 		}{url, formats.format, formats.formats})
+	case "playlists", "playlist":
+		handlePlaylistRoute(w, r, p, action)
 	case "resolveVideo":
 		var body struct {
 			TrackID string `json:"trackId"`
