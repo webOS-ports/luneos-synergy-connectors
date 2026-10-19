@@ -1,20 +1,22 @@
 /* config.js - generic S3-compatible storage connector wiring.
  *
  * This connector is PROVIDER-AGNOSTIC: it speaks the Amazon S3 REST API (SigV4-signed), so it
- * works against AWS S3, IDrive e2, Backblaze B2 (S3 API), Wasabi, MinIO, Storj, etc. There is
- * NO OAuth and NOTHING to register centrally - the account owner supplies their own endpoint,
- * region, bucket, access key id and secret access key in the s3-auth form. Those are stored in
- * the account credentials and the adapter signs every request with them (see s3sig.js/adapter.js).
+ * works against AWS S3, IDrive e2, Backblaze B2 (S3 API), Wasabi, MinIO, Garage, Storj, etc.
+ * There is NO OAuth and NOTHING to register centrally - the account owner supplies their own
+ * endpoint, region, bucket, access key id and secret access key in the s3-auth form. Those are
+ * stored in the account credentials and the adapter signs every request with them (s3sig.js,
+ * adapter.js).
  *
  * Credentials shape (credentials.common): { accessToken: <accessKeyId>, secretAccessKey,
- * endpoint (host), region, bucket, pathStyle }. The access key id doubles as _cloudcore's
- * accessToken so AccountCreds + the generic commands work unchanged (same trick as the Mega
- * connector's session id).
+ * endpoint ("host[:port]"), region, bucket, pathStyle, scheme? ("http" only for an endpoint
+ * given as http://) }. The access key id doubles as _cloudcore's accessToken, so the generic
+ * commands (checkCredentials, the credential lookup by accountId) work unchanged.
  */
+/* A plain file read with require() by service.js (and by the on-device harness). */
 var Config = {
-	// Modern-TLS HTTP: device node is OpenSSL 0.9.8k, so ALL S3 HTTPS shells out to the bundled
-	// modern curl (same binary + CA store the other connectors use). SigV4 hashing itself runs
-	// in-process via native node crypto (HMAC/SHA-256), which 0.9.8k does support.
+	// Not used by the service, which speaks HTTP(S) through node's own fetch (_cloudcore/node/
+	// http.js). The on-device harness (tests/suites/cloud.py tls_reachable) still runs this curl
+	// with this CA bundle to check the provider can be reached, so the keys stay.
 	CURL:                 "/usr/bin/curl",
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
@@ -39,7 +41,7 @@ var Config = {
 	],
 	DEFAULT_REGION: "us-east-1",
 
-	// --- _cloudcore generic wiring (consumed by ../_cloudcore) --------------------------
+	// --- _cloudcore generic wiring (read by _cloudcore/node) ----------------------------
 	SERVICE_NAME:  "com.palm.service.s3",
 	DISPLAY_NAME:  "S3 Storage",
 	STATE:         "s3",

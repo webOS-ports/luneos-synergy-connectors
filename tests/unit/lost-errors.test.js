@@ -8,11 +8,11 @@
 // the luna command hung until its timeout. Here each entry point of each adapter is driven with
 // a stand-in HttpCurl whose N-th request fails (a Future carrying an exception, and separately a
 // 500 reply), for N = 1, 2, ... until the operation needs fewer requests, so the later steps of
-// multi-step operations (MEGA's tree then command, S3's list then copy...)
+// multi-step operations (MEGA's tree then command...)
 // fail as well as the first one. The Future the entry point returns must settle with an error.
 //
-// Dropbox, Box and Flickr are not here: they run on _cloudcore/node (async/await, no Futures), and
-// dropbox.test.js, box.test.js and flickr.test.js do the same to them over the bus.
+// Dropbox, Box, Flickr, kDrive and S3 are not here: they run on _cloudcore/node (async/await, no Futures), and
+// dropbox.test.js, box.test.js, flickr.test.js, kdrive.test.js and s3.test.js do the same to them over the bus.
 //
 // The stand-in Future follows future.js on the point that matters: a throw inside a then()
 // callback stays on that Future. Set FOUNDATIONS_FUTURE to the path of Foundations'
@@ -168,10 +168,6 @@ function megaAccount() {
 }
 const MEGA = megaAccount();
 
-const S3_CREDS = { accessToken: "AKIDUNITTEST", secretAccessKey: "unit-test-secret-not-a-credential",
-	endpoint: "s3.example.test", region: "eu-test-1", bucket: "bkt", pathStyle: true };
-const s3List = (keys) => "<ListBucketResult>" + keys.map((k) =>
-	"<Contents><Key>" + k + "</Key><Size>3</Size></Contents>").join("") + "</ListBucketResult>";
 
 // Each entry: [label, call(Adapter, creds) -> Future, { tolerant, endsFailed, minSteps }].
 //   tolerant:   failures are meant to be absorbed (a fallback answer); it only has to settle.
@@ -277,39 +273,6 @@ const CONNECTORS = {
 			["moveItem (a file)", (A, c) => A.moveItem(c, "f5", "d0", null, () => {}), { minSteps: 3 }],
 			["moveItem (a folder)", (A, c) => A.moveItem(c, "d7", "d0", "n", () => {}), { minSteps: 2 }],
 			["deleteItem", (A, c) => A.deleteItem(c, "5", () => {}), { minSteps: 3 }],
-		] },
-	s3: { dir: "s3", creds: S3_CREDS, files: ["s3sig.js", "s3xml.js"],
-		reply: () => (o) => {
-			const q = urlOf(o).searchParams, h = o.headers || {};
-			if (o.method === "GET" && q.get("list-type")) {
-				const p = q.get("prefix") || "";
-				if (p === "a.jpg") { return ok(s3List(["a.jpg"])); }
-				if (p === "dir/") { return ok(s3List(["dir/", "dir/x.jpg"])); }
-				if (p === "paged/" && !q.get("continuation-token")) {   // two pages
-					return ok(s3List(["paged/1.jpg"]).replace("</ListBucketResult>",
-						"<IsTruncated>true</IsTruncated><NextContinuationToken>t2</NextContinuationToken></ListBucketResult>"));
-				}
-				return ok(s3List([]));
-			}
-			if (h["x-amz-copy-source"]) { return ok("<CopyObjectResult><LastModified>2026-01-01T00:00:00Z</LastModified></CopyObjectResult>"); }
-			if (o.method === "POST" && q.has("delete")) { return ok("<DeleteResult></DeleteResult>"); }
-			return ok("", o.method === "DELETE" ? 204 : 200);
-		},
-		entries: [
-			["getAccountInfo", (A, c) => A.getAccountInfo(c, () => {})],
-			["listFolder", (A, c) => A.listFolder(c, "root", () => {})],
-			["listFolder (two pages)", (A, c) => A.listFolder(c, "paged/", () => {}), { minSteps: 2 }],
-			["downloadFile", (A, c) => A.downloadFile(c, "a.jpg", dl(), null, () => {})],
-			["uploadFile", (A, c) => A.uploadFile(c, "root", LOCAL, "n.bin", null, () => {})],
-			["uploadReplace", (A, c) => A.uploadReplace(c, "a.jpg", LOCAL, null, () => {})],
-			["createFolder", (A, c) => A.createFolder(c, "", "n", () => {})],
-			["moveItem (a file)", (A, c) => A.moveItem(c, "a.jpg", "d/", null, () => {}), { minSteps: 4 }],
-			["moveItem (a folder)", (A, c) => A.moveItem(c, "dir/", "d2/", null, () => {}), { minSteps: 5 }],
-			["deleteItem (a file)", (A, c) => A.deleteItem(c, "a.jpg", () => {})],
-			["deleteItem (a folder)", (A, c) => A.deleteItem(c, "dir/", () => {}), { minSteps: 2 }],
-			["deletePhoto", (A, c) => A.deletePhoto(c, "a.jpg", () => {})],
-			["ensureAlbumFolder", (A, c) => A.ensureAlbumFolder(c, "Album", () => {})],
-			["resolvePhotoAlbum", (A, c) => A.resolvePhotoAlbum(c, () => {}), { tolerant: true }],
 		] },
 	yandex: { dir: "yandex", creds: OAUTH,
 		reply: () => (o) => {
@@ -421,7 +384,7 @@ function command(files, ctor, args, extra = {}) {
 	return future;
 }
 
-const PHOTO_SERVICES = ["hidrive", "koofr", "mega", "onedrive", "pcloud", "s3", "yandex"];
+const PHOTO_SERVICES = ["hidrive", "koofr", "mega", "onedrive", "pcloud", "yandex"];
 for (const svc of PHOTO_SERVICES) {
 	const dir = serviceDir(svc);
 	for (const [file, ctor] of [["listAlbums_command.js", "ListAlbumsCommandAssistant"],
@@ -456,7 +419,6 @@ for (const [file, ctor, args] of CORE_COMMANDS) {
 for (const [svc, file, ctor, args] of [
 	["pcloud", "exchangeCode_command.js", "ExchangeCodeCommandAssistant", { code: "c" }],
 	["mega", "login_command.js", "LoginCommandAssistant", { email: "u@example.test", password: "p" }],
-	["s3", "login_command.js", "LoginCommandAssistant", { endpoint: "e", bucket: "b", accessKeyId: "a", secretAccessKey: "s" }],
 ]) {
 	test(`${svc} ${ctor}: a reply of an unexpected shape still answers`, async () => {
 		const out = await outcome(command([path.join(serviceDir(svc), "commands", file)], ctor, args));
