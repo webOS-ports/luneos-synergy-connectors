@@ -155,31 +155,6 @@ const urlOf = (o) => new URL(o.url);
 //   minSteps:   the number of requests the operation makes, so its later steps are known to be
 //               failed too.
 const CONNECTORS = {
-	google: { dir: "google", creds: OAUTH, entries: [
-		["listFolder", (A, c) => A.listFolder(c, "root", () => {})],
-		["getAccountInfo", (A, c) => A.getAccountInfo(c, () => {})],
-		["downloadFile", (A, c) => A.downloadFile(c, "F", dl(), null, () => {})],
-		["uploadFile", (A, c) => A.uploadFile(c, "D", LOCAL, "n.bin", null, () => {}), { minSteps: 2 }],
-		["uploadReplace", (A, c) => A.uploadReplace(c, "F", LOCAL, null, () => {})],
-		["createFolder", (A, c) => A.createFolder(c, "root", "n", () => {})],
-		["moveItem (rename)", (A, c) => A.moveItem(c, "F", null, "n", () => {})],
-		["moveItem (to a folder)", (A, c) => A.moveItem(c, "F", "D", null, () => {}), { minSteps: 2 }],
-		["moveItem (to the root)", (A, c) => A.moveItem(c, "F", "root", null, () => {}), { minSteps: 3 }],
-		["deleteItem", (A, c) => A.deleteItem(c, "F", () => {})],
-	] },
-	onedrive: { dir: "onedrive", creds: OAUTH, entries: [
-		["listFolder", (A, c) => A.listFolder(c, "root", () => {})],
-		["listSpecialChildren", (A, c) => A.listSpecialChildren(c, "cameraroll", () => {})],
-		["getAccountInfo", (A, c) => A.getAccountInfo(c, () => {})],
-		["downloadFile", (A, c) => A.downloadFile(c, "F", dl(), null, () => {})],
-		["uploadFile", (A, c) => A.uploadFile(c, "D", LOCAL, "n.bin", null, () => {})],
-		["uploadReplace", (A, c) => A.uploadReplace(c, "F", LOCAL, null, () => {})],
-		["deletePhoto", (A, c) => A.deletePhoto(c, "F", () => {})],
-		["createFolder", (A, c) => A.createFolder(c, "root", "n", () => {})],
-		["moveItem (to a folder)", (A, c) => A.moveItem(c, "F", "D", null, () => {})],
-		["moveItem (to the root)", (A, c) => A.moveItem(c, "F", "root", null, () => {}), { minSteps: 2 }],
-		["deleteItem", (A, c) => A.deleteItem(c, "F", () => {})],
-	] },
 };
 
 const MAX_STEPS = 12;
@@ -240,18 +215,6 @@ function command(files, ctor, args, extra = {}) {
 	return future;
 }
 
-const PHOTO_SERVICES = ["onedrive"];
-for (const svc of PHOTO_SERVICES) {
-	const dir = serviceDir(svc);
-	for (const [file, ctor] of [["listAlbums_command.js", "ListAlbumsCommandAssistant"],
-		["listPhotos_command.js", "ListPhotosCommandAssistant"]]) {
-		test(`${svc} ${file}: a reply of an unexpected shape still answers`, async () => {
-			const out = await outcome(command([path.join(dir, "commands/photolib.js"), path.join(dir, "commands", file)],
-				ctor, { accountId: "acc", aid: "album" }));
-			assert.ok(!out.pending, "the command never answered");
-		});
-	}
-}
 
 const CORE_COMMANDS = [
 	["listFolder_command.js", "ListFolderCommandAssistant", { accountId: "acc" }],

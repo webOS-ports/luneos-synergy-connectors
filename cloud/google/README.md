@@ -12,20 +12,18 @@ is no PHOTO.UPLOAD provider (see [`../../recon/google-drive.md`](../../recon/goo
 ## What's here
 
 ```
-service/com.palm.service.gdrive/    node service: OAuth2/PKCE(+secret) + Drive API v3
-  oauth2.js        Google auth-code + PKCE; DOES ship a client_secret (Desktop clients must
-                   send it); access_type=offline + prompt=consent for a refresh token
-  driveapi.js      Drive v3 REST: query-based listing (files?q='id' in parents), export of
-                   Google-native docs, /about identity, two-step upload, refresh-on-401
-  httpcurl.js      shells all TLS to the bundled modern curl
-  creds.js acl.js  credentials-by-accountId; allowedAppIds enforcement
-  commands/        getAuthorizeUrl, exchangeCode, checkCredentials,
-                   listFolder, downloadFile, uploadFile
-apps/
-  com.palm.app.gdrive-auth/    customUI OAuth login (Atlas simple-mode, stateless PKCE verifier)
-  com.palm.app.gdrive-files/   Enyo file browser/uploader (folder-ID breadcrumb; native-doc export)
+service/com.palm.service.gdrive/    node service on _cloudcore/node (as Dropbox, see ../dropbox/README.md)
+  package.json     main: service.js; run-js-service require()s the directory and calls run()
+  service.js       config.js + adapter.js into _cloudcore/node's connector(); upload/deletePhoto
+                   answer NOT_SUPPORTED (DOCUMENTS only, as the old services.json had none)
+  config.js        endpoints, scope, caller allow-lists; the build fills PLACEHOLDER_GDRIVE_* in
+  adapter.js       Drive v3: query-based listing (files?q='id' in parents, every page), export of
+                   Google-native docs, /about identity, two-step upload, trash, moves by parents
 account/com.palm.gdrive.json   Synergy template: customUI validator, DOCUMENTS only
 ```
+
+OAuth (PKCE plus the Desktop client's secret, `access_type=offline&prompt=consent`), the
+refresh on a 401, the token store and the generic luna methods are `_cloudcore/node`'s.
 
 ## How it differs from the others (Drive is a query store, not a folder tree)
 
@@ -52,13 +50,15 @@ files app maps a Google-native doc to an export format and appends the extension
    `http://localhost/gdrive/oauth2callback`.
 3. Paste **both** `CLIENT_ID` and `CLIENT_SECRET` into `service/com.palm.service.gdrive/config.js`.
 
-Same modern system-curl (`/usr/bin/curl`) + current-CA prerequisites as the other connectors.
+The service speaks HTTPS through node's own fetch; `CURL*` in config.js is only for the
+on-device harness's reachability check.
 
 ## Status / caveats
 
 - ✅ Service, both apps, template. All JS/JSON validated.
 - ⏳ **Account sign-in untested** — needs the Google client_id + secret above.
 - ⚠️ **Unverified-app screen** + **100-user cap** (restricted scope). Personal use only.
-- ⚠️ **Listing caps at pageSize 1000** per folder (no pagination loop) — huge folders truncate.
+- ✅ Large folders are listed in full (`nextPageToken`, 1000 per page).
+- ⚠️ A failed second upload step (the rename/move PATCH) leaves an "Untitled" file in My Drive, as before.
 - ⚠️ For a lower-risk **read-only** build, switch `SCOPE` to `.../auth/drive.readonly` (browse +
   download work; upload is rejected by Google).

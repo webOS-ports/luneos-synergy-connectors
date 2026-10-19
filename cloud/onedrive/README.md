@@ -8,31 +8,30 @@ secret**. Only the on-device customUI sign-in is exercised solely by the framewo
 
 Of the three cloud providers investigated, OneDrive was the **cleanest fit** — a public
 PKCE client with *no secret*, personal Microsoft accounts allowed, and a file-download
-endpoint that 302-redirects to a pre-signed URL our curl fetches with no auth header. It is
-the purest `_cloudcore` connector: **everything but `config.js`, `adapter.js`, and the three
-photo commands is the shared core**, and it uses the one generic `com.palm.app.cloud-auth` app.
+endpoint that 302-redirects to a pre-signed URL fetched with no auth header. It is the
+purest `_cloudcore` connector: **everything but `config.js`, `adapter.js` and `photos.js` is
+the shared core**, and it uses the one generic `com.palm.app.cloud-auth` app.
 
 ## What's here
 
 ```
-service/com.palm.service.onedrive/   node service on the shared _cloudcore runtime
-  config.js        endpoints + Azure client id + _cloudcore wiring (SCOPE, TOKEN_SEND_SCOPE,
-                   AUTH_APP_IDS/FILE_APP_IDS); ROOT_FOLDER = "root"
-  adapter.js       Microsoft Graph mapping: /me/drive/{root|items/{id}}/children, /content
-                   (302), PUT raw-body upload, refresh-on-401; normalises to the uniform
-                   _cloudcore entry shape (+ listSpecialChildren raw, for Photos)
-  commands/        photolib, listAlbums, listPhotos                <- PHOTO.UPLOAD (Camera Roll)
-  sources.json     pulls ../_cloudcore/{acl,httpcurl,oauth2,creds,cloudservice}.js and the six
-                   generic ../_cloudcore/commands/* (getAuthorizeUrl, exchangeCode,
-                   checkCredentials, listFolder, uploadFile, downloadFile) + the local photos
+service/com.palm.service.onedrive/   node service on _cloudcore/node (as Dropbox, see ../dropbox/README.md)
+  package.json     main: service.js; run-js-service require()s the directory and calls run()
+  service.js       config.js + adapter.js + photos.js into _cloudcore/node's connector()
+  config.js        endpoints, scope, caller allow-lists; the build fills PLACEHOLDER_ONEDRIVE_* in;
+                   TOKEN_SEND_SCOPE (Graph wants scope on the token calls); ROOT_FOLDER = "root"
+  adapter.js       Microsoft Graph: /me/drive/{root|items/{id}}/children (every page), /content
+                   (302, followed), PUT raw-body upload, conflictBehavior fail, moves by
+                   parentReference (the root's real id), DELETE to the recycle bin
+  photos.js        listAlbums / listPhotos: the Camera Roll special folder as one album
 account/com.palm.onedrive.json   Synergy template: customUI validator -> the generic
                                  com.palm.app.cloud-auth, DOCUMENTS + PHOTO.UPLOAD, permissions
 ```
 
-Auth is the shared generic app **`../cloudcore/auth/com.palm.app.cloud-auth`** (no per-provider
-OneDrive auth app). The shared `_cloudcore/oauth2.js` covers OneDrive as-is: it sends `scope`
-on the code-exchange + refresh (Graph requires it) via `config.js` `TOKEN_SEND_SCOPE: true`,
-and runs pure PKCE because the `CLIENT_SECRET` is left as the `PLACEHOLDER_` sentinel.
+Auth is the shared generic app `com.palm.app.cloud-auth`. `_cloudcore/node/oauth.js` sends
+`scope` on the code exchange and refresh (`TOKEN_SEND_SCOPE: true`) and runs pure PKCE because
+`CLIENT_SECRET` stays the `PLACEHOLDER_` sentinel. Microsoft rotates the refresh token; the
+renewed one is saved to the account on every refresh.
 
 ## How it differs from Box (both are REST/ID-based)
 
@@ -41,7 +40,7 @@ and runs pure PKCE because the `CLIENT_SECRET` is left as the `PLACEHOLDER_` sen
 | Item tree | `/folders/{id}/items` | `/me/drive/{root\|items/{id}}/children` (URL segments) |
 | Root sentinel | `"0"` | `"root"` |
 | List envelope | `{entries:[…]}` | `{value:[…]}`; folder vs file = `folder`/`file` facet |
-| Download | `/content` → 302 dl.boxcloud.com | `/content` → 302 pre-signed (curl strips auth on cross-host redirect) |
+| Download | `/content` → 302 dl.boxcloud.com | `/content` → 302 pre-signed (fetch drops the Authorization header on the cross-origin redirect) |
 | Upload | multipart to upload.box.com | **PUT raw body** to `…:/{name}:/content` |
 | Photo `src_big` | `/content?access_token=` | item `@microsoft.graph.downloadUrl` (pre-signed, inline in the listing) |
 | Secret | optional | **never** — MS public clients redeem the code with no secret |
@@ -56,9 +55,10 @@ Register a free app in the **Azure portal → App registrations**:
 - **Supported account types:** *Accounts in any org directory **and** personal Microsoft accounts* (so consumer OneDrive works).
 - **Platform:** *Mobile and desktop applications*; add redirect URI `http://localhost/onedrive/oauth2callback` verbatim.
 - **Authentication → Allow public client flows: Yes.**
-- Copy the **Application (client) ID** into `service/com.palm.service.onedrive/config.js` (`CLIENT_ID`). **No client_secret** — leave the placeholder; `oauth2.js` runs pure PKCE.
+- The build fills the **Application (client) ID** in for `PLACEHOLDER_ONEDRIVE_CLIENT_ID`. **No client_secret** — leave the placeholder; `_cloudcore/node/oauth.js` runs pure PKCE.
 
-Same modern system-curl (`/usr/bin/curl`) + current-CA prerequisites as Dropbox.
+The service speaks HTTPS through node's own fetch; `CURL*` in config.js is only for the
+on-device harness's reachability check.
 
 ## Status / caveats
 
@@ -66,7 +66,9 @@ Same modern system-curl (`/usr/bin/curl`) + current-CA prerequisites as Dropbox.
   [`../../photos-integration/patches/Utils.js.patch`](../../photos-integration/patches/Utils.js.patch)).
 - ✅ **Live-API verified** (off-device, system curl): Auth-Code+PKCE (no secret), rotating
   **refresh**, `/me` identity, drive-root list, upload, download (byte-identical round trip),
-  and the Camera Roll special folder — all against a real personal OneDrive.
+  and the Camera Roll special folder — all against a real personal OneDrive, with the
+  mojoservice version. The `_cloudcore/node` port is checked by `tests/unit/onedrive.test.js`
+  only; it has not yet been run against the live API or on a device.
 - ✅ **Library icons** (`icon_onedrive_{40x40,20x20}.png`, from the 2025 OneDrive cloud) +
   account icons (`onedrive-{32x32,48x48}.png`), all exact-square so they don't tile.
 - ⏳ **On-device customUI sign-in** — the one path exercised only by the framework; the token
