@@ -29,7 +29,7 @@ enyo.kind({
 					spellcheck: false, style: "width:100%; margin-top:8px;" },
 				{ kind: "PasswordInput", name: "secretField", hint: "Secret access key",
 					spellcheck: false, style: "width:100%; margin-top:8px;" },
-				{ kind: "control", style: "margin-top:10px; display:flex; align-items:center;", components: [
+				{ kind: "Control", style: "margin-top:10px; display:flex; align-items:center;", components: [
 					{ name: "pathStyleToggle", kind: "CheckBox", checked: true },
 					{ kind: "Control", className: "accounts-body-text", style: "margin-left:8px;",
 						content: "Path-style URLs (needed for most non-AWS endpoints)" }
