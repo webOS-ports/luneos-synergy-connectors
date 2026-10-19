@@ -111,8 +111,11 @@
 			// (a cached Microsoft session signs in without showing a page) is not missed.
 			window.addEventListener("webOSExternalProtocol", onExternal, false);
 
+			// No size by default: WAM makes a window.open() window a card like the app's own, and
+			// "height=600" made it a 600 px surface in the 679 px card slot on a 480x800 phone,
+			// which the keyboard then left a band of wallpaper above (MindPhone, Box sign-in).
 			try {
-				win = window.open(opts.url, opts.name || "oauth", opts.features || "width=800,height=600");
+				win = window.open(opts.url, opts.name || "oauth", opts.features || "");
 			} catch (e) {
 				win = null;
 			}

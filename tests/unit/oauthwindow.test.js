@@ -21,8 +21,8 @@ function load(file) {
 	const timers = [];
 	const win = {
 		navigator: { mimeTypes: {} },
-		open(url) {
-			const p = { closed: false, location: { href: url }, close() { p.closed = true; } };
+		open(url, name, features) {
+			const p = { closed: false, location: { href: url }, features, close() { p.closed = true; } };
 			popups.push(p);
 			return p;
 		},
@@ -82,5 +82,17 @@ for (const file of COPIES) {
 		assert.strictEqual(OAuthWindow.unwrapLoadError("https://x.example/?failedUrl=y"), "https://x.example/?failedUrl=y");
 		assert.strictEqual(OAuthWindow.unwrapLoadError(null), null);
 		assert.strictEqual(OAuthWindow.unwrapLoadError(ERROR_PAGE), REDIRECT + "?state=cloud&code=cP3R");
+	});
+}
+
+for (const file of COPIES) {
+	const name = path.basename(path.dirname(path.dirname(file)));
+	test(`${name}: the window gets no size unless the caller asks for one`, () => {
+		let r = load(file);
+		r.OAuthWindow.open({ url: "https://example.com/a", redirectPrefix: REDIRECT });
+		assert.strictEqual(r.popups[0].features, "");
+		r = load(file);
+		r.OAuthWindow.open({ url: "https://example.com/a", redirectPrefix: REDIRECT, features: "height=300" });
+		assert.strictEqual(r.popups[0].features, "height=300");
 	});
 }
