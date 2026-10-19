@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,28 +67,106 @@ type scTrack struct {
 		Username string `json:"username"`
 	} `json:"user"`
 	Media struct {
-		Transcodings []struct {
-			URL    string `json:"url"`
-			Format struct {
-				Protocol string `json:"protocol"`
-				MimeType string `json:"mime_type"`
-			} `json:"format"`
-		} `json:"transcodings"`
+		Transcodings []scTranscoding `json:"transcodings"`
 	} `json:"media"`
 }
 
-// streamTranscoding is the URL of the transcoding to play: progressive (plain MP3)
-// first, then HLS (gst hlsdemux). "" when there is none - label tracks often come
-// only as cbc-/ctr-encrypted-hls, which is DRM the stream player cannot decode.
-func (t *scTrack) streamTranscoding() string {
-	for _, proto := range []string{"progressive", "hls"} {
-		for _, tr := range t.Media.Transcodings {
-			if tr.Format.Protocol == proto {
-				return tr.URL
-			}
+type scTranscoding struct {
+	URL    string `json:"url"`
+	Preset string `json:"preset"` // e.g. aac_160k, aac_96k, mp3_1_0, opus_0_0, abr_sq
+	Format struct {
+		Protocol string `json:"protocol"`
+		MimeType string `json:"mime_type"`
+	} `json:"format"`
+}
+
+// scFormatLabel is the format label of a transcoding the stream player can play, ""
+// for the others: cbc-/ctr-encrypted-hls is DRM, and an abr_* preset is an adaptive
+// playlist over the same streams the track lists one by one.
+func scFormatLabel(tr *scTranscoding) string {
+	if tr.Format.Protocol != "progressive" && tr.Format.Protocol != "hls" {
+		return ""
+	}
+	p, mime := tr.Preset, tr.Format.MimeType
+	switch {
+	case strings.HasPrefix(p, "abr"):
+		return ""
+	case strings.HasPrefix(p, "aac_"):
+		if kbps := strings.TrimSuffix(strings.TrimPrefix(p, "aac_"), "k"); scKbps(kbps) > 0 {
+			return "AAC " + kbps
 		}
+		return "AAC"
+	case strings.HasPrefix(p, "mp3"):
+		return "MP3 128"
+	case strings.HasPrefix(p, "opus"):
+		return "OPUS 64"
+	case mime == "audio/mpeg" || strings.HasPrefix(mime, "audio/mpeg;"):
+		return "MP3"
+	case strings.Contains(mime, "mp4a") || strings.Contains(mime, "aac"):
+		return "AAC"
+	case strings.Contains(mime, "opus") || strings.Contains(mime, "ogg"):
+		return "OPUS"
 	}
 	return ""
+}
+
+// scKbps is the bitrate in a label's or preset's number, 0 if it has none.
+func scKbps(s string) int {
+	if i := strings.LastIndexByte(s, ' '); i >= 0 {
+		s = s[i+1:]
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+type scStream struct {
+	label, url  string
+	progressive bool
+}
+
+// streams are the transcodings the stream player can play, best first: the higher
+// bitrate, and at the same one a progressive (plain) file before HLS (gst hlsdemux).
+// None for a track that comes only encrypted, as label tracks often do.
+func (t *scTrack) streams() []scStream {
+	var out []scStream
+	for i := range t.Media.Transcodings {
+		tr := &t.Media.Transcodings[i]
+		if l := scFormatLabel(tr); l != "" && tr.URL != "" {
+			out = append(out, scStream{label: l, url: tr.URL, progressive: tr.Format.Protocol == "progressive"})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if a, b := scKbps(out[i].label), scKbps(out[j].label); a != b {
+			return a > b
+		}
+		return out[i].progressive && !out[j].progressive
+	})
+	return out
+}
+
+// pickStream is the stream with label format, or the best one when format is "" or
+// not among them; labels are the distinct ones, best first. ok is false when there is
+// nothing to play.
+func pickStream(streams []scStream, format string) (picked scStream, labels []string, ok bool) {
+	if len(streams) == 0 {
+		return scStream{}, nil, false
+	}
+	picked = streams[0]
+	found := false
+	seen := map[string]bool{}
+	for _, s := range streams {
+		if format != "" && !found && s.label == format {
+			picked, found = s, true
+		}
+		if !seen[s.label] {
+			seen[s.label] = true
+			labels = append(labels, s.label)
+		}
+	}
+	return picked, labels, true
 }
 
 // parseSoundcloudTracks turns a search reply into the tracks that can be played;
@@ -102,7 +181,7 @@ func parseSoundcloudTracks(body string) ([]providerTrack, error) {
 	out := []providerTrack{}
 	for i := range r.Collection {
 		t := &r.Collection[i]
-		if t.ID == 0 || t.streamTranscoding() == "" {
+		if t.ID == 0 || len(t.streams()) == 0 {
 			continue
 		}
 		out = append(out, providerTrack{
@@ -143,6 +222,12 @@ func (s *soundcloudProvider) Search(ctx context.Context, query string, limit int
 }
 
 func (s *soundcloudProvider) StreamURL(ctx context.Context, trackID string) (string, error) {
+	return s.StreamURLFormat(ctx, trackID, "")
+}
+
+// StreamURLFormat resolves the track in the format labelled format, or in the best
+// one when it has no such format (formatSelector).
+func (s *soundcloudProvider) StreamURLFormat(ctx context.Context, trackID, format string) (string, error) {
 	if trackID == "" {
 		return "", fmt.Errorf("no track id")
 	}
@@ -162,10 +247,13 @@ func (s *soundcloudProvider) StreamURL(ctx context.Context, trackID string) (str
 		// Not a track: api-v2's error replies (401, 404, 429) come with a body too.
 		return "", fmt.Errorf("soundcloud: no track %s", trackID)
 	}
-	tcURL := t.streamTranscoding()
-	if tcURL == "" {
-		if len(t.Media.Transcodings) > 0 {
-			return "", fmt.Errorf("soundcloud: %q is only available encrypted (DRM)", t.Title)
+	picked, labels, ok := pickStream(t.streams(), format)
+	tcURL := picked.url
+	if !ok {
+		for _, tr := range t.Media.Transcodings {
+			if strings.Contains(tr.Format.Protocol, "encrypted") {
+				return "", fmt.Errorf("soundcloud: %q is only available encrypted (DRM)", t.Title)
+			}
 		}
 		return "", fmt.Errorf("soundcloud: %q has no stream", t.Title)
 	}
@@ -183,5 +271,6 @@ func (s *soundcloudProvider) StreamURL(ctx context.Context, trackID string) (str
 	if err := json.Unmarshal([]byte(r2), &u); err != nil || u.URL == "" {
 		return "", fmt.Errorf("soundcloud stream resolve failed")
 	}
+	reportFormats(ctx, picked.label, labels)
 	return u.URL, nil
 }

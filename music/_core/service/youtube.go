@@ -411,7 +411,7 @@ resolve:
 								}
 							}
 						}
-						setNowPlaying(ytFmtLabel(pickedItag, pickedMime), avail)
+						reportFormats(ctx, ytFmtLabel(pickedItag, pickedMime), avail)
 					}
 					log.Printf("youtube player %s(%s): resolved %s url (verified) [itag %d]", cl.name, trackID, kind, pickedItag)
 					return best, nil
