@@ -15,6 +15,9 @@
  * so a build MAY run as a public client (leave CLIENT_SECRET as the placeholder and it
  * is never sent - see oauth2.js _hasSecret).
  */
+/* The OAuth app's credentials are not kept here. The build fills the PLACEHOLDER_YANDEX_*
+ * values in from YANDEX_CLIENT_ID / YANDEX_CLIENT_SECRET (meta-luneos
+ * cloud-synergy-connector.inc); a package built without them cannot sign in. */
 var Config = {
 	// Modern-TLS HTTP: the device node is OpenSSL 0.9.8k and cannot handshake with
 	// cloud-api.yandex.net / oauth.yandex.com, so ALL Yandex HTTPS is shelled out to the
@@ -24,11 +27,11 @@ var Config = {
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
 
-	CLIENT_ID:     "86411bcf2cea432db3201bfdec5ddf42",   // Yandex OAuth app ID
+	CLIENT_ID:     "PLACEHOLDER_YANDEX_CLIENT_ID", // from the build, see config.js header
 	// Yandex is a confidential client: the secret IS sent on the token exchange/refresh.
 	// If a build wants a pure public (PKCE-only) client, leave this placeholder and
 	// oauth2.js will never send a secret (it also sends an S256 code_challenge).
-	CLIENT_SECRET: "20bc280e6b134ce6aeb654f12fbe4eec",   // Yandex OAuth app secret
+	CLIENT_SECRET: "PLACEHOLDER_YANDEX_CLIENT_SECRET", // from the build, see config.js header
 	REDIRECT_URI:  "http://localhost/yandex/oauth2callback",
 
 	// Yandex OAuth2 (id.yandex / oauth.yandex.com)

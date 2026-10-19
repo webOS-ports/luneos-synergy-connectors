@@ -17,6 +17,9 @@
  * exchange REQUIRES a client_secret (same situation as the gdrive connector). Both values
  * are required before the connector can run.
  */
+/* The OAuth app's credentials are not kept here. The build fills the PLACEHOLDER_PCLOUD_*
+ * values in from PCLOUD_CLIENT_ID / PCLOUD_CLIENT_SECRET (meta-luneos
+ * cloud-synergy-connector.inc); a package built without them cannot sign in. */
 var Config = {
 	// Modern-TLS HTTP: device node is OpenSSL 0.9.8k, so ALL pCloud HTTPS shells out to the
 	// bundled modern curl (same binary + system CA store the Dropbox/Box connectors use).
@@ -24,11 +27,11 @@ var Config = {
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
 
-	CLIENT_ID:     "EYDr48cX1c8",                        // pCloud app "Client ID"
+	CLIENT_ID:     "PLACEHOLDER_PCLOUD_CLIENT_ID", // from the build, see config.js header
 	// REQUIRED for pCloud (no PKCE support - the token exchange must send the secret, like
 	// the gdrive "Desktop app" client). It ships in the package; oauth2.js includes it
 	// because it is not left as the PLACEHOLDER sentinel.
-	CLIENT_SECRET: "MKRfolugUiyIh6xS7qaNIFBGuRBV",       // pCloud app "Client secret"
+	CLIENT_SECRET: "PLACEHOLDER_PCLOUD_CLIENT_SECRET", // from the build, see config.js header
 	REDIRECT_URI:  "http://localhost/pcloud/oauth2callback",
 
 	// OAuth2 consent is always on my.pcloud.com (region-independent); the redirect back tells

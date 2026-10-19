@@ -12,6 +12,9 @@
  * IS sent on the token exchange), and oauth2.js ALSO sends a PKCE challenge (harmless - Hydra
  * binds it and we send the matching verifier).
  */
+/* The OAuth app's credentials are not kept here. The build fills the PLACEHOLDER_KOOFR_*
+ * values in from KOOFR_CLIENT_ID / KOOFR_CLIENT_SECRET (meta-luneos
+ * cloud-synergy-connector.inc); a package built without them cannot sign in. */
 var Config = {
 	// Modern-TLS HTTP: device node can't handshake with app.koofr.net, so ALL HTTPS shells out
 	// to the bundled modern curl (same binary + CA store as the other connectors).
@@ -19,9 +22,9 @@ var Config = {
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
 
-	CLIENT_ID:     "DMUXM62M6F6EI3DCAR5TIMJBEP5EETPJ",   // Koofr OAuth2 "Desktop app" Client ID
+	CLIENT_ID:     "PLACEHOLDER_KOOFR_CLIENT_ID", // from the build, see config.js header
 	// Koofr is a confidential client: the secret IS sent on the token exchange/refresh.
-	CLIENT_SECRET: "MS7G6OULP3HKIM7A2AGZHI7VJZ7MDA3X64YCW6HVNUMLINK2YZR5FUUKS6GV4MIC",
+	CLIENT_SECRET: "PLACEHOLDER_KOOFR_CLIENT_SECRET", // from the build, see config.js header
 	REDIRECT_URI:  "http://localhost/koofr/oauth2callback",
 
 	// Koofr OAuth2 (Ory Hydra) endpoints (verified live).

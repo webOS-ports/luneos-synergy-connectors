@@ -12,6 +12,9 @@
  * Microsoft public/native clients MUST redeem the code WITHOUT a secret, so the identical
  * package ships to every device with nothing to provision (see oauth2.js).
  */
+/* The OAuth app's credentials are not kept here. The build fills the PLACEHOLDER_ONEDRIVE_*
+ * values in from ONEDRIVE_CLIENT_ID / ONEDRIVE_CLIENT_SECRET (meta-luneos
+ * cloud-synergy-connector.inc); a package built without them cannot sign in. */
 var Config = {
 	// Modern-TLS HTTP: device node is OpenSSL 0.9.8k, so ALL Graph HTTPS shells out to the
 	// bundled modern curl (same binary + system CA store the Dropbox/Box connectors use).
@@ -19,7 +22,7 @@ var Config = {
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
 
-	CLIENT_ID:     "8b20aa5b-7480-461d-a32b-2fc5bde09701",   // Azure App registration (client) ID
+	CLIENT_ID:     "PLACEHOLDER_ONEDRIVE_CLIENT_ID", // from the build, see config.js header
 	// Microsoft public clients redeem the auth code with NO secret. Leave this placeholder;
 	// oauth2.js runs pure PKCE and never sends a secret when it starts with "PLACEHOLDER".
 	CLIENT_SECRET: "PLACEHOLDER_ONEDRIVE_CLIENT_SECRET",
