@@ -11,8 +11,11 @@
 // multi-step operations (MEGA's tree then command...)
 // fail as well as the first one. The Future the entry point returns must settle with an error.
 //
-// Dropbox, Box, Flickr, kDrive and S3 are not here: they run on _cloudcore/node (async/await, no Futures), and
-// dropbox.test.js, box.test.js, flickr.test.js, kdrive.test.js and s3.test.js do the same to them over the bus.
+// multi-step operations (MEGA's tree then command...)
+// fail as well as the first one. The Future the entry point returns must settle with an error.
+//
+// Dropbox, Box, Flickr, kDrive, Koofr, pCloud and S3 are not here: they run on _cloudcore/node (async/await, no Futures), and
+// dropbox.test.js, box.test.js, flickr.test.js, kdrive.test.js, koofr.test.js, pcloud.test.js and s3.test.js do the same to them over the bus.
 //
 // The stand-in Future follows future.js on the point that matters: a throw inside a then()
 // callback stays on that Future. Set FOUNDATIONS_FUTURE to the path of Foundations'
@@ -224,56 +227,6 @@ const CONNECTORS = {
 			["photoAlbums", (A, c) => A.photoAlbums(c, () => {}), { tolerant: true, minSteps: 2 }],
 			["resolvePhotoAlbum", (A, c) => A.resolvePhotoAlbum(c, () => {}), { tolerant: true, minSteps: 2 }],
 		] },
-	koofr: { dir: "koofr", creds: OAUTH,
-		// The move's probe of its destination must find nothing (404), its read-back the item.
-		reply: () => { let probed = false; return (o) => {
-			if (/\/mounts$/.test(o.url)) { return ok({ mounts: [{ id: "m1", isPrimary: true }] }); }
-			if (/files\/info\?path=%2Fd%2Fa\.jpg/.test(o.url) && !probed) { probed = true; return ok({}, 404); }
-			if (/files\/download\?/.test(o.url)) { return ok({ link: "https://dl.example.test/x" }); }
-			return ok({ name: "a.jpg", type: "file" });
-		}; },
-		entries: [
-			["getAccountInfo", (A, c) => A.getAccountInfo(c, () => {})],
-			["listFolder", (A, c) => A.listFolder(c, "/", () => {}), { minSteps: 2 }],
-			["downloadFile", (A, c) => A.downloadFile(c, "/a.jpg", dl(), null, () => {}), { minSteps: 2 }],
-			["uploadFile", (A, c) => A.uploadFile(c, "/", LOCAL, "n.bin", null, () => {}), { minSteps: 2 }],
-			["uploadReplace", (A, c) => A.uploadReplace(c, "/a.jpg", LOCAL, null, () => {}), { minSteps: 2 }],
-			["createFolder", (A, c) => A.createFolder(c, "/", "n", () => {}), { minSteps: 3 }],
-			["moveItem", (A, c) => A.moveItem(c, "/a.jpg", "/d", null, () => {}), { minSteps: 4 }],
-			["deleteItem", (A, c) => A.deleteItem(c, "/a.jpg", () => {}), { minSteps: 2 }],
-			["deletePhoto", (A, c) => A.deletePhoto(c, "/a.jpg", () => {}), { minSteps: 2 }],
-			["ensureAlbumFolder", (A, c) => A.ensureAlbumFolder(c, "Album", () => {}), { minSteps: 2 }],
-			["getTemporaryLink", (A, c) => A.getTemporaryLink(c, "/a.jpg", () => {}), { minSteps: 2 }],
-			["photoAlbums", (A, c) => A.photoAlbums(c, () => {}), { tolerant: true, minSteps: 2 }],
-			["resolvePhotoAlbum", (A, c) => A.resolvePhotoAlbum(c, () => {}), { tolerant: true, minSteps: 2 }],
-		] },
-	pcloud: { dir: "pcloud", creds: { accessToken: "tok", apiHost: "eapi.pcloud.com" },
-		reply: () => (o) => {
-			const u = urlOf(o), m = u.pathname.slice(1), q = u.searchParams;
-			if (u.host === "h.example.test") { return ok(""); }
-			if (m === "getfilelink") { return ok({ result: 0, hosts: ["h.example.test"], path: "/p" }); }
-			if (m === "checksumfile") { return ok({ result: 0, metadata: { name: "a.jpg", parentfolderid: 0, fileid: 5 } }); }
-			if (m === "listfolder" && q.get("nofiles")) {
-				return q.get("folderid") === "5" ? ok({ result: 2005, error: "Directory does not exist." }) :
-					ok({ result: 0, metadata: { folderid: Number(q.get("folderid")), isfolder: true, name: "d" } });
-			}
-			if (m === "listfolder") { return ok({ result: 0, metadata: { contents: [] } }); }
-			return ok({ result: 0, metadata: {} });
-		},
-		entries: [
-			["getAccountInfo", (A, c) => A.getAccountInfo(c, () => {})],
-			["listFolder", (A, c) => A.listFolder(c, 0, () => {})],
-			["listFolderRaw", (A, c) => A.listFolderRaw(c, 0, () => {})],
-			["downloadFile", (A, c) => A.downloadFile(c, "5", dl(), null, () => {}), { minSteps: 2 }],
-			["getFileLink", (A, c) => A.getFileLink(c, "5", () => {})],
-			["uploadFile", (A, c) => A.uploadFile(c, 0, LOCAL, "n.bin", null, () => {})],
-			["uploadReplace", (A, c) => A.uploadReplace(c, "5", LOCAL, null, () => {}), { minSteps: 2 }],
-			["deletePhoto", (A, c) => A.deletePhoto(c, "5", () => {})],
-			["createFolder", (A, c) => A.createFolder(c, "0", "n", () => {})],
-			["moveItem (a file)", (A, c) => A.moveItem(c, "f5", "d0", null, () => {}), { minSteps: 3 }],
-			["moveItem (a folder)", (A, c) => A.moveItem(c, "d7", "d0", "n", () => {}), { minSteps: 2 }],
-			["deleteItem", (A, c) => A.deleteItem(c, "5", () => {}), { minSteps: 3 }],
-		] },
 	yandex: { dir: "yandex", creds: OAUTH,
 		reply: () => (o) => {
 			if (/\/resources\/(download|upload)\?/.test(o.url)) {
@@ -384,7 +337,7 @@ function command(files, ctor, args, extra = {}) {
 	return future;
 }
 
-const PHOTO_SERVICES = ["hidrive", "koofr", "mega", "onedrive", "pcloud", "yandex"];
+const PHOTO_SERVICES = ["hidrive", "mega", "onedrive", "yandex"];
 for (const svc of PHOTO_SERVICES) {
 	const dir = serviceDir(svc);
 	for (const [file, ctor] of [["listAlbums_command.js", "ListAlbumsCommandAssistant"],
@@ -417,7 +370,6 @@ for (const [file, ctor, args] of CORE_COMMANDS) {
 }
 
 for (const [svc, file, ctor, args] of [
-	["pcloud", "exchangeCode_command.js", "ExchangeCodeCommandAssistant", { code: "c" }],
 	["mega", "login_command.js", "LoginCommandAssistant", { email: "u@example.test", password: "p" }],
 ]) {
 	test(`${svc} ${ctor}: a reply of an unexpected shape still answers`, async () => {

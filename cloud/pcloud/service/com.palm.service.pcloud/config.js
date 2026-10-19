@@ -9,7 +9,7 @@
  * Every subsequent API call for that account (token exchange, listfolder, getfilelink,
  * uploadfile, userinfo) MUST go to that region's host, or pCloud returns "log in first".
  * So we STORE the region host in the account credentials (common.apiHost) at exchangeCode
- * time and the Adapter uses it for all calls. See adapter.js / exchangeCode_command.js.
+ * time and the adapter uses it for all calls. See adapter.js / oauth2.js.
  *
  * REGISTER a free app at https://docs.pcloud.com/ -> "My applications" (developer console).
  * Set the redirect URI to REDIRECT_URI below verbatim. Paste BOTH the Client ID and the
@@ -20,17 +20,19 @@
 /* The OAuth app's credentials are not kept here. The build fills the PLACEHOLDER_PCLOUD_*
  * values in from PCLOUD_CLIENT_ID / PCLOUD_CLIENT_SECRET (meta-luneos
  * cloud-synergy-connector.inc); a package built without them cannot sign in. */
+/* A plain file the build patches (sed on the PLACEHOLDER_ lines), read with require(). */
 var Config = {
-	// Modern-TLS HTTP: device node is OpenSSL 0.9.8k, so ALL pCloud HTTPS shells out to the
-	// bundled modern curl (same binary + system CA store the Dropbox/Box connectors use).
+	// Not used by the service, which speaks HTTPS through node's own fetch (_cloudcore/node/
+	// http.js). The on-device harness (tests/suites/cloud.py tls_reachable) still runs this curl
+	// with this CA bundle to check the provider can be reached, so the keys stay.
 	CURL:                 "/usr/bin/curl",
 	CURL_LD_LIBRARY_PATH: "",
 	CURL_CAINFO:          "/etc/ssl/certs/ca-certificates.crt",
 
 	CLIENT_ID:     "PLACEHOLDER_PCLOUD_CLIENT_ID", // from the build, see config.js header
 	// REQUIRED for pCloud (no PKCE support - the token exchange must send the secret, like
-	// the gdrive "Desktop app" client). It ships in the package; oauth2.js includes it
-	// because it is not left as the PLACEHOLDER sentinel.
+	// the gdrive "Desktop app" client). It ships in the package; oauth2.js sends it on the
+	// token exchange.
 	CLIENT_SECRET: "PLACEHOLDER_PCLOUD_CLIENT_SECRET", // from the build, see config.js header
 	REDIRECT_URI:  "http://localhost/pcloud/oauth2callback",
 
@@ -48,16 +50,17 @@ var Config = {
 
 	ROOT_FOLDER: 0,   // pCloud root folderid sentinel (numeric 0)
 
-	// --- _cloudcore generic wiring (consumed by ../_cloudcore) --------------------------
+	// --- _cloudcore generic wiring (read by _cloudcore/node) ----------------------------
 	SERVICE_NAME:  "com.palm.service.pcloud",
 	DISPLAY_NAME:  "pCloud",                 // exchangeCode username fallback
 	STATE:         "pcloud",                 // OAuth `state` + Atlas result-key stem
-	// pCloud's auth is LOCAL (region host, no PKCE, no refresh) so the generic oauth2.js is
-	// NOT used - AUTHORIZE_EXTRA/TOKEN_SEND_SCOPE are kept only for config symmetry. The
-	// generic cloud-auth forwards the redirect's hostname/locationid to the LOCAL exchangeCode.
+	// pCloud's auth is LOCAL (region host, no PKCE, no refresh) so _cloudcore/node/oauth.js is
+	// NOT used (there is no TOKEN_URL) - AUTHORIZE_EXTRA/TOKEN_SEND_SCOPE are kept only for config
+	// symmetry. The generic cloud-auth forwards the redirect's hostname/locationid to the LOCAL
+	// exchangeCode (oauth2.js).
 	AUTHORIZE_EXTRA:  "",
 	TOKEN_SEND_SCOPE: false,
-	// Caller allow-lists enforced by _cloudcore/acl.js.
+	// Caller allow-lists enforced by _cloudcore/node/bus.js.
 	AUTH_APP_IDS:  ["com.palm.app.cloud-auth"],
 	FILE_APP_IDS:  ["org.webosports.app.documents", "org.webosports.app.documents-*", "com.palm.stark.files.service"],
 

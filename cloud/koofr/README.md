@@ -1,57 +1,65 @@
 # Koofr connector
 
-A Synergy connector for **Koofr** as a **DOCUMENTS** provider (file browse / upload / download for
-the file-picker + QuickOffice reroute) and a **PHOTO.UPLOAD** provider.
+A Synergy connector for **Koofr** as a **DOCUMENTS** provider (browse, download, upload and
+manage files for Documents and Topaz Explorer) and a **PHOTO.UPLOAD** source for the Photos
+service. It runs on `_cloudcore/node` (plain node 22 modules), laid out like the Dropbox
+connector, which is the reference.
+
+## Components
+
+| Path | What it is |
+|---|---|
+| `service/com.palm.service.koofr/` | The node service (see below). |
+| `account/com.palm.koofr.json` | Synergy account template. Sign-in runs in `com.palm.app.cloud-auth` (`cloud/_core/apps/`). |
+| `files/sysbus/` | Its LS2 role, permissions and service file. |
+
+The service directory:
+
+| File | What it is |
+|---|---|
+| `package.json` | `main: service.js`; `run-js-service` requires the directory and calls `run()`. |
+| `service.js` | Wires `config.js`, `adapter.js` and `photos.js` into `_cloudcore/node`'s `connector()`. |
+| `config.js` | OAuth app, endpoints, caller allow-lists. A plain file: the build fills `PLACEHOLDER_KOOFR_CLIENT_ID` / `PLACEHOLDER_KOOFR_CLIENT_SECRET` in with sed. |
+| `adapter.js` | Koofr REST v2 as async functions on a session. |
+| `photos.js` | `listAlbums` / `listPhotos`, and `upload` with the album id decoded. |
 
 ## Shape
 
-Koofr's pragmatic auth is **HTTP Basic with an app password**, not OAuth — Koofr *has* OAuth2, but
-third-party client registration is support-gated, whereas app passwords are self-service (and are
-what rclone's Koofr backend uses). So, like the Mega/S3 connectors, Koofr has its **own** credentials
-form (`com.palm.app.koofr-auth`) and a `login` command; there is nothing to register centrally.
+- **Auth:** OAuth2 (Ory Hydra) authorization code with PKCE **and** a client secret
+  (a confidential client); scope `public`, the only one Koofr accepts. The generic
+  `getAuthorizeUrl`/`exchangeCode`/`checkCredentials` of `_cloudcore/node`, a refresh on a 401.
+- **API:** `https://app.koofr.net/api/v2` for metadata, `…/content/api/v2` for file bytes;
+  every request carries `X-Koofr-Version: 2.1`.
+- **Mount + path model:** files live under a **mount**; the user's **primary** mount
+  (`GET /mounts` → `isPrimary`, else the first) is resolved the first time a request needs it
+  and kept on the credentials (`mountId`), so it is saved with a renewed token. A locator is an
+  absolute path in that mount; the root is `/` (`""`, `root` too).
+- **File operations:** `createFolder` (an existing name fails, 409), `moveItem` (a rename in
+  place is `files/rename`, anything else one `files/move`; an existing destination is refused
+  first with `KOOFR_EXISTS`, a change of case of the item itself is let through), `deleteItem`
+  (never the root), `uploadFile` (`files/put`, overwrite; the name in the URL and the multipart
+  part), `uploadFile replace:true` (the same put into the file's folder under its name).
+- **Errors:** `KOOFR_API_ERROR` with the HTTP status (Koofr's message as text);
+  `KOOFR_DOWNLOAD_FAILED`, `KOOFR_MKDIR_FAILED`, `KOOFR_DELETE_FAILED`, `KOOFR_NO_MOUNT`,
+  `KOOFR_EXISTS`; `CURL_FAILED` when no reply came.
 
-- **Auth:** the user generates an app password at
-  `app.koofr.net → Preferences → Password → App passwords`, and signs in with email + that password.
-  Every request sends `Authorization: Basic <base64(email:app-password)>` (+ `X-Koofr-Version: 2.1`).
-  App passwords don't expire, so there is no token refresh.
-- **API:** `https://app.koofr.net/api/v2` for metadata, `…/content/api/v2` (same host, different
-  path prefix) for file bytes.
-- **Mount + path model:** files live under a **mount**; the connector resolves the user's **primary**
-  personal mount (`GET /mounts` → `isPrimary`) at login and stores its id in the credentials. A
-  locator is an absolute path within that mount (the root sentinel `/` is the mount root). `GET
-  /mounts/{id}/files/list` lists (basenames — the adapter composes full paths), the content host's
-  `files/get`/`files/put` (multipart `file` field) download/upload, `files/folder` makes a folder,
-  `files/remove` deletes, and `files/download` yields a ready-to-GET link for the Photos aggregator.
+## Photos
 
-The credential/access model reuses all the generic `_cloudcore` commands: the app password is stored
-as `credentials.common.accessToken` (with the email + resolved mount id), so `AccountCreds` and the
-generic `checkCredentials`/`listFolder`/`upload`/`download`/photo commands work unchanged.
+`listAlbums` lists the mount root (album "Koofr", if it holds images) and every folder directly
+under it that holds images; the `aid` is the folder path URL-encoded, since the Photos service
+makes a local folder from it with a non-recursive mkdir. With no images anywhere there is one
+empty album (`aid` `""`, "Camera Uploads"). `listPhotos` decodes the `aid` and gives one
+`files/download` link per image; `upload` decodes the `aid` too, and without one makes
+"Camera Uploads" at the root and uploads there. `deletePhoto` removes the photo by path.
 
-## Status
+## Tests
 
-🟡 **Code-complete; wiring validated off-device.** On-device account creation still to be exercised.
+`tests/unit/koofr.test.js` drives the service over a stand-in bus and fetch: every method's
+requests, replies and errors, and every request of every method failing in five ways.
 
-All files syntax-check, and a **mock-server integration run** drives the real adapter through
-identity, **primary-mount resolution**, folder listing (with full-path composition), subfolder
-listing, download, multipart upload, the files/download temp link, delete, and confirms the HTTP
-Basic header is exactly `base64(email:app-password)` — 13/13.
+## Known caveats
 
-## On-device test checklist
-
-- [ ] Add an account (Settings → Accounts → Koofr) with an email + app password; it validates and
-      persists, and the primary mount is found.
-- [ ] File-picker / QuickOffice browses Koofr; open a document (download).
-- [ ] Upload / save-back a file (multipart PUT with `overwrite=true`).
-- [ ] A "Camera Uploads" folder shows as an album in Photos; images sync down via the download links.
-- [ ] Upload a photo device→cloud; confirm it lands in the folder.
-
-## Known caveats / follow-ups
-
-- **App-password auth only** (no OAuth path shipped) — deliberate, since Koofr's OAuth client
-  registration isn't self-service. If Koofr later offers public OAuth clients, an OAuth variant could
-  reuse the shared `cloud-auth` app.
-- **Digi Storage** (Koofr's white-label on `storage.rcs-rds.ro`) is not wired, but would only need a
-  different `API_BASE`/`CONTENT_BASE`.
-- **Placeholder icons** (blue "K"); swap in real branding if desired.
-- The multipart upload sends the file part without an explicit content-type; Koofr stores the object
-  and re-derives the type. Fine for documents/photos.
+- Without `offline_access` (Koofr refuses it) Hydra may not issue a refresh token; an account
+  whose access token expires then needs signing in again.
+- **Digi Storage** (Koofr's white label) would only need a different `API_BASE`/`CONTENT_BASE`.
+- Placeholder icons (blue "K").
