@@ -1,4 +1,5 @@
-"""Cloud/file connectors: one node mojoservice per provider on _cloudcore.
+"""Cloud/file connectors: one node service per provider on _cloudcore (a mojoservice, or a
+plain node module on _cloudcore/node for the ported ones: package.json, no sources.json).
 
 Method names, arguments and ACL behaviour are from cloud/cloudcore/service/
 _cloudcore (commands/*.js, acl.js). Gated methods check the caller's app id,
@@ -76,10 +77,24 @@ def _file_app(cfg):
 
 # -- L0 ----------------------------------------------------------------------
 
+def _node_service(ctx, base):
+    """A connector ported to _cloudcore/node: its package.json, else None (a mojoservice)."""
+    return ctx.dev.read_json(base + "/package.json")
+
+
 @test(0, ("cloud",))
 def service_sources(ctx, conn):
-    """Every source and framework library in sources.json resolves."""
+    """Every source and framework library in sources.json resolves; for a node service
+    (package.json), its main and the _cloudcore/node runtime it requires are installed."""
     base = _svc_dir(conn)
+    pkg = _node_service(ctx, base)
+    if pkg is not None:
+        missing = [p for p in (posixpath.join(base, pkg.get("main") or "index.js"),
+                               posixpath.join(SERVICES_DIR, "_cloudcore/node/index.js"))
+                   if not ctx.dev.exists(p)]
+        if missing:
+            raise Fail("not installed: " + ", ".join(missing))
+        return
     src = ctx.dev.read_json(base + "/sources.json")
     if src is None:
         raise Fail("%s/sources.json not installed" % base)
@@ -100,8 +115,15 @@ def service_sources(ctx, conn):
 
 @test(0, ("cloud",))
 def service_syntax(ctx, conn):
-    """node --check every source the service loads (ES5 code on node 22)."""
+    """node --check every source the service loads (ES5 code on node 22); a node service
+    must also load: require() of its directory, which starts nothing until run()."""
     base = _svc_dir(conn)
+    if _node_service(ctx, base) is not None:
+        js = "var s = require(%s); if (typeof s.run !== 'function') { throw new Error('no run()'); }" % json.dumps(base)
+        rc, out = ctx.dev.shell("node -e %s 2>&1" % q(js))
+        if rc != 0:
+            raise Fail("require(%s): %s" % (base, out.strip()[-300:]))
+        return
     src = ctx.dev.read_json(base + "/sources.json")
     if src is None:
         raise Skip("not installed")

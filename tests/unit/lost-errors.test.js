@@ -11,6 +11,9 @@
 // multi-step operations (Box's probe then PUT, MEGA's tree then command, S3's list then copy...)
 // fail as well as the first one. The Future the entry point returns must settle with an error.
 //
+// Dropbox is not here: it runs on _cloudcore/node (async/await, no Futures), and dropbox.test.js
+// does the same to it over the bus.
+//
 // The stand-in Future follows future.js on the point that matters: a throw inside a then()
 // callback stays on that Future. Set FOUNDATIONS_FUTURE to the path of Foundations'
 // control/future.js to run the same tests against the real one.
@@ -188,22 +191,6 @@ const CONNECTORS = {
 		["moveItem", (A, c) => A.moveItem(c, "F", "D", null, () => {}), { minSteps: 2 }],
 		["deleteItem", (A, c) => A.deleteItem(c, "F", () => {}), { minSteps: 2 }],
 	] },
-	dropbox: { dir: "dropbox", creds: OAUTH,
-		reply: () => (o) => (/get_metadata/.test(o.url) ? ok({ name: "a.jpg", path_lower: "/x/a.jpg" }) : ok()),
-		entries: [
-			["listFolder", (A, c) => A.listFolder(c, "", () => {})],
-			["listFolderRaw", (A, c) => A.listFolderRaw(c, "", () => {})],
-			["getTemporaryLink", (A, c) => A.getTemporaryLink(c, "/x/a.jpg", () => {})],
-			["getAccountInfo", (A, c) => A.getAccountInfo(c, () => {})],
-			["downloadFile", (A, c) => A.downloadFile(c, "/x/a.jpg", dl(), null, () => {})],
-			["uploadFile", (A, c) => A.uploadFile(c, "/x", LOCAL, "n.bin", null, () => {})],
-			["uploadReplace", (A, c) => A.uploadReplace(c, "/x/a.jpg", LOCAL, null, () => {})],
-			["deletePhoto", (A, c) => A.deletePhoto(c, "/x/a.jpg", () => {})],
-			["createFolder", (A, c) => A.createFolder(c, "/x", "n", () => {})],
-			["moveItem (rename)", (A, c) => A.moveItem(c, "/x/a.jpg", null, "b.jpg", () => {})],
-			["moveItem (move)", (A, c) => A.moveItem(c, "/x/a.jpg", "/d", null, () => {}), { minSteps: 2 }],
-			["deleteItem", (A, c) => A.deleteItem(c, "/x/a.jpg", () => {})],
-		] },
 	google: { dir: "google", creds: OAUTH, entries: [
 		["listFolder", (A, c) => A.listFolder(c, "root", () => {})],
 		["getAccountInfo", (A, c) => A.getAccountInfo(c, () => {})],
@@ -445,7 +432,7 @@ function command(files, ctor, args, extra = {}) {
 	return future;
 }
 
-const PHOTO_SERVICES = ["box", "dropbox", "hidrive", "koofr", "mega", "onedrive", "pcloud", "s3", "yandex", "flickr"];
+const PHOTO_SERVICES = ["box", "hidrive", "koofr", "mega", "onedrive", "pcloud", "s3", "yandex", "flickr"];
 for (const svc of PHOTO_SERVICES) {
 	const dir = serviceDir(svc);
 	const extra = svc === "flickr" ? { FlickrApi: Object.assign(answering(null), {}) } : {};

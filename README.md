@@ -14,10 +14,11 @@ and plugs a network or service into the stock apps.
 Every connector has its own folder; what the family shares lives in `_core/`.
 
 ```
-cloud/_core/service/_cloudcore     shared node runtime (OAuth2/PKCE, curl transport, ACL, commands)
+cloud/_core/service/_cloudcore     shared runtime: node/ for the ported connectors (Dropbox), the
+                                   mojoservice files (OAuth2/PKCE, curl, ACL, commands) for the rest
 cloud/_core/apps/                  com.palm.app.cloud-auth, the shared OAuth sign-in app
 cloud/<name>/account/              account template + icons  -> /usr/palm/public/accounts/
-cloud/<name>/service/              the connector's mojoservice -> /usr/palm/services/
+cloud/<name>/service/              the connector's service -> /usr/palm/services/
 cloud/<name>/apps/                 its own sign-in app, where it has one (kdrive, mega, s3, flickr)
 cloud/<name>/files/sysbus/         its service's LS2 files (webos_system_bus) -> /usr/share/luna-service2/
 

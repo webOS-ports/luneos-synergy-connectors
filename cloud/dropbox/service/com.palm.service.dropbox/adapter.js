@@ -1,286 +1,142 @@
-/*global IMPORTS, Config, OAuth2, HttpCurl, console */
-/* adapter.js - Dropbox API v2 provider ADAPTER for _cloudcore. Dropbox is RPC-style
- * (every endpoint POST) and PATH-based: metadata calls POST JSON to API_BASE; file bytes
- * go to CONTENT_BASE with the args in a Dropbox-API-Arg header. Transparent refresh-on-401.
- * All HTTPS runs through _cloudcore/httpcurl (device node is 0.9.8k).
+/* adapter.js - Dropbox API v2 for _cloudcore/node (commands.js there has the interface).
  *
- * Uniform _cloudcore adapter interface (normalised shapes):
- *   listFolder(creds, folderId, cb) -> { entries:[{id,type,name,size,modified,path}] }
- *   downloadFile(creds, fileId, localDest, exportMime, cb) -> { path }   (fileId = dropbox path)
- *   uploadFile(creds, folderId, localPath, name, mimeType, cb) -> metadata
- *   uploadReplace(creds, fileId, localPath, mimeType, cb)      -> metadata
- *   getAccountInfo(creds, cb) -> { user:{ displayName, emailAddress } }
- *   createFolder(creds, parent, name, cb)            -> { entry }   (files/create_folder_v2)
- *   moveItem(creds, item, toFolder|null, name|null, cb) -> { entry } (files/move_v2)
- *   deleteItem(creds, item, cb)                      -> {}          (files/delete_v2)
- * Plus listFolderRaw() + getTemporaryLink() used by the per-provider Photos commands, which
- * need the RAW Dropbox entry shape (".tag"/path_lower), NOT the normalised one.
+ * Dropbox is RPC style and path based. Metadata calls POST JSON to API_BASE; file bytes go to
+ * CONTENT_BASE with the arguments in a Dropbox-API-Arg header and the bytes as the body. Items
+ * are addressed by path_lower (or an "id:..." selector), which listFolder hands out as each
+ * entry's path; the root is "" ("root" and "/" mean it too).
+ *
+ * Every call runs through the session (s.authorized), which refreshes the token once on a 401
+ * and retries. Every failure rejects: a reply outside 2xx is DROPBOX_API_ERROR with its status
+ * and body (a 409 carries Dropbox's error_summary, e.g. path/conflict/folder/..).
  */
-var Foundations = IMPORTS.foundations;
-var Future = Foundations.Control.Future;
+"use strict";
 
-var Adapter = {
-	// rpc("/files/list_folder", {path:""}, creds, cb) - POST JSON, refresh-on-401.
-	rpc: function (path, argObj, creds, onRenewed) {
-		var self = this, url = Config.API_BASE + path;
-		var f = new Future();
-		function fire(c) {
-			return HttpCurl.request({ method: "POST", url: url, bearer: c.accessToken,
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify(argObj || {}) });
-		}
-		f.now(this, function () { return fire(creds); });
-		f.then(this, function () {
-			var r = f.result;
-			if (r && r.status === 401 && creds.refreshToken) {
-				var rf = OAuth2.refresh(creds.refreshToken);
-				rf.then(self, function () {
-					// A refresh that failed, or anything thrown here, fails f: thrown inside rf's or retry's
-					// callback it would stay on that Future, and the request would never answer.
-					try {
-						var t = rf.result;
-						var nc = { accessToken: t.accessToken,
-							refreshToken: t.refreshToken || creds.refreshToken,
-							expiresAt: Date.now() + (t.expiresIn * 1000) };
-						if (onRenewed) { onRenewed(nc); }
-						var retry = fire(nc);
-						retry.then(self, function () {
-							try { f.result = self._parse(retry.result); }
-							catch (e2) { f.setException(e2); }
-						});
-					} catch (e) { f.setException(e); }
-				});
-				return;
+const ERROR = "DROPBOX_API_ERROR";
+
+function normPath(p) { return (!p || p === "root" || p === "/") ? "" : p; }
+
+// folder + "/" + name, the root ("", "/", "root") giving "/name".
+function join(folder, name) {
+	const base = normPath(folder);
+	return (base.endsWith("/") ? base : base + "/") + String(name).replace(/^\/+/, "");
+}
+
+// The folder a path lives in ("" for an item in the root).
+function parentOf(p) { return p.substring(0, p.lastIndexOf("/")); }
+
+// One Dropbox Metadata object -> the listFolder entry. `type` overrides ".tag" for results
+// declared as FolderMetadata (create_folder_v2), which Dropbox sends without a ".tag".
+function entry(e, type) {
+	const isFolder = type ? (type === "folder") : (e[".tag"] === "folder");
+	return { id: e.id || e.path_lower, type: isFolder ? "folder" : "file",
+		name: e.name, size: e.size, modified: e.server_modified, path: e.path_lower };
+}
+
+// The Dropbox-API-Arg header is JSON in ASCII: anything else is sent \u-escaped, as Dropbox asks
+// (an HTTP header cannot carry "Café.pdf" as it is).
+function apiArg(obj) {
+	return JSON.stringify(obj).replace(/[\u007f-\uffff]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+}
+
+// The errorText of a Dropbox error reply: its error_summary where it has one.
+function describe(status, body) {
+	let summary = "";
+	try { const j = JSON.parse(body); summary = (j && typeof j.error_summary === "string") ? j.error_summary : ""; }
+	catch (e) { summary = String(body || "").replace(/\s+/g, " ").trim().slice(0, 200); }
+	return "Dropbox answered HTTP " + status + (summary ? ": " + summary : "");
+}
+
+function createAdapter({ config, http, errors }) {
+	// POST JSON to API_BASE. A route without arguments gets "{}", as it always has.
+	const rpc = (s, route, arg) => s.authorized((token) => http.json({ method: "POST", url: config.API_BASE + route,
+		bearer: token, headers: { "Content-Type": "application/json" }, body: JSON.stringify(arg || {}) }));
+
+	// Mode overwrite, autorename off, as before: uploadFile has no "never overwrite" rule for
+	// Dropbox (Documents picks a free name before it uploads a new file).
+	const upload = (s, dropboxPath, localPath) => s.authorized((token) => http.json({ method: "POST",
+		url: config.CONTENT_BASE + "/files/upload", bearer: token, file: localPath,
+		headers: { "Dropbox-API-Arg": apiArg({ path: dropboxPath, mode: "overwrite", autorename: false, mute: false }),
+			"Content-Type": "application/octet-stream" } }));
+
+	const adapter = {
+		// POST /users/get_current_account -> { user:{ emailAddress, displayName } }
+		async getAccountInfo(s) {
+			const a = (await rpc(s, "/users/get_current_account", null)) || {};
+			return { user: { emailAddress: a.email, displayName: (a.name && a.name.display_name) || undefined } };
+		},
+
+		// The raw list_folder reply (".tag", path_lower, ...), every page of it
+		// (/files/list_folder/continue while has_more). The Photos methods use it.
+		async listFolderRaw(s, folder) {
+			let page = await rpc(s, "/files/list_folder", { path: normPath(folder) });
+			const entries = (page.entries || []).slice();
+			while (page.has_more && page.cursor) {
+				page = await rpc(s, "/files/list_folder/continue", { cursor: page.cursor });
+				entries.push(...(page.entries || []));
 			}
-			f.result = self._parse(r);
-		});
-		return f;
-	},
+			return Object.assign({}, page, { entries, has_more: false });
+		},
 
-	_parse: function (r) {
-		if (!r || r.status < 200 || r.status >= 300) {
-			throw { returnValue: false, errorCode: "DROPBOX_API_ERROR",
-				status: r && r.status, body: r && r.responseText };
-		}
-		return r.responseText ? JSON.parse(r.responseText) : {};
-	},
+		async listFolder(s, folderId) {
+			const data = await adapter.listFolderRaw(s, folderId);
+			return { entries: data.entries.map((e) => entry(e)) };
+		},
 
-	// Root is the empty string ""; "root"/"/"/undefined all normalise to it.
-	_normPath: function (p) {
-		return (!p || p === "root" || p === "/") ? "" : p;
-	},
+		// POST /files/get_temporary_link -> { metadata, link }: a URL that needs no token, ~4 h.
+		getTemporaryLink(s, p) { return rpc(s, "/files/get_temporary_link", { path: p }); },
 
-	// POST /users/get_current_account -> normalise to { user:{ displayName, emailAddress } }.
-	getAccountInfo: function (creds, cb) {
-		var self = this, f = new Future();
-		// _settle, not call.then(): a failed call read inside call's callback would stay on call.
-		this._settle(f, this.rpc("/users/get_current_account", null, creds, cb), function (a) {
-			a = a || {};
-			return { user: {
-				emailAddress: a.email,
-				displayName:  (a.name && a.name.display_name) || undefined
-			} };
-		});
-		return f;
-	},
+		// POST content /files/download; fileId is the Dropbox path. exportMime is not Dropbox's.
+		async downloadFile(s, fileId, localDest) {
+			await s.authorized((token) => http.request({ method: "POST", url: config.CONTENT_BASE + "/files/download",
+				bearer: token, headers: { "Dropbox-API-Arg": apiArg({ path: fileId }) }, toFile: localDest }));
+			return { path: localDest };
+		},
 
-	// RAW list_folder (Photos commands need ".tag"/path_lower). root = "".
-	listFolderRaw: function (creds, path, cb) {
-		return this.rpc("/files/list_folder", { path: this._normPath(path) }, creds, cb);
-	},
+		// A new file at folder/name.
+		uploadFile(s, folderId, localPath, name) { return upload(s, join(folderId, name), localPath); },
 
-	// Normalised list for the generic listFolder command. Dropbox entries carry ".tag"
-	// ("folder"|"file"), name, size, server_modified, path_lower/path_display; the locator is
-	// the path (path_lower), handed back as the next folderId (browse) or fileId (download).
-	listFolder: function (creds, folderId, cb) {
-		var self = this, f = new Future();
-		this._settle(f, this.listFolderRaw(creds, folderId, cb), function (data) {
-			data = data || {};
-			return { entries: (data.entries || []).map(function (e) { return self._entry(e); }) };
-		});
-		return f;
-	},
+		// Overwrite the file at fileId (a save-back): path based, so the same upload.
+		uploadReplace(s, fileId, localPath) { return upload(s, fileId, localPath); },
 
-	// One Dropbox Metadata object -> the normalised listFolder entry. `type` overrides ".tag"
-	// for results whose metadata is declared as FolderMetadata (create_folder_v2), which
-	// Dropbox serialises without a ".tag".
-	_entry: function (e, type) {
-		var isFolder = type ? (type === "folder") : (e[".tag"] === "folder");
-		return { id: e.id || e.path_lower, type: (isFolder ? "folder" : "file"),
-			name: e.name, size: e.size, modified: e.server_modified,
-			path: e.path_lower };
-	},
+		// POST /files/create_folder_v2 { path, autorename:false }: an existing name is a 409
+		// path/conflict, never a silently renamed copy.
+		async createFolder(s, parent, name) {
+			const r = await rpc(s, "/files/create_folder_v2", { path: join(parent, name), autorename: false });
+			return { entry: entry((r && r.metadata) || {}, "folder") };
+		},
 
-	// POST /files/get_temporary_link -> { metadata, link } (no-auth ~4h URL). Photos use this.
-	getTemporaryLink: function (creds, path, cb) {
-		return this.rpc("/files/get_temporary_link", { path: path }, creds, cb);
-	},
-
-	// Content endpoints (content.dropboxapi.com): API args in a Dropbox-API-Arg header, HTTP
-	// body is the bytes. Same refresh-on-401 as rpc().
-	content: function (path, apiArg, opts, creds, onRenewed) {
-		var self = this, url = Config.CONTENT_BASE + path;
-		var f = new Future();
-		function fire(c) {
-			var headers = { "Dropbox-API-Arg": JSON.stringify(apiArg) };
-			if (opts.dataFile) { headers["Content-Type"] = "application/octet-stream"; }
-			return HttpCurl.request({ method: "POST", url: url, bearer: c.accessToken,
-				headers: headers, dataFile: opts.dataFile, outFile: opts.outFile });
-		}
-		f.now(this, function () { return fire(creds); });
-		f.then(this, function () {
-			var r = f.result;
-			if (r && r.status === 401 && creds.refreshToken) {
-				var rf = OAuth2.refresh(creds.refreshToken);
-				rf.then(self, function () {
-					// As in rpc(): a failed refresh or retry fails f instead of being lost.
-					try {
-						var t = rf.result;
-						var nc = { accessToken: t.accessToken,
-							refreshToken: t.refreshToken || creds.refreshToken,
-							expiresAt: Date.now() + (t.expiresIn * 1000) };
-						if (onRenewed) { onRenewed(nc); }
-						var retry = fire(nc);
-						retry.then(self, function () {
-							try { f.result = self._parseContent(retry.result, opts); }
-							catch (e2) { f.setException(e2); }
-						});
-					} catch (e) { f.setException(e); }
-				});
-				return;
+		// POST /files/move_v2 { from_path, to_path, autorename:false }. Locators are path_lower, so
+		// the item's own name is only known lowercased: when the name is kept (a move only), or the
+		// item is not a path, POST /files/get_metadata first for the cased name and the parent.
+		async moveItem(s, item, toFolder, name) {
+			const given = (v) => v !== null && v !== undefined;
+			let parent = toFolder, leaf = name;
+			if (given(name) && String(item).charAt(0) === "/") {
+				if (!given(parent)) { parent = parentOf(item); }
+			} else {
+				const m = (await rpc(s, "/files/get_metadata", { path: item })) || {};
+				if (!given(parent)) { parent = parentOf(m.path_lower || ""); }
+				if (!given(leaf)) { leaf = m.name; }
+				if (typeof leaf !== "string" || !leaf) { throw new errors.CloudError(ERROR, "get_metadata gave no name for " + item); }
 			}
-			f.result = self._parseContent(r, opts);
-		});
-		return f;
-	},
+			const r = await rpc(s, "/files/move_v2", { from_path: item, to_path: join(parent, leaf), autorename: false });
+			return { entry: entry((r && r.metadata) || {}) };
+		},
 
-	_parseContent: function (r, opts) {
-		if (!r || r.status < 200 || r.status >= 300) {
-			throw { returnValue: false, errorCode: "DROPBOX_API_ERROR",
-				status: r && r.status, body: r && r.responseText };
-		}
-		if (opts.outFile) { return { path: opts.outFile }; }
-		return r.responseText ? JSON.parse(r.responseText) : {};
-	},
+		// POST /files/delete_v2 { path }. Dropbox keeps deleted items restorable for the plan's
+		// history window; permanently_delete is the irreversible one, not used.
+		async deleteItem(s, item) {
+			await rpc(s, "/files/delete_v2", { path: item });
+			return {};
+		},
 
-	// POST /files/download (fileId = dropbox path). exportMime ignored.
-	downloadFile: function (creds, fileId, localDest, exportMime, cb) {
-		return this.content("/files/download", { path: fileId },
-			{ outFile: localDest }, creds, cb);
-	},
+		// The Photos delete button: pid is listPhotos' "id:..." selector, which delete_v2 takes.
+		async deletePhoto(s, fileId) {
+			await rpc(s, "/files/delete_v2", { path: fileId });
+			return { deleted: true };
+		},
+	};
+	return adapter;
+}
 
-	// Create a new file at folderId/name (mode overwrite; autorename off).
-	uploadFile: function (creds, folderId, localPath, name, mimeType, cb) {
-		return this._upload(creds, this._join(folderId, name), localPath, cb);
-	},
-
-	// Overwrite the file at fileId (QuickOffice save-back); path-based => upload overwrite.
-	uploadReplace: function (creds, fileId, localPath, mimeType, cb) {
-		return this._upload(creds, fileId, localPath, cb);
-	},
-
-	_upload: function (creds, dropboxPath, localPath, cb) {
-		return this.content("/files/upload",
-			{ path: dropboxPath, mode: "overwrite", autorename: false, mute: false },
-			{ dataFile: localPath }, creds, cb);
-	},
-
-	// POST /files/delete_v2 { path } -> remove a photo (Photos delete button). listPhotos stored
-	// pid as Dropbox's "id:<fileid>" path selector, which delete_v2 accepts directly. rpc rejects
-	// (via _parse) on a non-2xx, so the aggregator keeps the local copy on failure.
-	deletePhoto: function (creds, fileId, cb) {
-		var self = this, f = new Future();
-		var call = this.rpc("/files/delete_v2", { path: fileId }, creds, cb);
-		call.then(this, function () {
-			try { call.result; f.result = { deleted: true }; }
-			catch (e) { f.setException(e); }
-		});
-		return f;
-	},
-
-	// folder + "/" + name, root ("", "/", "root") giving "/name".
-	_join: function (folder, name) {
-		var base = this._normPath(folder);
-		return (base.charAt(base.length - 1) === "/" ? base : base + "/") + name.replace(/^\/+/, "");
-	},
-
-	// The folder a path lives in ("" for an item in the root).
-	_parentOf: function (p) {
-		return p.substring(0, p.lastIndexOf("/"));
-	},
-
-	// rpc() for a call made after another one: a token renewed by an earlier step is used,
-	// and reported, from then on.
-	_session: function (creds, onRenewed) {
-		var s = { creds: creds };
-		s.renew = function (nc) {
-			var merged = {}, k;
-			for (k in s.creds) { if (s.creds.hasOwnProperty(k)) { merged[k] = s.creds[k]; } }
-			for (k in nc) { if (nc.hasOwnProperty(k)) { merged[k] = nc[k]; } }
-			s.creds = merged;
-			if (onRenewed) { onRenewed(nc); }
-		};
-		return s;
-	},
-
-	// Settle `f` from `call`: map(result) on success, the call's exception otherwise.
-	_settle: function (f, call, map) {
-		call.then(this, function () {
-			var v;
-			try { v = map(call.result); }
-			catch (e) { f.setException(e); return; }
-			f.result = v;
-		});
-	},
-
-	// POST /files/create_folder_v2 { path, autorename:false } -> { metadata:FolderMetadata }.
-	// An existing name is a 409 (path/conflict), never a silently renamed copy.
-	createFolder: function (creds, parent, name, cb) {
-		var self = this, f = new Future();
-		this._settle(f, this.rpc("/files/create_folder_v2",
-			{ path: this._join(parent, name), autorename: false }, creds, cb),
-			function (r) { return { entry: self._entry((r && r.metadata) || {}, "folder") }; });
-		return f;
-	},
-
-	// POST /files/move_v2 { from_path, to_path, autorename:false } -> { metadata }.
-	// Locators are path_lower, so the item's own name is only known lowercased: when the name
-	// is kept (move only) - or the item is not a path - POST /files/get_metadata first for the
-	// cased name and the parent, so a move does not lowercase the file name.
-	moveItem: function (creds, item, toFolder, name, cb) {
-		var self = this, f = new Future();
-		var s = this._session(creds, cb);
-		function move(parent, leaf) {
-			self._settle(f, self.rpc("/files/move_v2",
-				{ from_path: item, to_path: self._join(parent, leaf), autorename: false },
-				s.creds, s.renew),
-				function (r) { return { entry: self._entry((r && r.metadata) || {}) }; });
-		}
-		if (name !== null && name !== undefined && item.charAt(0) === "/") {
-			move(toFolder !== null && toFolder !== undefined ? toFolder : this._parentOf(item), name);
-			return f;
-		}
-		var meta = this.rpc("/files/get_metadata", { path: item }, s.creds, s.renew);
-		meta.then(this, function () {
-			// All of it in the try: a throw here (a failed get_metadata, a reply with no name)
-			// would otherwise stay on meta and the move would never answer.
-			try {
-				var m = meta.result || {};
-				move(toFolder !== null && toFolder !== undefined ? toFolder : self._parentOf(m.path_lower || ""),
-					(name !== null && name !== undefined) ? name : m.name);
-			} catch (e) { f.setException(e); }
-		});
-		return f;
-	},
-
-	// POST /files/delete_v2 { path }. Dropbox keeps deleted files and folders restorable
-	// (Deleted files, per plan's history window); permanently_delete is the irreversible one.
-	deleteItem: function (creds, item, cb) {
-		var f = new Future();
-		this._settle(f, this.rpc("/files/delete_v2", { path: item }, creds, cb),
-			function () { return {}; });
-		return f;
-	}
-};
-
-if (typeof exports !== "undefined") { exports.Adapter = Adapter; }
+module.exports = Object.assign(createAdapter, { ERROR, describe, apiArg, join, normPath, entry });
