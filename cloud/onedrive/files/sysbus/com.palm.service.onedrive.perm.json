@@ -9,5 +9,6 @@
     "org.webosports.app.documents": ["synergy-onedrive.operation"],
     "org.webosports.app.photos-*": ["synergy-onedrive.operation"],
     "org.webosports.app.photos": ["synergy-onedrive.operation"],
-    "com.palm.service.photos": ["synergy-onedrive.operation"]
+    "com.palm.service.photos": ["synergy-onedrive.operation"],
+    "com.palm.stark.files.service": ["synergy-onedrive.operation"]
 }

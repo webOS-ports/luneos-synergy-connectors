@@ -9,5 +9,6 @@
     "org.webosports.app.documents": ["synergy-dropbox.operation"],
     "org.webosports.app.photos-*": ["synergy-dropbox.operation"],
     "org.webosports.app.photos": ["synergy-dropbox.operation"],
-    "com.palm.service.photos": ["synergy-dropbox.operation"]
+    "com.palm.service.photos": ["synergy-dropbox.operation"],
+    "com.palm.stark.files.service": ["synergy-dropbox.operation"]
 }

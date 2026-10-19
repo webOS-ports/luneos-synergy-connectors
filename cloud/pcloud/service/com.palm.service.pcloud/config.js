@@ -59,7 +59,7 @@ var Config = {
 	TOKEN_SEND_SCOPE: false,
 	// Caller allow-lists enforced by _cloudcore/acl.js.
 	AUTH_APP_IDS:  ["com.palm.app.cloud-auth"],
-	FILE_APP_IDS:  ["org.webosports.app.documents", "org.webosports.app.documents-*"],
+	FILE_APP_IDS:  ["org.webosports.app.documents", "org.webosports.app.documents-*", "com.palm.stark.files.service"],
 
 	// Map a pCloud locationid (1/2) to its API host; fall back to the US default.
 	hostForLocation: function (locationid) {

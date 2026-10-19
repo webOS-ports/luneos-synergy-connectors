@@ -56,7 +56,7 @@ var Config = {
 	AUTHORIZE_EXTRA:  "",
 	TOKEN_SEND_SCOPE: false,             // Koofr derives scope from the grant
 	AUTH_APP_IDS:  ["com.palm.app.cloud-auth"],
-	FILE_APP_IDS:  ["org.webosports.app.documents", "org.webosports.app.documents-*"]
+	FILE_APP_IDS:  ["org.webosports.app.documents", "org.webosports.app.documents-*", "com.palm.stark.files.service"]
 };
 
 if (typeof exports !== "undefined") { exports.Config = Config; }

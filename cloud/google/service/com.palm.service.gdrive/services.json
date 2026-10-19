@@ -15,7 +15,10 @@
 				{ "name": "checkCredentials", "assistant": "CheckCredentialsCommandAssistant", "public": true },
 				{ "name": "listFolder",       "assistant": "ListFolderCommandAssistant",       "public": true },
 				{ "name": "uploadFile",       "assistant": "UploadFileCommandAssistant",       "public": true },
-				{ "name": "downloadFile",     "assistant": "DownloadFileCommandAssistant",     "public": true }
+				{ "name": "downloadFile",     "assistant": "DownloadFileCommandAssistant",     "public": true },
+				{ "name": "createFolder",     "assistant": "CreateFolderCommandAssistant",     "public": true },
+				{ "name": "moveItem",         "assistant": "MoveItemCommandAssistant",         "public": true },
+				{ "name": "deleteItem",       "assistant": "DeleteItemCommandAssistant",       "public": true }
 			]
 		}
 	]

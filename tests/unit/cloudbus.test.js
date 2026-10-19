@@ -55,12 +55,23 @@ for (const name of connectors()) {
 		// com.palm.app.accounts-<pid> (LS_REQUIRES_SECURITY on getAuthorizeUrl otherwise).
 		const expected = ["com.palm.service.accounts", "com.palm.app.accounts", "com.palm.app.accounts-*",
 			t.validator.customUI.appId, t.validator.customUI.appId + "-*"];
-		if (caps.includes("DOCUMENTS")) expected.push("org.webosports.app.documents", "org.webosports.app.documents-*");
+		// Documents opens files from it; Topaz Explorer's service browses and manages them.
+		if (caps.includes("DOCUMENTS")) {
+			expected.push("org.webosports.app.documents", "org.webosports.app.documents-*", "com.palm.stark.files.service");
+		}
 		if (caps.includes("PHOTO.UPLOAD")) {
 			// The Photos app browses it; com.palm.service.photos syncs it (listAlbums, listPhotos,
 			// upload, deletePhoto) for the PHOTO.UPLOAD hooks the template points at it
 			expected.push("org.webosports.app.photos", "org.webosports.app.photos-*", "com.palm.service.photos");
 		}
 		assert.deepStrictEqual(callers, expected.sort());
+
+		// The file commands' own allow-list (Acl.enforce) lets in the same file clients.
+		if (caps.includes("DOCUMENTS")) {
+			const cfg = fs.readFileSync(path.join(CLOUD, name, "service", service, "config.js"), "utf8");
+			const ids = JSON.parse(/FILE_APP_IDS:\s*(\[[^\]]*\])/.exec(cfg)[1]);
+			const files = expected.filter((c) => c.startsWith("org.webosports.app.documents") || c === "com.palm.stark.files.service");
+			assert.deepStrictEqual(ids.slice().sort(), files.sort(), `${name}: FILE_APP_IDS`);
+		}
 	});
 }

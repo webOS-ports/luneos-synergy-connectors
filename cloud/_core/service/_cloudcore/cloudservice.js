@@ -6,7 +6,8 @@
  * behaviour lives in exactly two per-service files:
  *   - config.js  : endpoints, client id/secret, app-id allow-lists, auth header scheme
  *   - adapter.js : the REST mapping (var Adapter = {...}) - listFolder/downloadFile/
- *                  uploadFile/uploadReplace/getAccountInfo, each returning a normalised shape
+ *                  uploadFile/uploadReplace/getAccountInfo, and createFolder/moveItem/deleteItem
+ *                  (commands/fileOps_commands.js), each returning a normalised shape
  *
  * services.json references this assistant by name ("assistant": "CloudService").
  */
@@ -27,7 +28,8 @@
  */
 var CloudGuard = {
 	ENTRY_POINTS: ["listFolder", "downloadFile", "uploadFile", "uploadReplace",
-		"getAccountInfo", "deletePhoto", "ensureAlbumFolder"],
+		"getAccountInfo", "deletePhoto", "ensureAlbumFolder",
+		"createFolder", "moveItem", "deleteItem"],
 
 	wrap: function (adapter) {
 		var i, name;

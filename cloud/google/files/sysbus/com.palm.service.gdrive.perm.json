@@ -6,5 +6,6 @@
     "com.palm.app.cloud-auth-*": ["synergy-gdrive.operation"],
     "com.palm.app.cloud-auth": ["synergy-gdrive.operation"],
     "org.webosports.app.documents-*": ["synergy-gdrive.operation"],
-    "org.webosports.app.documents": ["synergy-gdrive.operation"]
+    "org.webosports.app.documents": ["synergy-gdrive.operation"],
+    "com.palm.stark.files.service": ["synergy-gdrive.operation"]
 }

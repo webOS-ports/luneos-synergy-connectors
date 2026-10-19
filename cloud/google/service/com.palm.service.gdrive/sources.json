@@ -15,5 +15,6 @@
 	{ "source": "../_cloudcore/commands/checkCredentials_command.js" },
 	{ "source": "../_cloudcore/commands/listFolder_command.js" },
 	{ "source": "../_cloudcore/commands/uploadFile_command.js" },
-	{ "source": "../_cloudcore/commands/downloadFile_command.js" }
+	{ "source": "../_cloudcore/commands/downloadFile_command.js" },
+	{ "source": "../_cloudcore/commands/fileOps_commands.js" }
 ]

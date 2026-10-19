@@ -9,5 +9,6 @@
     "org.webosports.app.documents": ["synergy-mega.operation"],
     "org.webosports.app.photos-*": ["synergy-mega.operation"],
     "org.webosports.app.photos": ["synergy-mega.operation"],
-    "com.palm.service.photos": ["synergy-mega.operation"]
+    "com.palm.service.photos": ["synergy-mega.operation"],
+    "com.palm.stark.files.service": ["synergy-mega.operation"]
 }

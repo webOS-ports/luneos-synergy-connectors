@@ -9,5 +9,6 @@
     "org.webosports.app.documents": ["synergy-pcloud.operation"],
     "org.webosports.app.photos-*": ["synergy-pcloud.operation"],
     "org.webosports.app.photos": ["synergy-pcloud.operation"],
-    "com.palm.service.photos": ["synergy-pcloud.operation"]
+    "com.palm.service.photos": ["synergy-pcloud.operation"],
+    "com.palm.stark.files.service": ["synergy-pcloud.operation"]
 }
