@@ -211,3 +211,22 @@ test("httpcurl names a multipart file part when asked, quoted for curl", () => {
 	assert.deepStrictEqual(JSON.parse(JSON.stringify(parts)), ['file=@/media/internal/tmp-1.bin;filename="my \\"odd\\"; file.txt"',
 		"attributes={}", "plain=@/media/internal/a.txt"]);
 });
+
+test("httpcurl makes a download's missing folders 0755 before curl runs", () => {
+	const os = require("node:os");
+	const base = fs.mkdtempSync(path.join(os.tmpdir(), "curldirs-"));
+	try {
+		fs.chmodSync(base, 0o700);
+		const { HttpCurl, calls } = curlWith("\n200");
+		const out = path.join(base, "a", "b", "file.docx");
+		const old = process.umask(0o077);
+		try { HttpCurl.request({ url: "https://x", outFile: out }).result; } finally { process.umask(old); }
+		for (const d of [path.join(base, "a"), path.join(base, "a", "b")]) {
+			assert.strictEqual(fs.statSync(d).mode & 0o777, 0o755, d);
+		}
+		assert.strictEqual(fs.statSync(base).mode & 0o777, 0o700, "existing folders are left alone");
+		assert.ok(calls[0].includes(out));
+	} finally {
+		fs.rmSync(base, { recursive: true, force: true });
+	}
+});

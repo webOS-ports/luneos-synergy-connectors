@@ -25,8 +25,27 @@ var Future = Foundations.Control.Future;
 
 var reqf = (typeof require !== "undefined") ? require : (IMPORTS.require || null);
 var cp = reqf ? reqf("child_process") : null;
+var fsm = reqf ? reqf("fs") : null;
 
 var HttpCurl = {
+	// The folders a download goes into, made 0755: the file is for an app to read, and the web
+	// apps run as another user than this service. curl's --create-dirs makes them 0750, which
+	// left Documents unable to open what it had downloaded into a new cache folder.
+	makeDirs: function (dir) {
+		if (!fsm || !dir) { return; }
+		var parts = dir.split("/"), cur = "", i;
+		for (i = 1; i < parts.length; i++) {
+			if (!parts[i]) { continue; }
+			cur += "/" + parts[i];
+			try {
+				if (!fsm.existsSync(cur)) {
+					fsm.mkdirSync(cur);
+					fsm.chmodSync(cur, 493);   // 0755, whatever the umask
+				}
+			} catch (e) { return; }   // curl --create-dirs tries again, and says why if it cannot
+		}
+	},
+
 	// request({ method, url, headers:{}, form:{k:v}, body:"", bearer:"", responseHeader:"" })
 	// -> Future resolving to { status: <int>, responseText: <string> }, plus header: <string>
 	// (the named response header's value, "" when absent) when responseHeader is given.
@@ -75,6 +94,7 @@ var HttpCurl = {
 			args.push("-L");   // Box content endpoint 302-redirects to dl.boxcloud.com
 		}
 		if (opts.outFile) {
+			HttpCurl.makeDirs(opts.outFile.substring(0, opts.outFile.lastIndexOf("/")));
 			args.push("--create-dirs", "-o", opts.outFile);
 		}
 		if (opts.multipart) {
