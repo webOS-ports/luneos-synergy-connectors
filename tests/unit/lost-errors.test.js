@@ -8,11 +8,11 @@
 // the luna command hung until its timeout. Here each entry point of each adapter is driven with
 // a stand-in HttpCurl whose N-th request fails (a Future carrying an exception, and separately a
 // 500 reply), for N = 1, 2, ... until the operation needs fewer requests, so the later steps of
-// multi-step operations (Box's probe then PUT, MEGA's tree then command, S3's list then copy...)
+// multi-step operations (MEGA's tree then command, S3's list then copy...)
 // fail as well as the first one. The Future the entry point returns must settle with an error.
 //
-// Dropbox is not here: it runs on _cloudcore/node (async/await, no Futures), and dropbox.test.js
-// does the same to it over the bus.
+// Dropbox and Box are not here: they run on _cloudcore/node (async/await, no Futures), and
+// dropbox.test.js and box.test.js do the same to them over the bus.
 //
 // The stand-in Future follows future.js on the point that matters: a throw inside a then()
 // callback stays on that Future. Set FOUNDATIONS_FUTURE to the path of Foundations'
@@ -180,17 +180,6 @@ const s3List = (keys) => "<ListBucketResult>" + keys.map((k) =>
 //   minSteps:   the number of requests the operation makes, so its later steps are known to be
 //               failed too.
 const CONNECTORS = {
-	box: { dir: "box", creds: OAUTH, entries: [
-		["listFolder", (A, c) => A.listFolder(c, "0", () => {})],
-		["getAccountInfo", (A, c) => A.getAccountInfo(c, () => {})],
-		["downloadFile", (A, c) => A.downloadFile(c, "F", dl(), null, () => {})],
-		["uploadFile", (A, c) => A.uploadFile(c, "0", LOCAL, "n.bin", null, () => {})],
-		["uploadReplace", (A, c) => A.uploadReplace(c, "F", LOCAL, null, () => {})],
-		["deletePhoto", (A, c) => A.deletePhoto(c, "F", () => {})],
-		["createFolder", (A, c) => A.createFolder(c, "0", "n", () => {})],
-		["moveItem", (A, c) => A.moveItem(c, "F", "D", null, () => {}), { minSteps: 2 }],
-		["deleteItem", (A, c) => A.deleteItem(c, "F", () => {}), { minSteps: 2 }],
-	] },
 	google: { dir: "google", creds: OAUTH, entries: [
 		["listFolder", (A, c) => A.listFolder(c, "root", () => {})],
 		["getAccountInfo", (A, c) => A.getAccountInfo(c, () => {})],
@@ -432,7 +421,7 @@ function command(files, ctor, args, extra = {}) {
 	return future;
 }
 
-const PHOTO_SERVICES = ["box", "hidrive", "koofr", "mega", "onedrive", "pcloud", "s3", "yandex", "flickr"];
+const PHOTO_SERVICES = ["hidrive", "koofr", "mega", "onedrive", "pcloud", "s3", "yandex", "flickr"];
 for (const svc of PHOTO_SERVICES) {
 	const dir = serviceDir(svc);
 	const extra = svc === "flickr" ? { FlickrApi: Object.assign(answering(null), {}) } : {};

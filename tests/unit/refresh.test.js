@@ -5,7 +5,8 @@
 // failed, or a retry that was refused or never got an answer, used to stay there: the request's
 // Future never settled and the command hung until its timeout. Each adapter's listFolder must
 // now settle with an error in all three cases, and still succeed when the retry does.
-// (Dropbox, on _cloudcore/node, has the same three cases in core-auth.test.js and dropbox.test.js.)
+// (Dropbox and Box, on _cloudcore/node, have the same three cases in core-auth.test.js,
+// dropbox.test.js and box.test.js.)
 "use strict";
 
 const test = require("node:test");
@@ -53,7 +54,6 @@ const failed = (e) => { const f = new Future(); f.setException(e); return f; };
 
 // connector -> how to list its root (credentials it needs beyond the tokens, and the folder)
 const ADAPTERS = {
-	box: { folder: "0" },
 	google: { folder: "root" },
 	onedrive: { folder: "root" },
 	hidrive: { folder: "/users/me" },
