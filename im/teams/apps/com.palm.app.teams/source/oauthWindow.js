@@ -39,6 +39,17 @@
 			}
 		},
 
+		// A redirect_uri that nothing on the device serves (Box's http://localhost/...) fails to
+		// load, and WAM swaps in its error page, which carries the URL it could not load:
+		//   file:///usr/share/localization/wam/loaderror.html?errorCode=-102&failedUrl=<url>
+		// The window's location is then that page, so take the redirect from failedUrl.
+		unwrapLoadError: function (url) {
+			if (!url || url.indexOf("/wam/loaderror.html?") < 0) { return url; }
+			var m = /[?&]failedUrl=([^&#]*)/.exec(url);
+			if (!m) { return url; }
+			try { return decodeURIComponent(m[1]); } catch (e) { return url; }
+		},
+
 		// A redirect matches when it starts with the expected redirect_uri. With no prefix to go
 		// on, fall back to "carries an OAuth result", which is what the native-scheme providers
 		// give us — the engine reports those URLs verbatim.
@@ -100,8 +111,11 @@
 			// (a cached Microsoft session signs in without showing a page) is not missed.
 			window.addEventListener("webOSExternalProtocol", onExternal, false);
 
+			// No size by default: WAM makes a window.open() window a card like the app's own, and
+			// "height=600" made it a 600 px surface in the 679 px card slot on a 480x800 phone,
+			// which the keyboard then left a band of wallpaper above (MindPhone, Box sign-in).
 			try {
-				win = window.open(opts.url, opts.name || "oauth", opts.features || "width=800,height=600");
+				win = window.open(opts.url, opts.name || "oauth", opts.features || "");
 			} catch (e) {
 				win = null;
 			}
@@ -116,7 +130,7 @@
 				var here = null;
 				// Reading a cross-origin location is allowed here (--disable-web-security); a throw
 				// just means it is not readable yet, which is not an error.
-				try { here = String(win.location.href); } catch (e) {}
+				try { here = self.unwrapLoadError(String(win.location.href)); } catch (e) {}
 				if (self.matches(here, opts.redirectPrefix)) { hit(here); return; }
 
 				// WAM also stamps the aborted native-scheme URL onto the window, which covers a
