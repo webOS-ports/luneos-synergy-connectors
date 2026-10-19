@@ -93,14 +93,17 @@ var Adapter = {
 		call.then(this, function () {
 			var data = call.result || {};
 			var contents = (data.metadata && data.metadata.contents) || [];
-			f.result = { entries: contents.map(function (e) {
-				var id = e.isfolder ? e.folderid : e.fileid;
-				return { id: id, type: (e.isfolder ? "folder" : "file"),
-					name: e.name, size: e.size, modified: e.modified,
-					path: id, mimeType: e.contenttype };
-			}) };
+			f.result = { entries: contents.map(function (e) { return self._entry(e); }) };
 		});
 		return f;
+	},
+
+	// One listFolder entry from a pCloud metadata object.
+	_entry: function (e) {
+		var id = e.isfolder ? e.folderid : e.fileid;
+		return { id: id, type: (e.isfolder ? "folder" : "file"),
+			name: e.name, size: e.size, modified: e.modified,
+			path: id, mimeType: e.contenttype };
 	},
 
 	// GET /getfilelink?fileid={id} -> { hosts, path }; fetch https://<host><path> to localDest
@@ -213,6 +216,139 @@ var Adapter = {
 			else { f.setException({ returnValue: false, errorCode: "PCLOUD_DELETE_FAILED", detail: d }); }
 		});
 		return f;
+	},
+
+	// --- File manager: createFolder / moveItem / deleteItem (commands/fileOps_commands.js) ----
+	// Locators are listFolder's: a bare numeric folderid or fileid. pCloud numbers folders and
+	// files separately, so a bare number does not say which it is; pCloud's own typed ids
+	// ("d123" folder, "f456" file, metadata.id) are accepted too. A bare number is looked up as
+	// both (checksumfile?fileid / listfolder?folderid&nofiles) and refused when it names both,
+	// so a file's id can never delete or move a folder, or the other way round.
+
+	// A Future settled by fn(result of g): fn's return value, a Future it returns (nested), or
+	// what it (or reading g's result) throws.
+	_after: function (g, fn) {
+		var self = this, f = new Future();
+		g.then(this, function () {
+			var v;
+			try { v = fn.call(self, g.result); } catch (e) { f.setException(e); return; }
+			if (v && typeof v.then === "function") { f.nest(v); } else { f.result = v; }
+		});
+		return f;
+	},
+	_err: function (code, text) { return { returnValue: false, errorCode: code, errorText: text }; },
+	_fail: function (code, text) {
+		var f = new Future();
+		f.setException(this._err(code, text));
+		return f;
+	},
+	// "123" / 123 -> { id:"123", kind:null }; "d123" -> folder; "f456" -> file; else null.
+	_loc: function (x) {
+		var m = /^([df]?)(\d+)$/.exec(String(x == null ? "" : x));
+		if (!m) { return null; }
+		return { id: m[2], kind: (m[1] === "d") ? "folder" : (m[1] === "f") ? "file" : null };
+	},
+	// _get, resolving to null instead of failing on the one "does not exist" result code.
+	_getOrNull: function (creds, method, params, missing) {
+		var f = new Future(), g = this._get(creds, method, params);
+		g.then(this, function () {
+			try { f.result = g.result; }
+			catch (e) {
+				if (e && e.errorCode === "PCLOUD_API_ERROR" && e.result === missing) { f.result = null; }
+				else { f.setException(e); }
+			}
+		});
+		return f;
+	},
+	// What a locator names -> { kind:"file"|"folder", meta } (pCloud metadata).
+	_resolve: function (creds, loc) {
+		var self = this;
+		var asFile = (loc.kind === "folder") ? null :
+			this._getOrNull(creds, "checksumfile", { fileid: loc.id }, 2009);   // 2009 File not found
+		var asFolder = function () {
+			return (loc.kind === "file") ? null :
+				self._getOrNull(creds, "listfolder", { folderid: loc.id, nofiles: 1 }, 2005);   // 2005 Directory does not exist
+		};
+		function pick(fileReply, folderReply) {
+			var file = fileReply && fileReply.metadata, folder = folderReply && folderReply.metadata;
+			if (file && folder) {
+				throw self._err("PCLOUD_AMBIGUOUS_ID", "id " + loc.id + " is both a file and a folder; use f" +
+					loc.id + " or d" + loc.id);
+			}
+			if (file) { return { kind: "file", meta: file }; }
+			if (folder) { return { kind: "folder", meta: folder }; }
+			throw self._err("PCLOUD_NOT_FOUND", "no file or folder " + loc.id);
+		}
+		if (!asFile) { return this._after(asFolder(), function (d) { return pick(null, d); }); }
+		return this._after(asFile, function (fr) {
+			var fd = asFolder();
+			return fd ? this._after(fd, function (d) { return pick(fr, d); }) : pick(fr, null);
+		});
+	},
+
+	// GET /createfolder?folderid=<parent>&name=<name> -> { metadata } (2004 if it exists).
+	createFolder: function (creds, parent, name, cb) {
+		var p = this._loc(parent);
+		if (!p || p.kind === "file") { return this._fail("BAD_ARGS", "parent must be a folder id"); }
+		return this._after(this._get(creds, "createfolder", { folderid: p.id, name: name }),
+			function (d) { return { entry: this._entry(d.metadata || {}) }; });
+	},
+
+	// GET /renamefolder or /renamefile ?<id>&tofolderid=&toname= (either or both). renamefolder
+	// fails with 2004 on an existing name; renamefile instead REPLACES an existing file of that
+	// name (docs.pcloud.com/methods/file/renamefile.html), so for a file the destination folder
+	// is listed first and an existing name refused (PCLOUD_EXISTS) - a file manager's move must
+	// not overwrite. A change of case only of the item itself is let through.
+	moveItem: function (creds, item, toFolder, name, cb) {
+		var it = this._loc(item);
+		if (!it) { return this._fail("BAD_ARGS", "item must be a file or folder id"); }
+		var to = null;
+		if (toFolder != null) {
+			to = this._loc(toFolder);
+			if (!to || to.kind === "file") { return this._fail("BAD_ARGS", "toFolder must be a folder id"); }
+		}
+		var params = { tofolderid: to ? to.id : null, toname: (name == null) ? null : name };
+		return this._after(this._resolve(creds, it), function (r) {
+			if (r.kind === "folder") {
+				if (String(r.meta.folderid) === String(Config.ROOT_FOLDER)) {
+					throw this._err("BAD_ARGS", "the root folder cannot be moved");
+				}
+				params.folderid = it.id;
+				return this._after(this._get(creds, "renamefolder", params),
+					function (d) { return { entry: this._entry(d.metadata || {}) }; });
+			}
+			var destId = to ? to.id : r.meta.parentfolderid;
+			var newName = (name == null) ? r.meta.name : name;
+			var listing = this._get(creds, "listfolder", { folderid: destId });
+			return this._after(listing, function (l) {
+				var contents = (l.metadata && l.metadata.contents) || [];
+				var lower = String(newName).toLowerCase();
+				contents.forEach(function (c) {
+					var self_ = !c.isfolder && String(c.fileid) === String(it.id);
+					if (!self_ && String(c.name).toLowerCase() === lower) {
+						throw this._err("PCLOUD_EXISTS", "an item named " + newName + " already exists there");
+					}
+				}, this);
+				params.fileid = it.id;
+				return this._after(this._get(creds, "renamefile", params),
+					function (d) { return { entry: this._entry(d.metadata || {}) }; });
+			});
+		});
+	},
+
+	// GET /deletefile?fileid= or /deletefolderrecursive?folderid= - both land in pCloud's Trash.
+	deleteItem: function (creds, item, cb) {
+		var it = this._loc(item);
+		if (!it) { return this._fail("BAD_ARGS", "item must be a file or folder id"); }
+		if (it.kind !== "file" && it.id === String(Config.ROOT_FOLDER)) {
+			return this._fail("BAD_ARGS", "the root folder cannot be deleted");
+		}
+		return this._after(this._resolve(creds, it), function (r) {
+			var call = (r.kind === "folder") ?
+				this._get(creds, "deletefolderrecursive", { folderid: it.id }) :
+				this._get(creds, "deletefile", { fileid: it.id });
+			return this._after(call, function () { return {}; });
+		});
 	}
 };
 
