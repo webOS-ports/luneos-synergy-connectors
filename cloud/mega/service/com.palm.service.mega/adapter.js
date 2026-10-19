@@ -14,6 +14,9 @@
  *   uploadFile(creds, folderId, localPath, name, mimeType, cb) -> { id, name, size }
  *   uploadReplace(creds, fileId, localPath, mimeType, cb)      -> { id, name, size }
  *   getAccountInfo(creds, cb) -> { user:{ displayName, emailAddress } }
+ *   createFolder(creds, parent, name, cb)               -> { entry }   (listFolder-shaped)
+ *   moveItem(creds, item, toFolder|null, name|null, cb) -> { entry }
+ *   deleteItem(creds, item, cb)                         -> {}          (to the Rubbish Bin)
  * plus the PHOTO.UPLOAD helpers (resolvePhotoAlbum/ensureAlbumFolder/deletePhoto and
  * getPhotoLocalPath, since Mega's download URL serves ciphertext - see commands/listPhotos).
  */
@@ -85,6 +88,17 @@ var Adapter = {
 		return map[ext] || null;
 	},
 
+	// One node as listFolder lists it (also the `entry` of createFolder/moveItem).
+	_entry: function (n) {
+		var isFolder = (n.t === 1);
+		return {
+			id: n.h, type: (isFolder ? "folder" : "file"),
+			name: n.name || n.h, size: n.size || 0,
+			modified: n.ts ? (n.ts * 1000) : 0, path: n.h,
+			mimeType: this._mime(n.name, isFolder)
+		};
+	},
+
 	// GET user (validates the session, ESID if expired). Returns normalised identity.
 	getAccountInfo: function (creds, cb) {
 		var self = this, f = new Future();
@@ -114,13 +128,7 @@ var Adapter = {
 				var n = tree.nodes[i];
 				if (n.p !== parent) { continue; }
 				if (n.t !== 0 && n.t !== 1) { continue; }   // files + folders only
-				var isFolder = (n.t === 1);
-				entries.push({
-					id: n.h, type: (isFolder ? "folder" : "file"),
-					name: n.name || n.h, size: n.size || 0,
-					modified: n.ts ? (n.ts * 1000) : 0, path: n.h,
-					mimeType: self._mime(n.name, isFolder)
-				});
+				entries.push(self._entry(n));
 			}
 			f.result = { entries: entries };
 		});
@@ -259,6 +267,175 @@ var Adapter = {
 			});
 		});
 		return f;
+	},
+
+	// --- createFolder / moveItem / deleteItem (commands/fileOps_commands.js) ---------------
+	// The cs commands megajs 1.3.10 sends (MutableFile.mkdir, setAttributes/rename, moveTo,
+	// delete). The cached tree is checked first, so the obvious mistakes fail with Mega's own
+	// error names before reaching the server (which would happily keep two nodes of one name).
+	_fail: function (f, code, ctx) { f.setException(MegaApi.apiError(code, ctx)); return f; },
+
+	// h and its ancestors, nearest first (stops at an unknown parent or a cycle).
+	_chain: function (tree, h) {
+		var out = [], seen = {};
+		while (h && !seen[h]) { seen[h] = true; out.push(h); h = tree.byHandle[h] ? tree.byHandle[h].p : null; }
+		return out;
+	},
+
+	// The top of h's chain: the Cloud Drive root, the Rubbish Bin, or something else (inbox,
+	// a share from another user).
+	_top: function (tree, h) { var c = this._chain(tree, h); return c[c.length - 1]; },
+
+	// A file or folder (other than `except`) called `name` directly in `parent`.
+	_sibling: function (tree, parent, name, except) {
+		for (var i = 0; i < tree.nodes.length; i++) {
+			var n = tree.nodes[i];
+			if (n.p === parent && n.h !== except && (n.t === 0 || n.t === 1) && n.name === name) { return n; }
+		}
+		return null;
+	},
+
+	// Why new or moved nodes may not go into folder h, or null. Allowed: the Cloud Drive root and
+	// the folders in it, but not under an outgoing share: megajs adds a `cr` share-key set there
+	// so the sharees can decrypt the node, and this connector does not keep the share keys.
+	_targetError: function (tree, h) {
+		var t = tree.byHandle[h];
+		if (!t) { return MegaApi.apiError(-9, h); }
+		if (t.t !== 1 && t.t !== 2) { return MegaApi.apiError(-2, "not a folder: " + h); }
+		var chain = this._chain(tree, h);
+		if (chain[chain.length - 1] !== tree.rootHandle) { return MegaApi.apiError(-11, "outside the Cloud Drive: " + h); }
+		for (var i = 0; i < chain.length; i++) {
+			if (tree.shareHandles && tree.shareHandles[chain[i]]) {
+				return { returnValue: false, errorCode: "MEGA_SHARE_UNSUPPORTED",
+					errorText: "a folder shared with other users cannot be written to from here", detail: h };
+			}
+		}
+		return null;
+	},
+
+	// Why the item may not be moved, renamed or deleted, or null: only own files and folders in
+	// the Cloud Drive or the Rubbish Bin.
+	_itemError: function (tree, item) {
+		var node = tree.byHandle[item];
+		if (!node) { return MegaApi.apiError(-9, item); }
+		if (node.t !== 0 && node.t !== 1) { return MegaApi.apiError(-2, "not a file or folder: " + item); }
+		var top = this._top(tree, item);
+		if (top !== tree.rootHandle && top !== tree.rubbishHandle) { return MegaApi.apiError(-11, item); }
+		return null;
+	},
+
+	// f nests the Future fn(tree, master) returns once the tree is there.
+	_withTree: function (creds, cb, fn) {
+		var self = this, f = new Future(), master;
+		try { master = MegaApi.masterKey(creds); } catch (e) { f.setException(e); return f; }
+		var tf = this._fetchTree(creds, cb);
+		f.now(this, function () { return tf; });
+		f.then(this, function () {
+			var tree, inner;
+			try { tree = tf.result; inner = fn.call(self, tree, master); }
+			catch (e1) { f.setException(e1); return; }
+			f.nest(inner);
+		});
+		return f;
+	},
+
+	// `p` with one new folder node: a fresh random 4-word key, the attributes {n} under it, the
+	// key wrapped with the master key (AES-ECB). Mega replies { f:[<the new node>] }.
+	createFolder: function (creds, parent, name, cb) {
+		return this._withTree(creds, cb, function (tree, master) {
+			var f = new Future(), self = this;
+			var ph = this._folderHandle(tree, parent);
+			var bad = this._targetError(tree, ph);
+			if (bad) { f.setException(bad); return f; }
+			if (this._sibling(tree, ph, name)) { return this._fail(f, -12, name); }
+			var fkey = this._rand(4);   // /dev/urandom (see _rand)
+			var pf = MegaApi.cmd({ a: "p", t: ph, n: [{ h: "xxxxxxxx", t: 1,
+				a: MC.encryptAttr({ n: name }, fkey), k: MC.a32ToB64(MC.ecbEncryptA32(master, fkey)) }] },
+				creds.accessToken);
+			pf.then(this, function () {
+				var pr;
+				try { pr = pf.result; } catch (e) { f.setException(e); return; }
+				var nn = pr && pr.f && pr.f[0];
+				if (!nn || !nn.h) { f.setException({ returnValue: false, errorCode: "MEGA_BAD_REPLY", detail: pr }); return; }
+				self._invalidate();
+				f.result = { entry: self._entry({ h: nn.h, t: 1, name: name, size: 0, ts: nn.ts }) };
+			});
+			return f;
+		});
+	},
+
+	// `m` to the new parent (megajs moveTo) and/or `a` with the attributes re-encrypted under the
+	// node's own key, every other attribute kept (megajs setAttributes, which rename uses). The
+	// move goes first: it is the step the server may still refuse; the rename was checked here.
+	moveItem: function (creds, item, toFolder, name, cb) {
+		return this._withTree(creds, cb, function (tree) {
+			var f = new Future(), self = this, i;
+			var bad = this._itemError(tree, item);
+			if (bad) { f.setException(bad); return f; }
+			var node = tree.byHandle[item];
+			var to = toFolder ? this._folderHandle(tree, toFolder) : null;
+			if (to === node.p) { to = null; }
+			if (to) {
+				bad = this._targetError(tree, to);
+				if (bad) { f.setException(bad); return f; }
+				var chain = this._chain(tree, to);
+				for (i = 0; i < chain.length; i++) { if (chain[i] === item) { return this._fail(f, -10, to); } }
+			}
+			if (name === undefined || name === node.name) { name = null; }
+			var newName = (name !== null) ? name : node.name;
+			if ((to || name !== null) && this._sibling(tree, to || node.p, newName, item)) { return this._fail(f, -12, newName); }
+			var at = null;
+			if (name !== null) {
+				if (!node.attrs || !node.aesKeyA32) { return this._fail(f, -14, item); }
+				var attrs = {}, k;
+				for (k in node.attrs) { if (node.attrs.hasOwnProperty(k)) { attrs[k] = node.attrs[k]; } }
+				attrs.n = name;
+				at = MC.encryptAttr(attrs, node.aesKeyA32);
+			}
+			var done = function () {
+				self._invalidate();
+				f.result = { entry: self._entry({ h: node.h, t: node.t, name: newName, size: node.size, ts: node.ts }) };
+			};
+			var rename = function () {
+				if (!at) { done(); return; }
+				var af = MegaApi.cmd({ a: "a", n: item, at: at }, creds.accessToken);
+				af.then(self, function () {
+					try { af.result; }
+					catch (e) { if (to) { e.moved = true; self._invalidate(); } f.setException(e); return; }
+					done();
+				});
+			};
+			if (!to) { rename(); return f; }
+			var mf = MegaApi.cmd({ a: "m", n: item, t: to }, creds.accessToken);
+			mf.then(this, function () {
+				try { mf.result; } catch (e) { f.setException(e); return; }
+				rename();
+			});
+			return f;
+		});
+	},
+
+	// To the Rubbish Bin (`m` to the t===4 root), from where any MEGA client can restore it; only
+	// what is already in the Rubbish Bin is removed for good (`d`). That is megajs's delete()
+	// default (permanent when the parent is the trash), here for anything below the trash.
+	deleteItem: function (creds, item, cb) {
+		return this._withTree(creds, cb, function (tree) {
+			var f = new Future(), self = this;
+			var bad = this._itemError(tree, item);
+			if (bad) { f.setException(bad); return f; }
+			var inRubbish = (this._top(tree, item) === tree.rubbishHandle);
+			if (!inRubbish && !tree.rubbishHandle) {
+				f.setException({ returnValue: false, errorCode: "MEGA_NO_RUBBISH_BIN", detail: item }); return f;
+			}
+			var df = MegaApi.cmd(inRubbish ? { a: "d", n: item } : { a: "m", n: item, t: tree.rubbishHandle },
+				creds.accessToken);
+			df.then(this, function () {
+				try { df.result; } catch (e) { f.setException(e); return; }
+				self._invalidate();
+				f.result = {};
+			});
+			return f;
+		});
 	},
 
 	// --- PHOTO.UPLOAD helpers ------------------------------------------------------------

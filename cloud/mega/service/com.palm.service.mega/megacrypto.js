@@ -507,6 +507,19 @@ var MegaCrypto = (function () {
 	}
 
 	// ---- attributes ---------------------------------------------------------------------
+	// The attribute block is "MEGA" + JSON, as UTF-8, zero-padded to a multiple of 16 bytes and
+	// AES-128-CBC encrypted with a zero IV under the node's 128-bit key (a file's 8-word key
+	// xor-folded to 4 words, a folder's 4-word key as is), in Mega base64. Same as megajs's
+	// MutableFile.packAttributes/File.unpackAttributes + AES.encryptCBC/decryptCBC.
+	// UTF-8 through encodeURIComponent/escape, which ES5 (and the device's node 0.4.12) have.
+	function utf8Bytes(s) {
+		var e = unescape(encodeURIComponent(s)), out = [], i;   // throws URIError on a lone surrogate
+		for (i = 0; i < e.length; i++) { out.push(e.charCodeAt(i)); }
+		return out;
+	}
+	function utf8Decode(bin) {
+		try { return decodeURIComponent(escape(bin)); } catch (e) { return bin; }   // not UTF-8: as bytes
+	}
 	// Decrypt a node's `a` attribute block (base64) with its 128-bit key. Returns the parsed
 	// JSON object ({ n: "filename", ... }) or null.
 	function decryptAttr(attrB64, keyA32) {
@@ -514,12 +527,11 @@ var MegaCrypto = (function () {
 		var s = "";
 		for (var i = 0; i < pt.length && pt[i] !== 0; i++) { s += String.fromCharCode(pt[i]); }
 		if (s.substr(0, 4) !== "MEGA") { return null; }
-		try { return JSON.parse(s.substr(4)); } catch (e) { return null; }
+		try { return JSON.parse(utf8Decode(s.substr(4))); } catch (e) { return null; }
 	}
-	// Encrypt attributes for upload: "MEGA" + JSON, zero-padded to 16 bytes, CBC(zero IV).
+	// Encrypt attributes (the inverse of decryptAttr).
 	function encryptAttr(obj, keyA32) {
-		var s = "MEGA" + JSON.stringify(obj), bytes = [];
-		for (var i = 0; i < s.length; i++) { bytes.push(s.charCodeAt(i) & 0xff); }
+		var bytes = utf8Bytes("MEGA" + JSON.stringify(obj));
 		while (bytes.length % 16 !== 0) { bytes.push(0); }
 		return bytesToB64(cbcEncryptBytes(keyA32.slice(0, 4), bytes));
 	}

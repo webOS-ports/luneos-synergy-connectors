@@ -24,9 +24,12 @@ var MegaApi = (function () {
 	var _seq = Math.floor((new Date()).getTime() / 1000) & 0x7fffffff;   // seed the id counter
 
 	// Human-readable text for the Mega error codes we care to surface.
+	// Names as in MEGA's SDK (megaapi.h API_E*) and megajs's ERRORS table.
 	var ERR = {
-		"-2": "EARGS", "-3": "EAGAIN", "-8": "EEXPIRED", "-9": "ENOENT", "-11": "EACCESS",
-		"-13": "ETOOMANY", "-14": "ERANGE", "-15": "ESID", "-16": "EBLOCKED", "-26": "EMFAREQUIRED"
+		"-1": "EINTERNAL", "-2": "EARGS", "-3": "EAGAIN", "-4": "ERATELIMIT", "-5": "EFAILED",
+		"-6": "ETOOMANY", "-7": "ERANGE", "-8": "EEXPIRED", "-9": "ENOENT", "-10": "ECIRCULAR",
+		"-11": "EACCESS", "-12": "EEXIST", "-13": "EINCOMPLETE", "-14": "EKEY", "-15": "ESID",
+		"-16": "EBLOCKED", "-17": "EOVERQUOTA", "-18": "ETEMPUNAVAIL", "-26": "EMFAREQUIRED"
 	};
 	function apiError(code, ctx) {
 		return { returnValue: false, errorCode: "MEGA_" + (ERR[String(code)] || ("E" + code)),
@@ -205,7 +208,10 @@ var MegaApi = (function () {
 
 		// fetchNodes(creds) -> Future<{ nodes:[...], rootHandle, byHandle:{} }>. Pulls the whole
 		// filesystem tree (`f`) and decrypts each node's key + attributes with the master key.
-		// nodes carry: { h, p, t, name, size, ts, key(a32), aesKeyA32, nonce, metaMac }.
+		// nodes carry: { h, p, t, name, attrs, size, ts, key(a32), aesKeyA32, nonce, metaMac }, attrs
+		// being the whole decrypted attribute object (null when it could not be decrypted).
+		// rubbishHandle/inboxHandle are the t===4/t===3 roots; shareHandles holds the folders with
+		// an outgoing share key (`ok`), under which new nodes would also need a `cr` share-key set.
 		fetchNodes: function (creds) {
 			var f = new Future();
 			var master = this.masterKey(creds);
@@ -215,10 +221,14 @@ var MegaApi = (function () {
 				var res;
 				try { res = ff.result; } catch (e) { f.setException(e); return; }
 				var raw = (res && res.f) || [];
-				var out = [], byHandle = {}, root = null;
+				var out = [], byHandle = {}, root = null, rubbish = null, inbox = null, shares = {};
+				var ok = (res && res.ok) || [];
+				for (var si = 0; si < ok.length; si++) { if (ok[si] && ok[si].h) { shares[ok[si].h] = true; } }
 				for (var i = 0; i < raw.length; i++) {
-					var n = raw[i], node = { h: n.h, p: n.p, t: n.t, size: n.s, ts: n.ts, name: null };
+					var n = raw[i], node = { h: n.h, p: n.p, t: n.t, size: n.s, ts: n.ts, name: null, attrs: null };
 					if (n.t === 2) { root = n.h; }
+					if (n.t === 3) { inbox = n.h; }
+					if (n.t === 4) { rubbish = n.h; }
 					// Decrypt the node key: `k` = "handle:b64key [handle2:b64key2 ...]". Own nodes are
 					// wrapped with the master key. Pick a pair whose key unwraps to a sane length.
 					if (n.k) {
@@ -237,19 +247,20 @@ var MegaApi = (function () {
 									node.aesKeyA32 = uk.aesKeyA32;
 									node.nonce = uk.nonce;
 									node.metaMac = uk.metaMac;
-									if (n.a) { var af = MC.decryptAttr(n.a, uk.aesKeyA32); node.name = af && af.n; }
+									if (n.a) { var af = MC.decryptAttr(n.a, uk.aesKeyA32); node.attrs = af; node.name = af && af.n; }
 								} else {           // folder: 4-word key
 									node.key = rawKey;
 									node.aesKeyA32 = rawKey.slice(0, 4);
-									if (n.a) { var ad = MC.decryptAttr(n.a, rawKey.slice(0, 4)); node.name = ad && ad.n; }
+									if (n.a) { var ad = MC.decryptAttr(n.a, rawKey.slice(0, 4)); node.attrs = ad; node.name = ad && ad.n; }
 								}
-							} catch (ek) { node.name = null; }
+							} catch (ek) { node.name = null; node.attrs = null; }
 						}
 					}
 					byHandle[n.h] = node;
 					out.push(node);
 				}
-				f.result = { nodes: out, rootHandle: root, byHandle: byHandle };
+				f.result = { nodes: out, rootHandle: root, rubbishHandle: rubbish, inboxHandle: inbox,
+					shareHandles: shares, byHandle: byHandle };
 			});
 			return f;
 		}
