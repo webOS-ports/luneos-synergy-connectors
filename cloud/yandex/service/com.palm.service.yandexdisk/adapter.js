@@ -54,15 +54,22 @@ var Adapter = {
 			if (r && r.status === 401 && creds.refreshToken) {
 				var rf = OAuth2.refresh(creds.refreshToken);
 				rf.then(self, function () {
-					var t = null, tErr = null;
-						try { t = rf.result; } catch (e) { tErr = e; }
-						if (tErr) { f.setException(tErr); return; }
-					var nc = { accessToken: t.accessToken,
-						refreshToken: t.refreshToken || creds.refreshToken,
-						expiresAt: Date.now() + (t.expiresIn * 1000) };
-					if (onRenewed) { onRenewed(nc); }
-					var retry = fire(nc);
-					retry.then(self, function () { f.result = retry.result; });
+					// A refresh that failed, or anything thrown here, fails f: thrown inside rf's or retry's
+					// callback it would stay on that Future, and the request would never answer.
+					try {
+						var t = null, tErr = null;
+							try { t = rf.result; } catch (e) { tErr = e; }
+							if (tErr) { f.setException(tErr); return; }
+						var nc = { accessToken: t.accessToken,
+							refreshToken: t.refreshToken || creds.refreshToken,
+							expiresAt: Date.now() + (t.expiresIn * 1000) };
+						if (onRenewed) { onRenewed(nc); }
+						var retry = fire(nc);
+						retry.then(self, function () {
+							try { f.result = retry.result; }
+							catch (e2) { f.setException(e2); }
+						});
+					} catch (e) { f.setException(e); }
 				});
 				return;
 			}
@@ -235,9 +242,12 @@ var Adapter = {
 		var self = this;
 		call.then(this, function () {
 			var r, link;
-			try { r = call.result; link = self._parse(r); } catch (e) { f.setException(e); return; }
-			if (r.status !== 202) { next(); return; }
-			self._poll(t, link && link.href, 0, f, next);
+			// All in the try, next() too: call is not f, so a throw here would stay on call.
+			try {
+				r = call.result; link = self._parse(r);
+				if (r.status !== 202) { next(); return; }
+				self._poll(t, link && link.href, 0, f, next);
+			} catch (e) { f.setException(e); }
 		});
 	},
 
@@ -253,7 +263,10 @@ var Adapter = {
 		st.then(this, function () {
 			var op;
 			try { op = self._parse(st.result) || {}; } catch (e) { f.setException(e); return; }
-			if (op.status === "success") { next(); return; }
+			if (op.status === "success") {
+				try { next(); } catch (e1) { f.setException(e1); }   // st is not f: a throw would stay on st
+				return;
+			}
 			if (op.status === "failed") {
 				f.setException({ returnValue: false, errorCode: "YANDEX_OPERATION_FAILED", href: href });
 				return;

@@ -157,21 +157,24 @@ var Adapter = {
 					f.setException({ returnValue: false, errorCode: "MEGA_NO_DOWNLOAD_URL", detail: g });
 					return;
 				}
-				var cipherPath = localDest + ".mzenc";
-				var dl = HttpCurl.request({ method: "GET", url: g.g, follow: true, outFile: cipherPath });
+				var cipherPath = localDest + ".mzenc", dl;
+				try { dl = HttpCurl.request({ method: "GET", url: g.g, follow: true, outFile: cipherPath }); }
+				catch (e4) { f.setException(e4); return; }
 				dl.then(self, function () {
+					// All of it in the try, the decryption too: dl is not f, so a throw here would stay
+					// on dl and the download would never answer.
 					try {
 						var r = dl.result;
 						if (!r || r.status < 200 || r.status >= 300) {
 							throw { returnValue: false, errorCode: "MEGA_DOWNLOAD_FAILED",
 								status: r && r.status };
 						}
-					} catch (e3) { f.setException(e3); return; }
-					MC.ctrFile(cipherPath, localDest, MC.a32ToBytes(node.aesKeyA32), node.nonce, function (err) {
-						try { if (MC._fs) { MC._fs.unlinkSync(cipherPath); } } catch (eu) {}
-						if (err) { f.setException(err); return; }
-						f.result = { path: localDest };
-					});
+						MC.ctrFile(cipherPath, localDest, MC.a32ToBytes(node.aesKeyA32), node.nonce, function (err) {
+							try { if (MC._fs) { MC._fs.unlinkSync(cipherPath); } } catch (eu) {}
+							if (err) { f.setException(err); return; }
+							f.result = { path: localDest };
+						});
+					} catch (e3) { f.setException(e3); }
 				});
 			});
 		});
@@ -214,8 +217,9 @@ var Adapter = {
 						if (!uu || !uu.p) { try { MC._fs.unlinkSync(cipherPath); } catch (e) {}
 							f.setException({ returnValue: false, errorCode: "MEGA_NO_UPLOAD_URL", detail: uu }); return; }
 						// POST the whole ciphertext at offset 0 -> completion token (base64 string).
-						var up = HttpCurl.request({ method: "POST", url: uu.p + "/0",
-							follow: true, dataFile: cipherPath });
+						var up;
+						try { up = HttpCurl.request({ method: "POST", url: uu.p + "/0", follow: true, dataFile: cipherPath }); }
+						catch (e4) { try { MC._fs.unlinkSync(cipherPath); } catch (e) {} f.setException(e4); return; }
 						up.then(self, function () {
 							try { MC._fs.unlinkSync(cipherPath); } catch (e) {}
 							var token;
@@ -229,13 +233,14 @@ var Adapter = {
 								if (token.charAt(0) === "[" || token.charAt(0) === "\"") {
 									try { var pj = JSON.parse(token); token = (pj && pj.length) ? pj[0] : pj; } catch (ej) {}
 								}
+								// Repack the key with the computed meta_mac, wrap with the master key. In the
+								// try as well: up is not f, so a throw here would stay on up.
+								var fullKey = MC.packFileKey(uk.aesKeyA32, uk.nonce, metaMac);
+								var wrapped = MC.a32ToB64(MC.ecbEncryptA32(master, fullKey));
+								var attr = MC.encryptAttr({ n: name }, uk.aesKeyA32);
+								var pf = MegaApi.cmd({ a: "p", t: parent,
+									n: [{ h: token, t: 0, a: attr, k: wrapped }] }, creds.accessToken);
 							} catch (e2) { f.setException(e2); return; }
-							// Repack the key with the computed meta_mac, wrap with the master key.
-							var fullKey = MC.packFileKey(uk.aesKeyA32, uk.nonce, metaMac);
-							var wrapped = MC.a32ToB64(MC.ecbEncryptA32(master, fullKey));
-							var attr = MC.encryptAttr({ n: name }, uk.aesKeyA32);
-							var pf = MegaApi.cmd({ a: "p", t: parent,
-								n: [{ h: token, t: 0, a: attr, k: wrapped }] }, creds.accessToken);
 							pf.then(self, function () {
 								var pr;
 								try { pr = pf.result; } catch (e3) { f.setException(e3); return; }
@@ -402,14 +407,14 @@ var Adapter = {
 				af.then(self, function () {
 					try { af.result; }
 					catch (e) { if (to) { e.moved = true; self._invalidate(); } f.setException(e); return; }
-					done();
+					try { done(); } catch (e2) { f.setException(e2); }
 				});
 			};
 			if (!to) { rename(); return f; }
 			var mf = MegaApi.cmd({ a: "m", n: item, t: to }, creds.accessToken);
+			// rename() in the try too: mf is not f, so a throw here would stay on mf.
 			mf.then(this, function () {
-				try { mf.result; } catch (e) { f.setException(e); return; }
-				rename();
+				try { mf.result; rename(); } catch (e) { f.setException(e); }
 			});
 			return f;
 		});

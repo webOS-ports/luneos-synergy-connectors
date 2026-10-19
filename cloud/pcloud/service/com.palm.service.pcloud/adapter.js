@@ -68,13 +68,11 @@ var Adapter = {
 	// GET /userinfo -> normalise to { user:{ displayName, emailAddress } } (pCloud has no
 	// separate display name, so the email doubles as the alias).
 	getAccountInfo: function (creds, cb) {
-		var self = this, f = new Future();
-		var call = this._get(creds, "userinfo", null);
-		call.then(this, function () {
-			var u = call.result || {};
-			f.result = { user: { emailAddress: u.email, displayName: u.email } };
+		// _after, not call.then(): a failed call read inside call's callback would stay on call.
+		return this._after(this._get(creds, "userinfo", null), function (u) {
+			u = u || {};
+			return { user: { emailAddress: u.email, displayName: u.email } };
 		});
-		return f;
 	},
 
 	// RAW /listfolder?folderid={id} -> pCloud { metadata:{ contents:[ item ] } }. Photos need
@@ -88,14 +86,11 @@ var Adapter = {
 	// folderid|fileid, name, size, modified, contenttype; the locator is the numeric id (a
 	// folderid for folders, a fileid for files), handed back as the next folderId/fileId.
 	listFolder: function (creds, folderId, cb) {
-		var self = this, f = new Future();
-		var call = this.listFolderRaw(creds, folderId, cb);
-		call.then(this, function () {
-			var data = call.result || {};
+		return this._after(this.listFolderRaw(creds, folderId, cb), function (data) {
+			data = data || {};
 			var contents = (data.metadata && data.metadata.contents) || [];
-			f.result = { entries: contents.map(function (e) { return self._entry(e); }) };
+			return { entries: contents.map(function (e) { return this._entry(e); }, this) };
 		});
-		return f;
 	},
 
 	// One listFolder entry from a pCloud metadata object.
@@ -124,7 +119,9 @@ var Adapter = {
 			var url = "https://" + hosts[0] + d.path;
 			var dl = HttpCurl.request({ method: "GET", url: url, follow: true, outFile: localDest });
 			dl.then(self, function () {
-				var r = dl.result;
+				// A download that got no answer throws here; caught, or it would stay on dl.
+				var r;
+				try { r = dl.result; } catch (e2) { f.setException(e2); return; }
 				if (!r || r.status < 200 || r.status >= 300) {
 					f.setException({ returnValue: false, errorCode: "PCLOUD_DOWNLOAD_FAILED",
 						status: r && r.status });

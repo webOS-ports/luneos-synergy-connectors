@@ -42,16 +42,20 @@ var Adapter = {
 	// Sign + send one S3 request. opts: { method, key, query, headers, payloadHash, outFile,
 	// dataFile }. Resolves to the raw HttpCurl result { status, responseText }.
 	_req: function (creds, opts) {
-		var f = new Future();
-		var t = this._target(creds, opts.key);
-		var signed = S3Sig.signRequest({
-			method: opts.method || "GET",
-			host: t.host, path: t.path, query: opts.query || {},
-			headers: opts.headers || {},
-			payloadHash: opts.payloadHash,
-			region: creds.region || Config.DEFAULT_REGION, service: "s3",
-			accessKeyId: creds.accessToken, secretAccessKey: creds.secretAccessKey
-		});
+		var f = new Future(), t, signed;
+		// A request that cannot be signed (a credential field missing) fails f rather than
+		// throwing: _req is called from other Futures' callbacks, where a throw would be lost.
+		try {
+			t = this._target(creds, opts.key);
+			signed = S3Sig.signRequest({
+				method: opts.method || "GET",
+				host: t.host, path: t.path, query: opts.query || {},
+				headers: opts.headers || {},
+				payloadHash: opts.payloadHash,
+				region: creds.region || Config.DEFAULT_REGION, service: "s3",
+				accessKeyId: creds.accessToken, secretAccessKey: creds.secretAccessKey
+			});
+		} catch (e) { f.setException(e); return f; }
 		var reqOpts = { method: opts.method || "GET", url: signed.url, headers: signed.headers };
 		if (opts.outFile) { reqOpts.outFile = opts.outFile; reqOpts.follow = true; }
 		if (opts.dataFile) { reqOpts.dataFile = opts.dataFile; }
@@ -111,17 +115,19 @@ var Adapter = {
 				"max-keys": String(Config.LIST_LIMIT || 1000) };
 			if (token) { q["continuation-token"] = token; }
 			var call = self._req(creds, { method: "GET", key: "", query: q });
+			// All of it in the try: call is not f, so a throw here would stay on call.
 			call.then(self, function () {
-				var parsed;
-				try { self._check(call.result, "S3_LIST_FAILED"); parsed = S3Xml.parseList(call.result.responseText); }
-				catch (e) { f.setException(e); return; }
-				parsed.prefixes.forEach(function (p) { entries.push(self._folderEntry(p)); });
-				parsed.files.forEach(function (o) {
-					if (o.key === prefix) { return; }   // the folder's own placeholder object
-					entries.push(self._fileEntry(o));
-				});
-				if (parsed.truncated && parsed.nextToken) { page(parsed.nextToken); }
-				else { f.result = { entries: entries }; }
+				try {
+					self._check(call.result, "S3_LIST_FAILED");
+					var parsed = S3Xml.parseList(call.result.responseText);
+					parsed.prefixes.forEach(function (p) { entries.push(self._folderEntry(p)); });
+					parsed.files.forEach(function (o) {
+						if (o.key === prefix) { return; }   // the folder's own placeholder object
+						entries.push(self._fileEntry(o));
+					});
+					if (parsed.truncated && parsed.nextToken) { page(parsed.nextToken); }
+					else { f.result = { entries: entries }; }
+				} catch (e) { f.setException(e); }
 			});
 		}
 		page(null);
@@ -408,7 +414,8 @@ var Adapter = {
 					c.then(self, function () {
 						try { c.result; } catch (e) { return undo(e); }
 						copied.push(to);
-						copyNext(i + 1);
+						// The next copy (or the deletes) in a try: c is not f, so a throw would stay on c.
+						try { copyNext(i + 1); } catch (e2) { undo(e2); }
 					});
 				}
 				function undo(cause) {
@@ -423,7 +430,7 @@ var Adapter = {
 					u.then(self, function () {
 						var ok = false;
 						try { ok = u.result.failed.length === 0; } catch (e) { ok = false; }
-						fail(ok);
+						try { fail(ok); } catch (e3) { f.setException(cause); }
 					});
 				}
 				function deleteOriginals() {

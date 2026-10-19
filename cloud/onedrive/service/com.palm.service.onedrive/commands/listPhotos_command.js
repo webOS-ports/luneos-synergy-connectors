@@ -28,13 +28,16 @@ ListPhotosCommandAssistant.prototype = {
 					future.result = { returnValue: true, photos: [] };
 					return;
 				}
-				var photos = (data.value || []).filter(PhotoLib.isImage).map(function (e) {
-					var url = e["@microsoft.graph.downloadUrl"];   // pre-signed, no header needed
-					return { pid: e.id, src_big: url, src_small: url,
-						caption: e.name, type: "image", fileName: e.name };
-				}).filter(function (p) { return !!p.src_big; });
-				if (renewed && args.accountId) { AccountCreds.save(args.accountId, renewed); }
-				future.result = { returnValue: true, photos: photos };
+				// lf is not future: a throw here would stay on lf and the command never answer.
+				try {
+					var photos = (data.value || []).filter(PhotoLib.isImage).map(function (e) {
+						var url = e["@microsoft.graph.downloadUrl"];   // pre-signed, no header needed
+						return { pid: e.id, src_big: url, src_small: url,
+							caption: e.name, type: "image", fileName: e.name };
+					}).filter(function (p) { return !!p.src_big; });
+					if (renewed && args.accountId) { AccountCreds.save(args.accountId, renewed); }
+					future.result = { returnValue: true, photos: photos };
+				} catch (e3) { future.setException(e3); }
 			});
 		});
 	}

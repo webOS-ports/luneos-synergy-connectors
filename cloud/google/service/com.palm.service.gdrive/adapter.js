@@ -45,13 +45,20 @@ var Adapter = {
 			if (r && r.status === 401 && creds.refreshToken) {
 				var rf = OAuth2.refresh(creds.refreshToken);
 				rf.then(self, function () {
-					var t = rf.result;
-					var nc = { accessToken: t.accessToken,
-						refreshToken: t.refreshToken || creds.refreshToken,  // Google keeps the old one
-						expiresAt: Date.now() + (t.expiresIn * 1000) };
-					if (onRenewed) { onRenewed(nc); }
-					var retry = fire(nc);
-					retry.then(self, function () { f.result = self._parse(retry.result, toFile, base); });
+					// A refresh that failed, or anything thrown here, fails f: thrown inside rf's or retry's
+					// callback it would stay on that Future, and the request would never answer.
+					try {
+						var t = rf.result;
+						var nc = { accessToken: t.accessToken,
+							refreshToken: t.refreshToken || creds.refreshToken,  // Google keeps the old one
+							expiresAt: Date.now() + (t.expiresIn * 1000) };
+						if (onRenewed) { onRenewed(nc); }
+						var retry = fire(nc);
+						retry.then(self, function () {
+							try { f.result = self._parse(retry.result, toFile, base); }
+							catch (e2) { f.setException(e2); }
+						});
+					} catch (e) { f.setException(e); }
 				});
 				return;
 			}
@@ -220,14 +227,17 @@ var Adapter = {
 				if (others.length) { q += "removeParents=" + encodeURIComponent(others.join(",")) + "&"; }
 				patch(q);
 			}
-			if (toFolder !== Config.ROOT_FOLDER) { withTarget(toFolder); return; }
+			// withTarget in the try as well: a throw in parentsF's or rootF's callback would stay
+			// there and the move would never answer.
+			if (toFolder !== Config.ROOT_FOLDER) {
+				try { withTarget(toFolder); } catch (e1) { f.setException(e1); }
+				return;
+			}
 			var rootF = self.get("/files/" + encodeURIComponent(Config.ROOT_FOLDER) + "?fields=id",
 				cur(), onR);
 			rootF.then(self, function () {
-				var rootId;
-				try { rootId = rootF.result.id; }
-				catch (e2) { f.setException(e2); return; }
-				withTarget(rootId);
+				try { withTarget(rootF.result.id); }
+				catch (e2) { f.setException(e2); }
 			});
 		});
 		return f;

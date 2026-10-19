@@ -40,13 +40,20 @@ var Adapter = {
 			if (r && r.status === 401 && creds.refreshToken) {
 				var rf = OAuth2.refresh(creds.refreshToken);
 				rf.then(self, function () {
-					var t = rf.result;
-					var nc = { accessToken: t.accessToken,
-						refreshToken: t.refreshToken || creds.refreshToken,   // Box rotates -> keep new
-						expiresAt: Date.now() + (t.expiresIn * 1000) };
-					if (onRenewed) { onRenewed(nc); }
-					var retry = fire(nc);
-					retry.then(self, function () { f.result = self._parse(retry.result, toFile, base); });
+					// A refresh that failed, or anything thrown here, fails f: thrown inside rf's or retry's
+					// callback it would stay on that Future, and the request would never answer.
+					try {
+						var t = rf.result;
+						var nc = { accessToken: t.accessToken,
+							refreshToken: t.refreshToken || creds.refreshToken,   // Box rotates -> keep new
+							expiresAt: Date.now() + (t.expiresIn * 1000) };
+						if (onRenewed) { onRenewed(nc); }
+						var retry = fire(nc);
+						retry.then(self, function () {
+							try { f.result = self._parse(retry.result, toFile, base); }
+							catch (e2) { f.setException(e2); }
+						});
+					} catch (e) { f.setException(e); }
 				});
 				return;
 			}
@@ -67,10 +74,10 @@ var Adapter = {
 	// GET /users/me -> normalise to { user:{ displayName, emailAddress } }.
 	getAccountInfo: function (creds, cb) {
 		var self = this, f = new Future();
-		var call = this.get("/users/me?fields=id,name,login", creds, cb);
-		call.then(this, function () {
-			var u = call.result || {};
-			f.result = { user: { emailAddress: u.login, displayName: u.name } };
+		// _settle, not call.then(): a failed call read inside call's callback would stay on call.
+		this._settle(f, this.get("/users/me?fields=id,name,login", creds, cb), function (u) {
+			u = u || {};
+			return { user: { emailAddress: u.login, displayName: u.name } };
 		});
 		return f;
 	},
@@ -80,11 +87,10 @@ var Adapter = {
 	listFolder: function (creds, folderId, cb) {
 		var self = this, f = new Future();
 		var id = folderId || Config.ROOT_FOLDER;
-		var call = this.get("/folders/" + encodeURIComponent(id) +
-			"/items?limit=1000&fields=" + this.ENTRY_FIELDS, creds, cb);
-		call.then(this, function () {
-			var data = call.result || {};
-			f.result = { entries: (data.entries || []).map(function (e) { return self._entry(e); }) };
+		this._settle(f, this.get("/folders/" + encodeURIComponent(id) +
+			"/items?limit=1000&fields=" + this.ENTRY_FIELDS, creds, cb), function (data) {
+			data = data || {};
+			return { entries: (data.entries || []).map(function (e) { return self._entry(e); }) };
 		});
 		return f;
 	},

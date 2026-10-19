@@ -28,11 +28,14 @@ ListAlbumsCommandAssistant.prototype = {
 					future.result = { returnValue: true, albums: [album] };
 					return;
 				}
-				var contents = (data.metadata && data.metadata.contents) || [];
-				var count = 0;
-				contents.forEach(function (e) { if (PhotoLib.isImage(e)) { count++; } });
-				album.size.images = count;
-				future.result = { returnValue: true, albums: [album] };
+				// call is not future: a throw here would stay on call and the command never answer.
+				try {
+					var contents = (data.metadata && data.metadata.contents) || [];
+					var count = 0;
+					contents.forEach(function (e) { if (PhotoLib.isImage(e)) { count++; } });
+					album.size.images = count;
+					future.result = { returnValue: true, albums: [album] };
+				} catch (e3) { future.setException(e3); }
 			});
 		});
 	}

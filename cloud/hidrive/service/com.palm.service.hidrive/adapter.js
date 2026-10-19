@@ -55,15 +55,22 @@ var Adapter = {
 			if (r && r.status === 401 && creds.refreshToken) {
 				var rf = OAuth2.refresh(creds.refreshToken);
 				rf.then(self, function () {
-					var t = null, tErr = null;
-					try { t = rf.result; } catch (e) { tErr = e; }
-					if (tErr) { f.setException(tErr); return; }
-					var nc = { accessToken: t.accessToken,
-						refreshToken: t.refreshToken || creds.refreshToken,
-						expiresAt: Date.now() + (t.expiresIn * 1000) };
-					if (onRenewed) { onRenewed(nc); }
-					var retry = fire(nc);
-					retry.then(self, function () { f.result = retry.result; });
+					// A refresh that failed, or anything thrown here, fails f: thrown inside rf's or retry's
+					// callback it would stay on that Future, and the request would never answer.
+					try {
+						var t = null, tErr = null;
+						try { t = rf.result; } catch (e) { tErr = e; }
+						if (tErr) { f.setException(tErr); return; }
+						var nc = { accessToken: t.accessToken,
+							refreshToken: t.refreshToken || creds.refreshToken,
+							expiresAt: Date.now() + (t.expiresIn * 1000) };
+						if (onRenewed) { onRenewed(nc); }
+						var retry = fire(nc);
+						retry.then(self, function () {
+							try { f.result = retry.result; }
+							catch (e2) { f.setException(e2); }
+						});
+					} catch (e) { f.setException(e); }
 				});
 				return;
 			}
@@ -261,8 +268,12 @@ var Adapter = {
 		pf.then(this, function () {
 			var dir;
 			try { dir = pf.result; } catch (e0) { f.setException(e0); return; }
-			var path = self._child(dir, name);
-			var call = self._api(t, "POST", Config.API_BASE + "/dir?path=" + self._enc(path));
+			var path, call;
+			// In a try: pf is not f, so a throw in this callback would stay on pf.
+			try {
+				path = self._child(dir, name);
+				call = self._api(t, "POST", Config.API_BASE + "/dir?path=" + self._enc(path));
+			} catch (e1) { f.setException(e1); return; }
 			call.then(self, function () {
 				try { f.result = self._opEntry(call.result, path); } catch (e) { f.setException(e); }
 			});
@@ -282,18 +293,23 @@ var Adapter = {
 					try { f.result = self._opEntry(call.result, path); } catch (e) { f.setException(e); }
 				});
 			}
+			// The steps below in try blocks: kf and df are not f, so a throw in their callbacks
+			// would stay there and the move would never answer.
 			if (!toFolder) {
-				done(self._api(t, "POST", Config.API_BASE + "/" + kind + "/rename?path=" + self._enc(item) +
-					"&name=" + self._enc(name)), self._child(self._dirOf(item), name));
+				try {
+					done(self._api(t, "POST", Config.API_BASE + "/" + kind + "/rename?path=" + self._enc(item) +
+						"&name=" + self._enc(name)), self._child(self._dirOf(item), name));
+				} catch (e2) { f.setException(e2); }
 				return;
 			}
 			var df = self._resolve(t.creds, toFolder, t.renew);
 			df.then(self, function () {
-				var dir;
-				try { dir = df.result; } catch (e1) { f.setException(e1); return; }
-				var dst = self._child(dir, (name === null || name === undefined) ? self._leaf(item) : name);
-				done(self._api(t, "POST", Config.API_BASE + "/" + kind + "/move?src=" + self._enc(item) +
-					"&dst=" + self._enc(dst)), dst);
+				try {
+					var dir = df.result;
+					var dst = self._child(dir, (name === null || name === undefined) ? self._leaf(item) : name);
+					done(self._api(t, "POST", Config.API_BASE + "/" + kind + "/move?src=" + self._enc(item) +
+						"&dst=" + self._enc(dst)), dst);
+				} catch (e1) { f.setException(e1); }
 			});
 		});
 		return f;
@@ -305,9 +321,13 @@ var Adapter = {
 		var kf = this._kind(t, item);
 		kf.then(this, function () {
 			var kind;
-			try { kind = kf.result; } catch (e0) { f.setException(e0); return; }
-			var call = self._api(t, "DELETE", Config.API_BASE + "/" + kind + "?path=" + self._enc(item) +
-				(kind === "dir" ? "&recursive=true" : ""));
+			var call;
+			// In a try: kf is not f, so a throw in this callback would stay on kf.
+			try {
+				kind = kf.result;
+				call = self._api(t, "DELETE", Config.API_BASE + "/" + kind + "?path=" + self._enc(item) +
+					(kind === "dir" ? "&recursive=true" : ""));
+			} catch (e0) { f.setException(e0); return; }
 			call.then(self, function () {
 				try { call.result; f.result = {}; } catch (e) { f.setException(e); }
 			});
@@ -332,31 +352,37 @@ var Adapter = {
 			var home;
 			try { home = hf.result; } catch (e) { f.setException(e); return; }
 			var lf = self.listFolder(creds, home, cb);
+			// Everything in lf's and each sf's callback in a try: neither is f, so a throw there
+			// would stay on it and the album list would never answer.
 			lf.then(self, function () {
 				var entries;
 				try { entries = (lf.result && lf.result.entries) || []; } catch (e2) { entries = []; }
 				var albums = [], homeImgs = 0, folders = [];
-				entries.forEach(function (e) {
-					if (self._isImg(e)) { homeImgs++; }
-					else if (e.type === "folder") { folders.push(e); }
-				});
-				if (homeImgs) { albums.push({ aid: home, name: "HiDrive", images: homeImgs }); }
-				// Probe each immediate sub-folder for images (bounded to one level).
 				var i = 0;
 				function nextFolder() {
 					if (i >= folders.length) { f.result = { albums: albums }; return; }
 					var fld = folders[i++];
 					var sf = self.listFolder(creds, fld.id, cb);
 					sf.then(self, function () {
-						var se;
-						try { se = (sf.result && sf.result.entries) || []; } catch (e3) { se = []; }
-						var c = 0;
-						se.forEach(function (x) { if (self._isImg(x)) { c++; } });
-						if (c) { albums.push({ aid: fld.id, name: fld.name, images: c }); }
-						nextFolder();
+						try {
+							var se;
+							try { se = (sf.result && sf.result.entries) || []; } catch (e3) { se = []; }
+							var c = 0;
+							se.forEach(function (x) { if (self._isImg(x)) { c++; } });
+							if (c) { albums.push({ aid: fld.id, name: fld.name, images: c }); }
+							nextFolder();
+						} catch (e4) { f.setException(e4); }
 					});
 				}
-				nextFolder();
+				try {
+					entries.forEach(function (e) {
+						if (self._isImg(e)) { homeImgs++; }
+						else if (e.type === "folder") { folders.push(e); }
+					});
+					if (homeImgs) { albums.push({ aid: home, name: "HiDrive", images: homeImgs }); }
+					// Probe each immediate sub-folder for images (bounded to one level).
+					nextFolder();
+				} catch (e5) { f.setException(e5); }
 			});
 		});
 		return f;
@@ -392,7 +418,9 @@ var Adapter = {
 			var call = self._authCall(creds, { method: "POST",
 				url: Config.API_BASE + "/dir?path=" + self._enc(path) }, cb);
 			call.then(self, function () {
-				var r = call.result;
+				// A request that got no answer throws here; caught, or it would stay on call.
+				var r;
+				try { r = call.result; } catch (e2) { f.setException(e2); return; }
 				// 201 Created or 409 (exists) are both success.
 				if (r && (r.status === 409 || (r.status >= 200 && r.status < 300))) { f.result = path; }
 				else { f.setException({ returnValue: false, errorCode: "HIDRIVE_MKDIR_FAILED", status: r && r.status }); }
@@ -416,7 +444,8 @@ var Adapter = {
 		var call = this._authCall(creds, { method: "DELETE",
 			url: Config.API_BASE + "/file?path=" + this._enc(fileId) }, cb);
 		call.then(this, function () {
-			var r = call.result;
+			var r;
+			try { r = call.result; } catch (e) { f.setException(e); return; }
 			if (r && (r.status === 204 || (r.status >= 200 && r.status < 300))) { f.result = { deleted: true }; }
 			else { f.setException({ returnValue: false, errorCode: "HIDRIVE_DELETE_FAILED", status: r && r.status }); }
 		});

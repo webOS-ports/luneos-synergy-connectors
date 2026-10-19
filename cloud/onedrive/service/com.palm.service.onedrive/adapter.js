@@ -46,13 +46,20 @@ var Adapter = {
 			if (r && r.status === 401 && creds.refreshToken) {
 				var rf = OAuth2.refresh(creds.refreshToken);
 				rf.then(self, function () {
-					var t = rf.result;
-					var nc = { accessToken: t.accessToken,
-						refreshToken: t.refreshToken || creds.refreshToken,  // MS rotates -> keep new
-						expiresAt: Date.now() + (t.expiresIn * 1000) };
-					if (onRenewed) { onRenewed(nc); }
-					var retry = fire(nc);
-					retry.then(self, function () { f.result = self._parse(retry.result, toFile, base); });
+					// A refresh that failed, or anything thrown here, fails f: thrown inside rf's or retry's
+					// callback it would stay on that Future, and the request would never answer.
+					try {
+						var t = rf.result;
+						var nc = { accessToken: t.accessToken,
+							refreshToken: t.refreshToken || creds.refreshToken,  // MS rotates -> keep new
+							expiresAt: Date.now() + (t.expiresIn * 1000) };
+						if (onRenewed) { onRenewed(nc); }
+						var retry = fire(nc);
+						retry.then(self, function () {
+							try { f.result = self._parse(retry.result, toFile, base); }
+							catch (e2) { f.setException(e2); }
+						});
+					} catch (e) { f.setException(e); }
 				});
 				return;
 			}
@@ -73,14 +80,12 @@ var Adapter = {
 	// GET /me -> normalise to { user:{ displayName, emailAddress } }. Personal accounts carry
 	// `mail` sometimes null -> fall back to userPrincipalName.
 	getAccountInfo: function (creds, cb) {
-		var self = this, f = new Future();
-		var call = this.get("/me?$select=id,displayName,userPrincipalName,mail", creds, cb);
-		call.then(this, function () {
-			var u = call.result || {};
-			f.result = { user: { emailAddress: u.mail || u.userPrincipalName,
+		// _map, not call.then(): a failed call read inside call's callback would stay on call.
+		return this._map(this.get("/me?$select=id,displayName,userPrincipalName,mail", creds, cb), function (u) {
+			u = u || {};
+			return { user: { emailAddress: u.mail || u.userPrincipalName,
 				displayName: u.displayName } };
 		});
-		return f;
 	},
 
 	// RAW children of a drive item -> Graph { value:[driveItem] }. NO $select, so the folder/
@@ -107,13 +112,10 @@ var Adapter = {
 	// facet (=> folder) or `file` facet, id, name, size, lastModifiedDateTime; the locator is
 	// the item id (OneDrive is ID-based), handed back as the next folderId/fileId.
 	listFolder: function (creds, folderId, cb) {
-		var self = this, f = new Future();
-		var call = this._children(creds, folderId, cb);
-		call.then(this, function () {
-			var data = call.result || {};
-			f.result = { entries: (data.value || []).map(function (e) { return self._entry(e); }) };
+		return this._map(this._children(creds, folderId, cb), function (data) {
+			data = data || {};
+			return { entries: (data.value || []).map(function (e) { return this._entry(e); }, this) };
 		});
-		return f;
 	},
 
 	// One Graph driveItem -> the NORMALISED entry listFolder hands out.
@@ -207,10 +209,9 @@ var Adapter = {
 		if (toFolder !== Config.ROOT_FOLDER) { patch(toFolder || null); return f; }
 		var rootF = this.get("/me/drive/root?$select=id", creds, onR);
 		rootF.then(this, function () {
-			var rootId;
-			try { rootId = rootF.result.id; }
-			catch (e) { f.setException(e); return; }
-			patch(rootId);
+			// patch() in the try as well: rootF is not f, so a throw here would stay on rootF.
+			try { patch(rootF.result.id); }
+			catch (e) { f.setException(e); }
 		});
 		return f;
 	},

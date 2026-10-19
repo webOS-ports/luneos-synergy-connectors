@@ -29,14 +29,17 @@ LoginCommandAssistant.prototype = {
 			info.then(this, function () {
 				var u = {};
 				try { u = (info.result && info.result.user) || {}; } catch (e2) { u = {}; }
-				// Persist the display name so getAccountInfo can return it without another `ug`.
-				if (u.displayName) { creds.name = u.displayName; }
-				future.result = {
-					returnValue: true,
-					username:    u.emailAddress || creds.email || (Config && Config.DISPLAY_NAME) || "MEGA",
-					alias:       u.displayName || undefined,
-					credentials: { common: creds }
-				};
+				// info is not future: a throw here would stay on info and the command never answer.
+				try {
+					// Persist the display name so getAccountInfo can return it without another `ug`.
+					if (u.displayName) { creds.name = u.displayName; }
+					future.result = {
+						returnValue: true,
+						username:    u.emailAddress || creds.email || (Config && Config.DISPLAY_NAME) || "MEGA",
+						alias:       u.displayName || undefined,
+						credentials: { common: creds }
+					};
+				} catch (e3) { future.setException(e3); }
 			});
 		});
 	}

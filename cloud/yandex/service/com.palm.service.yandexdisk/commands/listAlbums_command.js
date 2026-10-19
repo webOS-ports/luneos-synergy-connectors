@@ -28,24 +28,30 @@ ListAlbumsCommandAssistant.prototype = {
 				var album;
 				try { album = albF.result; }
 				catch (e2) { album = { path: "disk:/Pictures", name: "Pictures" }; }
-				var lf = Adapter.listFolder(creds, album.path, function (nc) { renewed = nc; });
+				// albF and lf are not future: a throw in their callbacks would stay there and the
+				// command never answer, hence the try blocks.
+				var lf;
+				try { lf = Adapter.listFolder(creds, album.path, function (nc) { renewed = nc; }); }
+				catch (e4) { future.setException(e4); return; }
 				lf.then(self, function () {
 					var entries;
 					// Folder missing/empty -> still surface the (empty) album so the source
 					// shows in Photos rather than silently vanishing.
 					try { entries = (lf.result && lf.result.entries) || []; }
 					catch (e3) { entries = []; }
-					if (renewed && args.accountId) { AccountCreds.save(args.accountId, renewed); }
-					var count = 0;
-					entries.forEach(function (e) { if (PhotoLib.isImage(e)) { count++; } });
-					// aid must be FILESYSTEM-SAFE: the Photos aggregator builds a local cache dir
-					// "<aid>-<name>", so an internal "/" (from "disk:/Pictures") makes it a nested
-					// path whose parent doesn't exist -> mkdir ENOENT -> sync aborts. Strip the
-					// "disk:/" prefix to a bare single-segment token; listPhotos._normPath maps it
-					// back ("Pictures" -> "disk:/Pictures").
-					var aid = String(album.path).replace(/^disk:\//, "").replace(/\/+$/, "");
-					future.result = { returnValue: true,
-						albums: [{ aid: aid, name: album.name, size: { images: count } }] };
+					try {
+						if (renewed && args.accountId) { AccountCreds.save(args.accountId, renewed); }
+						var count = 0;
+						entries.forEach(function (e) { if (PhotoLib.isImage(e)) { count++; } });
+						// aid must be FILESYSTEM-SAFE: the Photos aggregator builds a local cache dir
+						// "<aid>-<name>", so an internal "/" (from "disk:/Pictures") makes it a nested
+						// path whose parent doesn't exist -> mkdir ENOENT -> sync aborts. Strip the
+						// "disk:/" prefix to a bare single-segment token; listPhotos._normPath maps it
+						// back ("Pictures" -> "disk:/Pictures").
+						var aid = String(album.path).replace(/^disk:\//, "").replace(/\/+$/, "");
+						future.result = { returnValue: true,
+							albums: [{ aid: aid, name: album.name, size: { images: count } }] };
+					} catch (e5) { future.setException(e5); }
 				});
 			});
 		});

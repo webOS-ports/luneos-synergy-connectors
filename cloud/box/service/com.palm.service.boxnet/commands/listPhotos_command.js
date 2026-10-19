@@ -23,14 +23,17 @@ ListPhotosCommandAssistant.prototype = {
 				var data;
 				try { data = lf.result; }
 				catch (e2) { future.setException(e2); return; }
-				var useCreds = renewed || creds;   // build URLs with the freshest token
-				var photos = (data.entries || []).filter(PhotoLib.isImage).map(function (e) {
-					var url = Adapter.contentUrl(useCreds, e.id);
-					return { pid: e.id, src_big: url, src_small: url,
-						caption: e.name, type: "image", fileName: e.name };
-				});
-				if (renewed && args.accountId) { AccountCreds.save(args.accountId, renewed); }
-				future.result = { returnValue: true, photos: photos };
+				// lf is not future: a throw here would stay on lf and the command never answer.
+				try {
+					var useCreds = renewed || creds;   // build URLs with the freshest token
+					var photos = (data.entries || []).filter(PhotoLib.isImage).map(function (e) {
+						var url = Adapter.contentUrl(useCreds, e.id);
+						return { pid: e.id, src_big: url, src_small: url,
+							caption: e.name, type: "image", fileName: e.name };
+					});
+					if (renewed && args.accountId) { AccountCreds.save(args.accountId, renewed); }
+					future.result = { returnValue: true, photos: photos };
+				} catch (e3) { future.setException(e3); }
 			});
 		});
 	}

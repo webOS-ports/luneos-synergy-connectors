@@ -60,16 +60,23 @@ var Adapter = {
 			if (r && r.status === 401 && creds.refreshToken) {
 				var rf = OAuth2.refresh(creds.refreshToken);
 				rf.then(self, function () {
-					var t = null, tErr = null;
-					try { t = rf.result; } catch (e) { tErr = e; }
-					if (tErr) { f.setException(tErr); return; }
-					var nc = { accessToken: t.accessToken,
-						refreshToken: t.refreshToken || creds.refreshToken,
-						expiresAt: Date.now() + (t.expiresIn * 1000),
-						mountId: creds.mountId };
-					if (onRenewed) { onRenewed(nc); }
-					var retry = fire(nc);
-					retry.then(self, function () { f.result = retry.result; });
+					// A refresh that failed, or anything thrown here, fails f: thrown inside rf's or retry's
+					// callback it would stay on that Future, and the request would never answer.
+					try {
+						var t = null, tErr = null;
+						try { t = rf.result; } catch (e) { tErr = e; }
+						if (tErr) { f.setException(tErr); return; }
+						var nc = { accessToken: t.accessToken,
+							refreshToken: t.refreshToken || creds.refreshToken,
+							expiresAt: Date.now() + (t.expiresIn * 1000),
+							mountId: creds.mountId };
+						if (onRenewed) { onRenewed(nc); }
+						var retry = fire(nc);
+						retry.then(self, function () {
+							try { f.result = retry.result; }
+							catch (e2) { f.setException(e2); }
+						});
+					} catch (e) { f.setException(e); }
 				});
 				return;
 			}
@@ -242,13 +249,16 @@ var Adapter = {
 				if (i >= folders.length) { f.result = { albums: albums }; return; }
 				var fld = folders[i++];
 				var sf = self.listFolder(creds, fld.id, cb);
+				// In a try: sf is not f, so a throw in its callback would stay on sf.
 				sf.then(self, function () {
-					var se;
-					try { se = (sf.result && sf.result.entries) || []; } catch (e3) { se = []; }
-					var c = 0;
-					se.forEach(function (x) { if (self._isImg(x)) { c++; } });
-					if (c) { albums.push({ aid: fld.id, name: fld.name, images: c }); }
-					nextFolder();
+					try {
+						var se;
+						try { se = (sf.result && sf.result.entries) || []; } catch (e3) { se = []; }
+						var c = 0;
+						se.forEach(function (x) { if (self._isImg(x)) { c++; } });
+						if (c) { albums.push({ aid: fld.id, name: fld.name, images: c }); }
+						nextFolder();
+					} catch (e4) { f.setException(e4); }
 				});
 			}
 			nextFolder();
@@ -288,7 +298,9 @@ var Adapter = {
 			var call = self._req(creds, { method: "POST", url: url,
 				headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: leaf }) }, cb);
 			call.then(self, function () {
-				var r = call.result;
+				// A request that got no answer throws here; caught, or it would stay on call.
+				var r;
+				try { r = call.result; } catch (e) { f.setException(e); return; }
 				if (r && (r.status === 409 || (r.status >= 200 && r.status < 300))) { f.result = "/" + leaf; }
 				else { f.setException({ returnValue: false, errorCode: "KOOFR_MKDIR_FAILED", status: r && r.status }); }
 			});
@@ -323,7 +335,8 @@ var Adapter = {
 			var url = Config.API_BASE + "/mounts/" + mid + "/files/remove?path=" + self._enc(self._norm(fileId));
 			var call = self._req(creds, { method: "DELETE", url: url }, cb);
 			call.then(self, function () {
-				var r = call.result;
+				var r;
+				try { r = call.result; } catch (e) { f.setException(e); return; }
 				if (r && (r.status === 200 || r.status === 204 || (r.status >= 200 && r.status < 300))) { f.result = { deleted: true }; }
 				else { f.setException({ returnValue: false, errorCode: "KOOFR_DELETE_FAILED", status: r && r.status }); }
 			});

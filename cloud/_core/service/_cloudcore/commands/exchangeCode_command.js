@@ -23,14 +23,17 @@ ExchangeCodeCommandAssistant.prototype = {
 		// `credentials`. Resolve `future` ourselves, only with the wrapped shape.
 		var ex = OAuth2.exchangeCode(args.code, args.codeVerifier);
 		ex.then(this, function () {
-			var t;
-			try { t = ex.result; }               // throws if ex carried an exception
-			catch (e) { future.setException(e); return; }
-			var common = {
-				accessToken:  t.accessToken,
-				refreshToken: t.refreshToken,
-				expiresAt:    Date.now() + (t.expiresIn * 1000)
-			};
+			var t, common;
+			// In the try, the reads of t as well: ex is not future, so a throw here would stay
+			// on ex and the account would never be created.
+			try {
+				t = ex.result;                   // throws if ex carried an exception
+				common = {
+					accessToken:  t.accessToken,
+					refreshToken: t.refreshToken,
+					expiresAt:    Date.now() + (t.expiresIn * 1000)
+				};
+			} catch (e) { future.setException(e); return; }
 			// Fetch the account identity (email/name) for `username`. Tolerate a failure here
 			// (still create the account with a fallback) - we already have valid tokens.
 			var info = Adapter.getAccountInfo(common);

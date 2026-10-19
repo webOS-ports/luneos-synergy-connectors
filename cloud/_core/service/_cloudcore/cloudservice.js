@@ -27,9 +27,13 @@
  * checkCredentials.
  */
 var CloudGuard = {
+	// The photo helpers too: the per-service Photos commands call them from credF's callback,
+	// where a throw would be lost the same way.
 	ENTRY_POINTS: ["listFolder", "downloadFile", "uploadFile", "uploadReplace",
 		"getAccountInfo", "deletePhoto", "ensureAlbumFolder",
-		"createFolder", "moveItem", "deleteItem"],
+		"createFolder", "moveItem", "deleteItem",
+		"listFolderRaw", "listSpecialChildren", "getTemporaryLink", "getFileLink",
+		"photoAlbums", "resolvePhotoAlbum", "getPhotoLocalPath"],
 
 	wrap: function (adapter) {
 		var i, name;

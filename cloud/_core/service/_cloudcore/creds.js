@@ -45,10 +45,18 @@ var AccountCreds = {
 	},
 
 	// Persist refreshed tokens back to the account (best-effort; only when we own accountId).
+	// Never throws: the commands call it from inside a Future callback just before replying,
+	// where a throw would be kept on that Future and the reply never sent.
 	save: function (accountId, common) {
-		if (!accountId || !common) { var d = new Future(); d.result = { returnValue: false }; return d; }
-		return PalmCall.call("palm://com.palm.service.accounts/", "writeCredentials",
-			{ accountId: accountId, name: "common", credentials: common });
+		var d;
+		if (!accountId || !common) { d = new Future(); d.result = { returnValue: false }; return d; }
+		try {
+			return PalmCall.call("palm://com.palm.service.accounts/", "writeCredentials",
+				{ accountId: accountId, name: "common", credentials: common });
+		} catch (e) {
+			if (typeof console !== "undefined") { console.log("AccountCreds.save failed: " + ((e && e.message) || e)); }
+			d = new Future(); d.result = { returnValue: false }; return d;
+		}
 	}
 };
 

@@ -35,13 +35,20 @@ var Adapter = {
 			if (r && r.status === 401 && creds.refreshToken) {
 				var rf = OAuth2.refresh(creds.refreshToken);
 				rf.then(self, function () {
-					var t = rf.result;
-					var nc = { accessToken: t.accessToken,
-						refreshToken: t.refreshToken || creds.refreshToken,
-						expiresAt: Date.now() + (t.expiresIn * 1000) };
-					if (onRenewed) { onRenewed(nc); }
-					var retry = fire(nc);
-					retry.then(self, function () { f.result = self._parse(retry.result); });
+					// A refresh that failed, or anything thrown here, fails f: thrown inside rf's or retry's
+					// callback it would stay on that Future, and the request would never answer.
+					try {
+						var t = rf.result;
+						var nc = { accessToken: t.accessToken,
+							refreshToken: t.refreshToken || creds.refreshToken,
+							expiresAt: Date.now() + (t.expiresIn * 1000) };
+						if (onRenewed) { onRenewed(nc); }
+						var retry = fire(nc);
+						retry.then(self, function () {
+							try { f.result = self._parse(retry.result); }
+							catch (e2) { f.setException(e2); }
+						});
+					} catch (e) { f.setException(e); }
 				});
 				return;
 			}
@@ -66,10 +73,10 @@ var Adapter = {
 	// POST /users/get_current_account -> normalise to { user:{ displayName, emailAddress } }.
 	getAccountInfo: function (creds, cb) {
 		var self = this, f = new Future();
-		var call = this.rpc("/users/get_current_account", null, creds, cb);
-		call.then(this, function () {
-			var a = call.result || {};
-			f.result = { user: {
+		// _settle, not call.then(): a failed call read inside call's callback would stay on call.
+		this._settle(f, this.rpc("/users/get_current_account", null, creds, cb), function (a) {
+			a = a || {};
+			return { user: {
 				emailAddress: a.email,
 				displayName:  (a.name && a.name.display_name) || undefined
 			} };
@@ -87,10 +94,9 @@ var Adapter = {
 	// the path (path_lower), handed back as the next folderId (browse) or fileId (download).
 	listFolder: function (creds, folderId, cb) {
 		var self = this, f = new Future();
-		var call = this.listFolderRaw(creds, folderId, cb);
-		call.then(this, function () {
-			var data = call.result || {};
-			f.result = { entries: (data.entries || []).map(function (e) { return self._entry(e); }) };
+		this._settle(f, this.listFolderRaw(creds, folderId, cb), function (data) {
+			data = data || {};
+			return { entries: (data.entries || []).map(function (e) { return self._entry(e); }) };
 		});
 		return f;
 	},
@@ -127,13 +133,19 @@ var Adapter = {
 			if (r && r.status === 401 && creds.refreshToken) {
 				var rf = OAuth2.refresh(creds.refreshToken);
 				rf.then(self, function () {
-					var t = rf.result;
-					var nc = { accessToken: t.accessToken,
-						refreshToken: t.refreshToken || creds.refreshToken,
-						expiresAt: Date.now() + (t.expiresIn * 1000) };
-					if (onRenewed) { onRenewed(nc); }
-					var retry = fire(nc);
-					retry.then(self, function () { f.result = self._parseContent(retry.result, opts); });
+					// As in rpc(): a failed refresh or retry fails f instead of being lost.
+					try {
+						var t = rf.result;
+						var nc = { accessToken: t.accessToken,
+							refreshToken: t.refreshToken || creds.refreshToken,
+							expiresAt: Date.now() + (t.expiresIn * 1000) };
+						if (onRenewed) { onRenewed(nc); }
+						var retry = fire(nc);
+						retry.then(self, function () {
+							try { f.result = self._parseContent(retry.result, opts); }
+							catch (e2) { f.setException(e2); }
+						});
+					} catch (e) { f.setException(e); }
 				});
 				return;
 			}
@@ -250,11 +262,13 @@ var Adapter = {
 		}
 		var meta = this.rpc("/files/get_metadata", { path: item }, s.creds, s.renew);
 		meta.then(this, function () {
-			var m;
-			try { m = meta.result || {}; }
-			catch (e) { f.setException(e); return; }
-			move(toFolder !== null && toFolder !== undefined ? toFolder : self._parentOf(m.path_lower || ""),
-				(name !== null && name !== undefined) ? name : m.name);
+			// All of it in the try: a throw here (a failed get_metadata, a reply with no name)
+			// would otherwise stay on meta and the move would never answer.
+			try {
+				var m = meta.result || {};
+				move(toFolder !== null && toFolder !== undefined ? toFolder : self._parentOf(m.path_lower || ""),
+					(name !== null && name !== undefined) ? name : m.name);
+			} catch (e) { f.setException(e); }
 		});
 		return f;
 	},

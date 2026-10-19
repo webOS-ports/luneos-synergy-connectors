@@ -49,7 +49,21 @@ var HttpCurl = {
 	// request({ method, url, headers:{}, form:{k:v}, body:"", bearer:"", responseHeader:"" })
 	// -> Future resolving to { status: <int>, responseText: <string> }, plus header: <string>
 	// (the named response header's value, "" when absent) when responseHeader is given.
+	// A Future, always: a request that cannot even be started (execFile refusing an argument,
+	// an outFile that is not a string) fails the Future instead of throwing. A throw here, inside
+	// some other Future's callback, would be kept on that Future and the command never answer.
 	request: function (opts) {
+		try {
+			return HttpCurl._request(opts);
+		} catch (e) {
+			var f = new Future();
+			f.setException({ returnValue: false, errorCode: "CURL_FAILED",
+				detail: String((e && e.message) || e) });
+			return f;
+		}
+	},
+
+	_request: function (opts) {
 		opts = opts || {};
 		var f = new Future();
 
