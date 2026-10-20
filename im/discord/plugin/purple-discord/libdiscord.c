@@ -6613,10 +6613,19 @@ discord_login(PurpleAccount *account)
 
 	discord_connect_send_reaction_once();
 
-	if (!strchr(purple_account_get_username(account), '@')) {
-		purple_connection_error(pc, PURPLE_CONNECTION_ERROR_INVALID_USERNAME, _("Username needs to be an email address"));
-		return;
-	}
+	/* webOS: the '@' check used to live here, and it rejected every QR sign-in.
+	 *
+	 * It belongs to upstream's email+password login. On webOS the account key is whatever the
+	 * customUI used as a label - a Discord username, not an email - and the real credential is
+	 * a token, or nothing at all when signing in by QR. Refusing a username without '@' meant
+	 * the QR flow never even started: purple_connection_error here fires before da is
+	 * allocated and before purple_connection_set_protocol_data, so the transport's close ran
+	 * against a connection with no protocol data and discord_close logged
+	 * "assertion 'da != NULL' failed" - which is what a MindPhone showed on every attempt,
+	 * with no QR code and no account created.
+	 *
+	 * The check is now made where it is actually true: just before posting to /auth/login,
+	 * the one path that really does send an email address. */
 
 	pc_flags = purple_connection_get_flags(pc);
 	pc_flags |= PURPLE_CONNECTION_FLAG_HTML;
@@ -6697,6 +6706,12 @@ discord_login(PurpleAccount *account)
 		discord_start_socket(da);
 
 	} else if (!discord_qr_login && account_password && *account_password) {
+		/* The email+password path, and the only one that needs an address. */
+		if (!strchr(purple_account_get_username(account), '@')) {
+			purple_connection_error(pc, PURPLE_CONNECTION_ERROR_INVALID_USERNAME, _("Username needs to be an email address"));
+			return;
+		}
+
 		JsonObject *data = json_object_new();
 		gchar *str;
 

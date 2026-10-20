@@ -559,11 +559,28 @@ void PurpleTdClient::promptAuthInputViaChat(AuthInput type, const std::string &m
     // TRANSLATOR: appended to the auth prompt shown in the fallback "Telegram" chat.
     prompt += std::string("\n") + _("Reply to this chat with the value above to continue.");
 
-    PurpleConversation *conv = purple_conversation_new(PURPLE_CONV_TYPE_IM, m_account, "Telegram");
-    if (conv)
-        purple_conversation_write(conv, "Telegram", prompt.c_str(),
-                                  (PurpleMessageFlags)(PURPLE_MESSAGE_RECV | PURPLE_MESSAGE_SYSTEM),
-                                  time(NULL));
+    // Deliver it the way a real incoming message arrives - serv_got_im - rather than by writing
+    // straight into a conversation.
+    //
+    // Both routes do reach imlibpurpletransport: it installs PurpleConversationUiOps with
+    // incoming_message_cb in the write_conv slot, and purple_conversation_write calls write_conv
+    // just as serv_got_im eventually does (purple_conv_im_write falls through to
+    // purple_conversation_write because the transport leaves write_im NULL). So this is not a
+    // choice between working and not working.
+    //
+    // serv_got_im is still the right call, because it is the whole receive path and not just its
+    // last step: it runs purple_privacy_check, emits receiving-im-msg and received-im-msg so
+    // anything hooked there sees the message, finds or creates the conversation itself, and sets
+    // PURPLE_MESSAGE_RECV on the way. Writing into the conversation by hand skips all of that and
+    // leaves this prompt as the one "incoming" message in the plugin that arrives differently
+    // from every other.
+    //
+    // PURPLE_MESSAGE_SYSTEM is deliberately NOT passed: what the transport should store is an
+    // ordinary received IM from a buddy called "Telegram", which is what the reply in
+    // sendMessage() is waiting for. serv_got_im adds PURPLE_MESSAGE_RECV itself.
+    PurpleConnection *gc = purple_account_get_connection(m_account);
+    if (gc)
+        serv_got_im(gc, "Telegram", prompt.c_str(), PURPLE_MESSAGE_RECV, time(NULL));
 }
 
 void PurpleTdClient::requestAuthCode(const td::td_api::authenticationCodeInfo *codeInfo)

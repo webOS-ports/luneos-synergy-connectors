@@ -38,7 +38,9 @@ add_executable(tests EXCLUDE_FROM_ALL
     ../secret-chat.cpp
 )
 
-set_property(TARGET tests PROPERTY CXX_STANDARD 14)
+# 17, like the plugin target: the sources under test are C++17, and a modern gtest's headers
+# use class template argument deduction (std::function(std::declval<Func>())) which 14 rejects.
+set_property(TARGET tests PROPERTY CXX_STANDARD 17)
 target_include_directories(tests PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(tests PRIVATE gtest fmt::fmt Td::TdStatic ${GLIB_LIBRARIES})
 
