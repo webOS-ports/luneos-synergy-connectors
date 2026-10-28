@@ -67,6 +67,137 @@ func (d *deezerProvider) Search(ctx context.Context, query string, limit int) ([
 	return out, nil
 }
 
+// deezerAPIBase is Deezer's public API (replaceable by the tests).
+var deezerAPIBase = "https://api.deezer.com"
+
+type deezerPlaylistsPage struct {
+	Data []struct {
+		ID      int64  `json:"id"`
+		Title   string `json:"title"`
+		Tracks  int    `json:"nb_tracks"`
+		Picture string `json:"picture_medium"`
+		Creator struct {
+			Name string `json:"name"`
+		} `json:"creator"`
+	} `json:"data"`
+	Next  string          `json:"next"`
+	Error json.RawMessage `json:"error"`
+}
+
+func deezerPlaylistsOf(page deezerPlaylistsPage) []providerPlaylist {
+	out := []providerPlaylist{}
+	for _, p := range page.Data {
+		if p.ID == 0 {
+			continue
+		}
+		out = append(out, providerPlaylist{
+			ID: strconv.FormatInt(p.ID, 10), Provider: "deezer", Name: p.Title, Owner: p.Creator.Name,
+			Thumbnail: p.Picture, Tracks: p.Tracks,
+		})
+	}
+	return out
+}
+
+type deezerTracksPage struct {
+	Data []struct {
+		ID       int64  `json:"id"`
+		Title    string `json:"title"`
+		Duration int    `json:"duration"` // seconds
+		Readable *bool  `json:"readable"`
+		Artist   struct {
+			Name string `json:"name"`
+		} `json:"artist"`
+		Album struct {
+			Title string `json:"title"`
+			Cover string `json:"cover_medium"`
+		} `json:"album"`
+	} `json:"data"`
+	Next  string          `json:"next"`
+	Error json.RawMessage `json:"error"`
+}
+
+// deezerTracksOf are the tracks of a playlist page Deezer plays here.
+func deezerTracksOf(page deezerTracksPage) []providerTrack {
+	out := []providerTrack{}
+	for _, t := range page.Data {
+		if t.ID == 0 || (t.Readable != nil && !*t.Readable) {
+			continue
+		}
+		id := strconv.FormatInt(t.ID, 10)
+		out = append(out, providerTrack{
+			ID: id, Provider: "deezer", Title: t.Title, Artist: t.Artist.Name,
+			Album: t.Album.Title, Thumbnail: t.Album.Cover, DurationMs: t.Duration * 1000, Path: "deezer:" + id,
+		})
+	}
+	return out
+}
+
+// deezerPages pages through a public API list (limit/index/next) into page.
+func deezerPages[T any](ctx context.Context, max, limit int, path string,
+	parse func([]byte) ([]T, int, bool, error)) ([]T, error) {
+	index := 0
+	return pageAll(max, func(int) ([]T, bool, error) {
+		body, err := httpGetString(ctx, fmt.Sprintf("%s/%s?limit=%d&index=%d", deezerAPIBase, path, limit, index))
+		if err != nil {
+			return nil, false, err
+		}
+		items, entries, more, err := parse([]byte(body))
+		if err != nil {
+			return nil, false, err
+		}
+		index += entries
+		return items, more && entries > 0, nil
+	})
+}
+
+// deezerErr is Deezer's {"error":{...}} as an error, nil for none.
+func deezerErr(raw json.RawMessage) error {
+	if e := strings.TrimSpace(string(raw)); e != "" && e != "null" {
+		return fmt.Errorf("deezer: %s", e)
+	}
+	return nil
+}
+
+// Playlists: the user's playlists Deezer's public API shows - their public ones,
+// with "Favourite tracks" (playlistSource). The account's sign-in says whose.
+func (d *deezerProvider) Playlists(ctx context.Context) ([]providerPlaylist, error) {
+	if d.dl == nil || !d.dl.Available() {
+		return nil, fmt.Errorf("deezer: no account")
+	}
+	if err := d.dl.auth(ctx); err != nil {
+		return nil, err
+	}
+	d.dl.mu.Lock()
+	uid := d.dl.userID
+	d.dl.mu.Unlock()
+	return deezerPages(ctx, maxPlaylists, 50, fmt.Sprintf("user/%d/playlists", uid),
+		func(body []byte) ([]providerPlaylist, int, bool, error) {
+			var page deezerPlaylistsPage
+			if err := json.Unmarshal(body, &page); err != nil {
+				return nil, 0, false, fmt.Errorf("deezer playlists parse: %w", err)
+			}
+			if err := deezerErr(page.Error); err != nil {
+				return nil, 0, false, err
+			}
+			return deezerPlaylistsOf(page), len(page.Data), page.Next != "", nil
+		})
+}
+
+// PlaylistTracks: the playable tracks of one playlist, in its order.
+func (d *deezerProvider) PlaylistTracks(ctx context.Context, playlistID string) ([]providerTrack, error) {
+	return deezerPages(ctx, maxPlaylistTracks, 100, "playlist/"+url.PathEscape(playlistID)+"/tracks",
+		func(body []byte) ([]providerTrack, int, bool, error) {
+			var page deezerTracksPage
+			if err := json.Unmarshal(body, &page); err != nil {
+				return nil, 0, false, fmt.Errorf("deezer playlist parse: %w", err)
+			}
+			if err := deezerErr(page.Error); err != nil {
+				return nil, 0, false, err
+			}
+			return deezerTracksOf(page), len(page.Data), page.Next != "", nil
+		})
+}
+
 func (d *deezerProvider) StreamURL(ctx context.Context, trackID string) (string, error) {
 	if trackID == "" {
 		return "", fmt.Errorf("no track id")
