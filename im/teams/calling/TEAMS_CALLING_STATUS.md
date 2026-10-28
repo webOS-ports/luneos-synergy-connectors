@@ -1,5 +1,19 @@
 # Teams NGC voice calling — status & morning runway
 
+## LuneOS (2026-10-28)
+
+Everything below is the bring-up history on the HP TouchPad (legacy webOS). On LuneOS:
+
+- the plug-in is upstream purple-teams with patches in meta-webos-ports
+  (`recipes-support/pidgin/purple-teams/`); the calling bridge is its `webOS: Add Teams voice
+  calling` patch, built into libteams-personal.so with `TEAMS_WEBOS_CALL=1`;
+- the media engine is `calling/media/teams_media.c`, built by the `teams-media` recipe and
+  installed as `/usr/libexec/teams_media`; it plays to PulseAudio's `voipcall` and records from
+  `webcall`, and the bridge reports the call to audiod with `phone/CallStatusUpdate`
+  (transport `com.palm.teams`), so audiod picks the output device;
+- calls are voice only: the clonk/voipkit video bridge, the qspkd/qmicd audio daemons and the
+  `/media/internal` logs and toggle files are gone.
+
 ## ⭐ 2026-08-05 session: video RTP fix, ICE-storm fix, and the real blocker (dual-instance launch race)
 
 Picked up from the 08-01 checkpoint (MediaError-410 fixed, video SDP shape matches a real capture).
