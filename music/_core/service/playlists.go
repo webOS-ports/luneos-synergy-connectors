@@ -7,7 +7,7 @@ import (
 
 // playlistSource is an OPTIONAL provider capability: the signed-in user's own
 // playlists on the service, read through its official API, for the app to show
-// beside its own. Spotify implements it.
+// beside its own. Spotify, Tidal, Qobuz and Deezer implement it.
 type playlistSource interface {
 	Playlists(ctx context.Context) ([]providerPlaylist, error)
 	PlaylistTracks(ctx context.Context, playlistID string) ([]providerTrack, error)

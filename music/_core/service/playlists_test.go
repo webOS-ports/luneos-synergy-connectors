@@ -199,3 +199,126 @@ func TestPlaylistRoutes(t *testing.T) {
 		t.Errorf("an error from the service: %d", code)
 	}
 }
+
+// A page of Tidal's playlistsAndFavoritePlaylists (shortened): an own playlist,
+// a favourited editorial one without a creator name, and an entry with no playlist.
+func TestTidalPlaylistsOf(t *testing.T) {
+	var page tidalPlaylistsPage
+	if err := json.Unmarshal([]byte(`{"limit":50,"offset":0,"totalNumberOfItems":3,"items":[
+		{"type":"USER_CREATED","playlist":{"uuid":"u-1","title":"Mine","numberOfTracks":12,
+			"squareImage":"29798a19-7c48-41ab-8b50-a0f23ea02bb4","creator":{"id":7,"name":"Herrie"}}},
+		{"type":"USER_FAVORITE","playlist":{"uuid":"u-2","title":"Rock Hits","numberOfTracks":50,"creator":{"id":0}}},
+		{"type":"USER_FAVORITE","playlist":{}}]}`), &page); err != nil {
+		t.Fatal(err)
+	}
+	want := []providerPlaylist{
+		{ID: "u-1", Provider: "tidal", Name: "Mine", Owner: "Herrie", Tracks: 12,
+			Thumbnail: "https://resources.tidal.com/images/29798a19/7c48/41ab/8b50/a0f23ea02bb4/320x320.jpg"},
+		{ID: "u-2", Provider: "tidal", Name: "Rock Hits", Tracks: 50},
+	}
+	if got := tidalPlaylistsOf(page); !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v\nwant %+v", got, want)
+	}
+}
+
+// Playlist items as Tidal answers them: a track, a video, and a track it no
+// longer streams.
+func TestTidalTracksOfKeepsThePlayableOnes(t *testing.T) {
+	var page tidalItemsPage
+	if err := json.Unmarshal([]byte(`{"totalNumberOfItems":3,"items":[
+		{"type":"track","item":{"id":522030436,"title":"Something Wicked","duration":209,"streamReady":true,
+			"artist":{"name":"Breaking Benjamin"},"album":{"title":"Something Wicked","cover":"d718c081-ef6d"}}},
+		{"type":"video","item":{"id":1,"title":"A video","duration":200}},
+		{"type":"track","item":{"id":2,"title":"Gone","duration":100,"streamReady":false}}]}`), &page); err != nil {
+		t.Fatal(err)
+	}
+	want := []providerTrack{{ID: "522030436", Provider: "tidal", Title: "Something Wicked", Artist: "Breaking Benjamin",
+		Album: "Something Wicked", Thumbnail: "https://resources.tidal.com/images/d718c081/ef6d/320x320.jpg",
+		DurationMs: 209000, Path: "tidal:522030436"}}
+	if got := tidalTracksOf(page); !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestQobuzPlaylistsAndTracksOf(t *testing.T) {
+	var lists qobuzPlaylistsPage
+	if err := json.Unmarshal([]byte(`{"user":{"id":1},"playlists":{"offset":0,"limit":50,"total":2,"items":[
+		{"id":123,"name":"Lossless","tracks_count":9,"images300":["a.jpg","b.jpg"],"owner":{"id":1,"name":"herrie"}},
+		{"id":0,"name":"broken"}]}}`), &lists); err != nil {
+		t.Fatal(err)
+	}
+	wantLists := []providerPlaylist{{ID: "123", Provider: "qobuz", Name: "Lossless", Owner: "herrie", Thumbnail: "a.jpg", Tracks: 9}}
+	if got := qobuzPlaylistsOf(lists); !reflect.DeepEqual(got, wantLists) {
+		t.Errorf("playlists: got %+v\nwant %+v", got, wantLists)
+	}
+	var tracks qobuzPlaylistPage
+	if err := json.Unmarshal([]byte(`{"id":123,"tracks":{"total":2,"items":[
+		{"id":55,"title":"Song","duration":180,"streamable":true,"performer":{"name":"Band"},
+			"album":{"title":"LP","image":{"small":"s.jpg"}}},
+		{"id":56,"title":"Withdrawn","duration":10,"streamable":false}]}}`), &tracks); err != nil {
+		t.Fatal(err)
+	}
+	wantTracks := []providerTrack{{ID: "55", Provider: "qobuz", Title: "Song", Artist: "Band", Album: "LP",
+		Thumbnail: "s.jpg", DurationMs: 180000, Path: "qobuz:55"}}
+	if got := qobuzTracksOf(tracks); !reflect.DeepEqual(got, wantTracks) {
+		t.Errorf("tracks: got %+v\nwant %+v", got, wantTracks)
+	}
+}
+
+// Against a stand-in for Deezer's public API: paging by index until there is
+// no next, the tracks it cannot play left out, and its error object passed on.
+func TestDeezerPlaylistCalls(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.RequestURI())
+		switch {
+		case r.URL.Path == "/playlist/9/tracks" && r.URL.Query().Get("index") == "0":
+			_, _ = w.Write([]byte(`{"data":[{"id":3135556,"title":"Harder","duration":224,"readable":true,
+				"artist":{"name":"Daft Punk"},"album":{"title":"Discovery","cover_medium":"c.jpg"}},
+				{"id":4,"title":"Not here","readable":false}],"total":3,"next":"more"}`))
+		case r.URL.Path == "/playlist/9/tracks":
+			_, _ = w.Write([]byte(`{"data":[{"id":5,"title":"Last","duration":60}],"total":3}`))
+		default:
+			_, _ = w.Write([]byte(`{"error":{"type":"DataException","message":"no data","code":800}}`))
+		}
+	}))
+	defer srv.Close()
+	old := deezerAPIBase
+	deezerAPIBase = srv.URL
+	defer func() { deezerAPIBase = old }()
+
+	d := &deezerProvider{}
+	got, err := d.PlaylistTracks(context.Background(), "9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []providerTrack{
+		{ID: "3135556", Provider: "deezer", Title: "Harder", Artist: "Daft Punk", Album: "Discovery",
+			Thumbnail: "c.jpg", DurationMs: 224000, Path: "deezer:3135556"},
+		{ID: "5", Provider: "deezer", Title: "Last", DurationMs: 60000, Path: "deezer:5"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v\nwant %+v", got, want)
+	}
+	if !reflect.DeepEqual(paths, []string{"/playlist/9/tracks?limit=100&index=0", "/playlist/9/tracks?limit=100&index=2"}) {
+		t.Errorf("asked %v", paths)
+	}
+	if _, err := d.PlaylistTracks(context.Background(), "private"); err == nil || !strings.Contains(err.Error(), "no data") {
+		t.Errorf("Deezer's error: %v", err)
+	}
+	if _, err := d.Playlists(context.Background()); err == nil {
+		t.Error("playlists without an account")
+	}
+}
+
+func TestDeezerPlaylistsOf(t *testing.T) {
+	var page deezerPlaylistsPage
+	if err := json.Unmarshal([]byte(`{"data":[{"id":15872242681,"title":"Favoriete nummers","nb_tracks":0,
+		"picture_medium":"p.jpg","is_loved_track":true,"creator":{"id":1,"name":"herrie"}},{"id":0}],"total":1}`), &page); err != nil {
+		t.Fatal(err)
+	}
+	want := []providerPlaylist{{ID: "15872242681", Provider: "deezer", Name: "Favoriete nummers", Owner: "herrie", Thumbnail: "p.jpg"}}
+	if got := deezerPlaylistsOf(page); !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v\nwant %+v", got, want)
+	}
+}

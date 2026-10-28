@@ -40,6 +40,7 @@ type deezerDL struct {
 	mu           sync.Mutex
 	apiToken     string // checkForm CSRF token for gw-light calls
 	licenseToken string // USER.OPTIONS.license_token for get_url
+	userID       int64  // USER.USER_ID: whose playlists to list
 	authed       bool
 }
 
@@ -112,6 +113,7 @@ func (d *deezerDL) auth(ctx context.Context) error {
 	if user == nil || asFloat(user["USER_ID"]) == 0 {
 		return fmt.Errorf("deezer: invalid/expired ARL (no user)")
 	}
+	d.userID = int64(asFloat(user["USER_ID"]))
 	if opts, _ := user["OPTIONS"].(map[string]interface{}); opts != nil {
 		d.licenseToken = asString(opts["license_token"])
 	}

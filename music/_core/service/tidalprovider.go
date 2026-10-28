@@ -69,6 +69,133 @@ func (p *tidalProvider) Search(ctx context.Context, query string, limit int) ([]
 	return out, nil
 }
 
+// tidalImage is the URL of a Tidal image id (a UUID: its dashes are the path).
+func tidalImage(id string) string {
+	if id == "" {
+		return ""
+	}
+	return "https://resources.tidal.com/images/" + strings.ReplaceAll(id, "-", "/") + "/320x320.jpg"
+}
+
+type tidalPlaylistsPage struct {
+	TotalNumberOfItems int `json:"totalNumberOfItems"`
+	Items              []struct {
+		Playlist struct {
+			UUID           string `json:"uuid"`
+			Title          string `json:"title"`
+			NumberOfTracks int    `json:"numberOfTracks"`
+			SquareImage    string `json:"squareImage"`
+			Creator        struct {
+				Name string `json:"name"`
+			} `json:"creator"`
+		} `json:"playlist"`
+	} `json:"items"`
+}
+
+func tidalPlaylistsOf(page tidalPlaylistsPage) []providerPlaylist {
+	out := []providerPlaylist{}
+	for _, it := range page.Items {
+		pl := it.Playlist
+		if pl.UUID == "" {
+			continue
+		}
+		out = append(out, providerPlaylist{
+			ID: pl.UUID, Provider: "tidal", Name: pl.Title, Owner: pl.Creator.Name,
+			Thumbnail: tidalImage(pl.SquareImage), Tracks: pl.NumberOfTracks,
+		})
+	}
+	return out
+}
+
+type tidalItemsPage struct {
+	TotalNumberOfItems int `json:"totalNumberOfItems"`
+	Items              []struct {
+		Type string `json:"type"`
+		Item struct {
+			ID          json.Number `json:"id"`
+			Title       string      `json:"title"`
+			Duration    int         `json:"duration"` // seconds
+			StreamReady *bool       `json:"streamReady"`
+			Artist      struct {
+				Name string `json:"name"`
+			} `json:"artist"`
+			Album struct {
+				Title string `json:"title"`
+				Cover string `json:"cover"`
+			} `json:"album"`
+		} `json:"item"`
+	} `json:"items"`
+}
+
+// tidalTracksOf are the tracks of an items page that can be played: not videos,
+// nor tracks Tidal no longer streams.
+func tidalTracksOf(page tidalItemsPage) []providerTrack {
+	out := []providerTrack{}
+	for _, it := range page.Items {
+		t := it.Item
+		id := t.ID.String()
+		if (it.Type != "" && it.Type != "track") || id == "" || id == "0" || (t.StreamReady != nil && !*t.StreamReady) {
+			continue
+		}
+		out = append(out, providerTrack{
+			ID: id, Provider: "tidal", Title: t.Title, Artist: t.Artist.Name,
+			Album: t.Album.Title, Thumbnail: tidalImage(t.Album.Cover),
+			DurationMs: t.Duration * 1000, Path: "tidal:" + id,
+		})
+	}
+	return out
+}
+
+// tidalPages pages through a Tidal list (limit/offset/totalNumberOfItems), handing
+// each page's body to parse (-> its items and how many entries it had).
+func tidalPages[T any](ctx context.Context, p *tidalProvider, max, limit int, path string,
+	parse func([]byte) ([]T, int, int, error)) ([]T, error) {
+	offset := 0
+	return pageAll(max, func(int) ([]T, bool, error) {
+		body, err := p.dl.authGet(ctx, fmt.Sprintf("%s/%s?limit=%d&offset=%d&countryCode=%s",
+			tidalAPIBase, path, limit, offset, url.QueryEscape(p.dl.countryCode())))
+		if err != nil {
+			return nil, false, err
+		}
+		items, entries, total, err := parse(body)
+		if err != nil {
+			return nil, false, err
+		}
+		offset += entries
+		return items, entries > 0 && offset < total, nil
+	})
+}
+
+// Playlists: the user's own playlists and the ones they favourited (playlistSource).
+func (p *tidalProvider) Playlists(ctx context.Context) ([]providerPlaylist, error) {
+	p.dl.mu.Lock()
+	uid := p.dl.tok.UserID
+	p.dl.mu.Unlock()
+	if uid == 0 {
+		return nil, fmt.Errorf("tidal: the sign-in has no user id")
+	}
+	return tidalPages(ctx, p, maxPlaylists, 50, fmt.Sprintf("users/%d/playlistsAndFavoritePlaylists", uid),
+		func(body []byte) ([]providerPlaylist, int, int, error) {
+			var page tidalPlaylistsPage
+			if err := json.Unmarshal(body, &page); err != nil {
+				return nil, 0, 0, fmt.Errorf("tidal playlists parse: %w", err)
+			}
+			return tidalPlaylistsOf(page), len(page.Items), page.TotalNumberOfItems, nil
+		})
+}
+
+// PlaylistTracks: the playable tracks of one playlist, in its order.
+func (p *tidalProvider) PlaylistTracks(ctx context.Context, playlistID string) ([]providerTrack, error) {
+	return tidalPages(ctx, p, maxPlaylistTracks, 100, "playlists/"+url.PathEscape(playlistID)+"/items",
+		func(body []byte) ([]providerTrack, int, int, error) {
+			var page tidalItemsPage
+			if err := json.Unmarshal(body, &page); err != nil {
+				return nil, 0, 0, fmt.Errorf("tidal playlist parse: %w", err)
+			}
+			return tidalTracksOf(page), len(page.Items), page.TotalNumberOfItems, nil
+		})
+}
+
 func (p *tidalProvider) StreamURL(ctx context.Context, trackID string) (string, error) {
 	if trackID == "" {
 		return "", fmt.Errorf("no track id")
