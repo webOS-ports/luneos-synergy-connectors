@@ -87,7 +87,7 @@
             "waitCode": [],
             "keyHoldMappings": [],
             "launchCode": "*#",
-            "videoFormat": "both"
+            "videoFormat": "none"
         }
     ]
 }]
