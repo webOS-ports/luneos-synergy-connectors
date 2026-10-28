@@ -1,25 +1,22 @@
 /*
- * signal_media.c - Signal 1:1 call MEDIA ENGINE for webOS (HP TouchPad), answerer side.
+ * signal_media.c - the media engine for 1:1 Signal voice calls on LuneOS.
  *
- * Reuses the exact audio recipe proven for the Telegram port: GStreamer 1.20.7 on-device, capture
- * from ALSA "voipsource" / play to "voip" (the PulseAudio pvoip/pvoipsource PCMs under the phone
- * scenario), Opus over RTP. The one thing Signal does differently from Telegram/WhatsApp: media is
- * ICE (libnice) + *manual-keyed* AEAD_AES_256_GCM SRTP whose master keys come from an X25519 DH
- * (srtp_kdf.c), NOT DTLS. So we drive srtpenc/srtpdec with keys we set ourselves.
+ * purple-presage (the Signal libpurple plug-in) runs it as a separate process for each call and
+ * drives it over stdin/stdout (see run_ipc below). Signal's media is ICE (libnice) plus SRTP with
+ * AEAD_AES_256_GCM, keyed from an X25519 DH (srtp_kdf.c) rather than DTLS, so srtpenc/srtpdec get
+ * keys we set ourselves. Audio is Opus over RTP, played to and captured from the PulseAudio call
+ * sink and source, voipcall and webcall, which module-palm-policy routes to the device audiod picks
+ * for the call:
  *
- *   RX: nicesrc -> srtpdec(offer_key||offer_salt via request-key) -> rtpopusdepay -> opusdec -> alsasink device=voip
- *   TX: alsasrc device=voipsource -> opusenc -> rtpopuspay -> srtpenc(answer_key||answer_salt) -> nicesink
+ *   RX: nicesrc -> srtpdec(peer's key via request-key) -> rtpopusdepay -> opusdec -> pulsesink device=voipcall
+ *   TX: pulsesrc device=webcall -> opusenc -> rtpopuspay -> srtpenc(our key) -> nicesink
  *
- * Both nicesrc and nicesink bind the SAME NiceAgent stream/component (RTP send+recv on one 5-tuple,
- * rtcp-mux). We are the CALLEE: DECRYPT the caller with offer_key/salt, ENCRYPT ours with answer_key/salt.
+ * Both nicesrc and nicesink bind the same NiceAgent stream/component (RTP send and receive on one
+ * 5-tuple, rtcp-mux). As the answerer we decrypt the caller with offer_key/salt and encrypt ours
+ * with answer_key/salt; as the caller it is the other way round.
  *
- * Build + loopback self-test: see build-signal-media.sh and README.md. This file compiles to both a
- * standalone test binary (main() -> --loopback / --selftest) and, via -DSIGNAL_MEDIA_NO_MAIN, an
- * object the presage bridge links against for the signal_media_* API.
- *
- * NOTE (unverified on device tonight): every ICE/pipeline caps detail below is reasoned-out, not yet
- * run against a live Signal call. The loopback self-test is the only end-to-end-verifiable piece and
- * it deliberately avoids ICE + ALSA so it can pass on any GStreamer host. TODOs are marked inline.
+ * `signal_media --loopback` runs a self-test of the SRTP-GCM + RTP + Opus path without ICE or audio
+ * devices. Compiled with -DSIGNAL_MEDIA_NO_MAIN this file is just the signal_media_* API.
  */
 
 #include <gst/gst.h>
@@ -31,11 +28,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
-#include <signal.h>     /* SIGBUS/SIGSEGV crash handler (temp diagnostic) */
-#include <execinfo.h>   /* backtrace/backtrace_symbols_fd */
-#include <unistd.h>     /* write, _exit */
-#include <sys/resource.h>  /* setpriority - realtime nice for the call */
-#include <sched.h>         /* SCHED_FIFO for the capture/send threads */
 #include <speex/speex_echo.h>        /* SpeexDSP acoustic echo canceller */
 #include <speex/speex_preprocess.h>  /* residual-echo suppression + denoise */
 
@@ -66,6 +58,7 @@ typedef struct {
     guint           component;  /* 1 = RTP (rtcp-mux) */
 
     GstElement     *pipeline;
+    GstElement     *mic;        /* the pulsesrc, held out of the pipeline until the user answers */
 
     signal_srtp_keys keys;      /* offer_* = decrypt caller, answer_* = encrypt us */
     GstBuffer      *rx_master;  /* the master we hand srtpdec on request-key (44B) */
@@ -85,7 +78,6 @@ typedef struct {
 } SignalMedia;
 
 static SignalMedia g_sm;         /* single active call (the device rings one at a time) */
-static void sm_enable_nice_debug(void);  /* fwd decl - defined near signal_media_init, called from build_ice */
 
 /* TX gate: don't let ANY TX buffer (audio or the rtp-data Accepted) reach nicesink until ICE has a
  * validated pair (CONNECTED). Before that, nice_agent_send() can only ever fail - but the pipeline
@@ -103,16 +95,27 @@ static GstPadProbeReturn sm_tx_gate_probe(GstPad *pad, GstPadProbeInfo *info, gp
     return g_ice_tx_ready ? GST_PAD_PROBE_OK : GST_PAD_PROBE_DROP;
 }
 
+static gboolean g_accepted;     /* defined with the rtp-data channel below */
+
+/* Mic gate: as the answerer the engine starts when the offer arrives, so ICE is ready by the time the
+ * user answers. The pulsesrc only joins the pipeline when they do (sm_open_mic), so nothing records
+ * while the phone rings; this probe is the second line, so no audio can leave before then either.
+ * As the caller the engine only starts once the peer has answered. */
+static GstPadProbeReturn sm_tx_audio_gate_probe(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+{
+    (void)pad; (void)info; (void)u;
+    return (g_sm.is_caller || g_accepted) ? GST_PAD_PROBE_OK : GST_PAD_PROBE_DROP;
+}
+
 /* --- Acoustic echo cancellation (SpeexDSP) --------------------------------------------------------
- * The tablet is on speakerphone: the mic captures the far-end audio coming out of the speaker and
- * would send it back = echo. WhatsApp/Telegram cancel this inside their own engines; our GStreamer
- * engine uses SpeexDSP's echo canceller. Its split playback/capture API is built for exactly our case
+ * On the loudspeaker the mic captures the far-end audio coming out of the speaker and would send it
+ * back as echo. PulseAudio's call sink and source have no echo canceller of their own, so the engine
+ * runs SpeexDSP's. Its split playback/capture API is built for exactly our case
  * (playback and capture on different threads): speex_echo_playback() buffers each frame we PLAY (the
  * reference); speex_echo_capture() cancels that echo out of each mic frame we CAPTURE. Both sides are
  * reframed to a fixed 10 ms (480-sample @ 48 kHz mono) buffer by an audiobuffersplit so the fixed-size
  * frames Speex requires arrive cleanly. A mutex guards the shared state (the two calls run on the RX
- * and TX streaming threads). Unlike webrtc-audio-processing (which alignment-traps this old kernel),
- * libspeexdsp is pure C, tiny, and loads fine. */
+ * and TX streaming threads). */
 #define AEC_FRAME 480    /* 10 ms @ 48 kHz mono = the Speex frame size */
 #define AEC_TAIL  4800   /* 100 ms echo tail (filter length) - covers the speakerphone loop delay */
 static SpeexEchoState        *g_echo    = NULL;
@@ -225,7 +228,7 @@ static srtp_t      g_data_srtp    = NULL;  /* TX SRTP session for the data SSRC 
 static gboolean    g_srtp_inited  = FALSE;
 static GstElement *g_datasrc      = NULL;  /* appsrc -> 2nd nicesink (that nicesink does the actual send) */
 static guint64     g_accept_id    = 0;     /* RingRTC call_id -> Accepted.id */
-static gboolean    g_accepted     = FALSE; /* user accepted -> keep resending */
+static gboolean    g_accepted     = FALSE; /* user accepted -> keep resending; also opens the mic gate */
 static GThread    *g_accept_thread= NULL;  /* dedicated resend thread (NOT g_sm.ctx - see below) */
 static guint16     g_data_seq     = 0;     /* RTP seq for the data stream */
 static guint32     g_data_ts      = 0;     /* RTP timestamp for the data stream */
@@ -244,12 +247,11 @@ static gboolean sm_data_srtp_init(void)
 {
     if (g_data_srtp) return TRUE;
     if (!g_srtp_inited) {
-        /* GStreamer's srtpenc/srtpdec have already srtp_init()'d libsrtp2 (audio SRTP works), and a
-         * second srtp_init() returns non-ok ("already initialized") on this build. That's NOT fatal -
-         * the library is ready - so log and proceed to srtp_create rather than bailing. */
+        /* GStreamer's srtpenc/srtpdec have already initialised libsrtp2, and a second srtp_init()
+         * may report that. Not fatal: the library is ready, so go on to srtp_create. */
         srtp_err_status_t is = srtp_init();
         if (is != srtp_err_status_ok)
-            g_message("signal_media: srtp_init returned %d (already init by gstreamer) - continuing", (int)is);
+            g_debug("signal_media: srtp_init returned %d (already initialised) - continuing", (int)is);
         g_srtp_inited = TRUE;
     }
     unsigned char master[SIGNAL_SRTP_MASTER_SIZE];
@@ -300,8 +302,8 @@ static void sm_push_accepted(void)
     GstBuffer *buf = gst_buffer_new_allocate(NULL, len, NULL);
     gst_buffer_fill(buf, 0, pkt, (gsize)len);
     GstFlowReturn fr = gst_app_src_push_buffer(GST_APP_SRC(g_datasrc), buf);  /* takes ownership */
-    static int logged = 0;
-    if (logged < 3) { g_message("signal_media: pushed rtp-data Accepted (%d enc bytes) -> appsrc flow=%d", len, (int)fr); logged++; }
+    if (fr != GST_FLOW_OK)
+        g_message("signal_media: could not queue the rtp-data Accepted: %s", gst_flow_get_name(fr));
 }
 
 /* Dedicated resend thread. CRITICAL: nice_agent_send() must NOT be called from the agent's own
@@ -320,13 +322,30 @@ static gpointer accept_thread_fn(gpointer u)
     return NULL;
 }
 
-/* The user tapped Answer (ACCEPT stdin cmd): start emitting the RingRTC Accepted so the caller's phone
- * stops ringing and both sides ungate audio. Idempotent. */
+/* Put the held-back pulsesrc into the running pipeline and start it. Runs on the media thread. */
+static gboolean sm_open_mic(gpointer data)
+{
+    SignalMedia *sm = (SignalMedia *)data;
+    if (!sm->mic || !sm->pipeline) return G_SOURCE_REMOVE;
+    GstElement *mic = sm->mic;
+    sm->mic = NULL;
+    GstElement *txconv = gst_bin_get_by_name(GST_BIN(sm->pipeline), "tx-aconv");
+    gst_bin_add(GST_BIN(sm->pipeline), mic);   /* the bin takes its own reference */
+    if (!txconv || !gst_element_link(mic, txconv) || !gst_element_sync_state_with_parent(mic))
+        g_printerr("signal_media: could not start the microphone\n");
+    if (txconv) gst_object_unref(txconv);
+    gst_object_unref(mic);
+    return G_SOURCE_REMOVE;
+}
+
+/* The user tapped Answer (ACCEPT stdin cmd): open the microphone and start emitting the RingRTC
+ * Accepted so the caller's phone stops ringing and both sides ungate audio. Idempotent. */
 void signal_media_accept(guint64 call_id)
 {
     g_accept_id = call_id;
     if (g_accepted) return;         /* already emitting */
     g_accepted = TRUE;
+    if (g_sm.ctx) g_main_context_invoke(g_sm.ctx, sm_open_mic, &g_sm);
     g_accept_thread = g_thread_new("sig-accept", accept_thread_fn, NULL);
     g_message("signal_media: ACCEPT call_id=%" G_GUINT64_FORMAT " -> emitting rtp-data Accepted", call_id);
 }
@@ -348,14 +367,9 @@ static int    g_stun_port;
 static SmTurn g_turn[SM_MAX_TURN];
 static int    g_n_turn;
 
-/* TEMP crash-trail: writes to a dedicated file (independent of the stderr redirect) so we can see
- * exactly how far ICE setup gets when the engine segfaults on a live call. Remove once TURN is stable. */
-static void sm_trace(const char *msg)
-{
-    FILE *f = fopen("/media/internal/sm_trace.log", "a");
-    if (f) { fputs(msg, f); fputc('\n', f); fclose(f); }
-}
 static gsize       g_inited = 0; /* gst_init once */
+
+
 
 /* ------------------------------------------------------------------ small helpers -------------- */
 
@@ -373,7 +387,7 @@ static GstBuffer *master_key_buffer(const unsigned char *key32, const unsigned c
 static GstElement *mk(const char *factory, const char *name)
 {
     GstElement *e = gst_element_factory_make(factory, name);
-    if (!e) g_printerr("signal_media: missing GStreamer element '%s' (need its plugin on device)\n", factory);
+    if (!e) g_printerr("signal_media: missing GStreamer element '%s'\n", factory);
     return e;
 }
 
@@ -401,7 +415,7 @@ static GstCaps *on_srtpdec_request_key(GstElement *dec, guint ssrc, gpointer use
     SignalMedia *sm = (SignalMedia *)user;
     /* srtpdec only asks for a key once it SEES an SRTP packet for that SSRC -> inbound media from
      * the peer is actually arriving (ICE connected + the peer is sending). Key milestone. */
-    g_message("signal_media: srtpdec request-key for ssrc %u (inbound SRTP arriving)", ssrc);
+    g_message("signal_media: inbound SRTP arriving (ssrc %u)", ssrc);
     if (!sm->rx_master) return NULL;
     GstCaps *caps = gst_caps_new_simple("application/x-srtp",
                                         "srtp-cipher",  G_TYPE_STRING, SRTP_CIPHER_GCM256,
@@ -468,7 +482,7 @@ static void on_nice_candidate(NiceAgent *agent, NiceCandidate *cand, gpointer us
         /* libnice emits the SDP attribute form "a=candidate:...", but Signal's IceCandidate opaque
          * carries the bare "candidate:..." line (verified vs a real capture). Strip the "a=". */
         const char *bare = (strncmp(sdp, "a=", 2) == 0) ? sdp + 2 : sdp;
-        g_message("signal_media: LOCAL candidate -> %s", bare);
+        g_debug("signal_media: local candidate %s", bare);
         sm->cand_cb(bare, sm->cand_user);   /* bridge -> Signal IceUpdate */
         g_free(sdp);
     }
@@ -499,8 +513,8 @@ static void on_nice_state(NiceAgent *agent, guint stream_id, guint component_id,
         if (nice_agent_get_selected_pair(agent, stream_id, component_id, &lc, &rc) && lc && rc) {
             gchar *ls = nice_agent_generate_local_candidate_sdp(agent, lc);
             gchar *rs = nice_agent_generate_local_candidate_sdp(agent, rc);
-            g_message("signal_media: ICE SELECTED PAIR local[%s] remote[%s]",
-                      ls ? ls : "?", rs ? rs : "?");
+            g_debug("signal_media: ICE selected pair local[%s] remote[%s]",
+                    ls ? ls : "?", rs ? rs : "?");
             g_free(ls); g_free(rs);
         }
     }
@@ -511,26 +525,20 @@ static void on_nice_state(NiceAgent *agent, guint stream_id, guint component_id,
 static gboolean build_ice(SignalMedia *sm, const char *our_ufrag, const char *our_pwd,
                           const char *remote_ufrag, const char *remote_pwd)
 {
-    /* RFC5245 full ICE, controlled role is set implicitly (we are the answerer). Using the private
-     * context so all agent signals fire on our media thread. */
-    sm_trace("build_ice: enter");
-    sm_enable_nice_debug();   /* before nice_agent_new so nice_debug_init() (called from agent init) sees it */
+    /* RFC5245 full ICE. Using the private context so all agent signals fire on our media thread. */
     sm->agent = nice_agent_new(sm->ctx, NICE_COMPATIBILITY_RFC5245);
     if (!sm->agent) { g_printerr("signal_media: nice_agent_new failed\n"); return FALSE; }
-    sm_trace("build_ice: agent created");
 
     /* ICE role: the CALLER (offerer) is CONTROLLING, the answerer is CONTROLLED. */
     g_object_set(sm->agent, "controlling-mode", sm->is_caller ? TRUE : FALSE, NULL);
     g_message("signal_media: role=%s controlling-mode=%d",
               sm->is_caller ? "CALLER" : "ANSWERER", sm->is_caller ? 1 : 0);
 
-    /* THE incoming-call fix (2026-07-29): Signal's peer is RingRTC (libwebrtc), which nominates the
-     * selected pair using Google's proprietary ICE RENOMINATION extension - a STUN NOMINATION attr
-     * (0xC001), NOT the standard USE-CANDIDATE. Proven via tcpdump: every inbound BindReq carried
-     * GOOG-NOMINATION=1/3 and never USE-CANDIDATE, so our controlled answerer formed a valid pair but
-     * libnice never nominated it -> ICE timed out to FAILED. libnice 0.1.21 already implements this
-     * (conn_check_handle_renomination), gated behind support-renomination which defaults FALSE. Enable
-     * it so the answerer honours RingRTC's nomination. Harmless for the caller (we drive nomination). */
+    /* Signal's peer is RingRTC (libwebrtc), which nominates the selected pair with Google's ICE
+     * renomination extension - a STUN NOMINATION attribute (0xC001) - not USE-CANDIDATE: in captures
+     * every inbound binding request carried GOOG-NOMINATION and never USE-CANDIDATE. libnice
+     * implements it behind support-renomination, which defaults to FALSE; without it the answerer
+     * never nominates a pair and ICE fails. Harmless for the caller, which drives nomination. */
     g_object_set(sm->agent, "support-renomination", TRUE, NULL);
 
     /* Keepalive as STUN binding REQUESTS, not indications. After ICE reaches READY, libnice's default
@@ -540,58 +548,36 @@ static gboolean build_ice(SignalMedia *sm, const char *our_ufrag, const char *ou
      * (which draw responses), keeping the peer's consent fresh so it doesn't tear the call down. */
     g_object_set(sm->agent, "keepalive-conncheck", TRUE, NULL);
 
-    /* Cut candidate/conncheck load to match Teams' (reliable) approach on this same device/AP.
-     * Teams' NGC calling deliberately uses a SINGLE relay path, not full ICE (see
-     * TEAMS_MEDIA_ADAPTATION.md "single MS-TURN relay ... not full ICE") - and it connects reliably
-     * over the identical WiFi hardware where Signal's full trickle-ICE (host x2 + srflx x2 + relay x6+
-     * = 10-20 simultaneous candidate pairs, each independently retrying STUN checks every 500ms) was
-     * seeing its connectivity checks go completely unanswered. That strongly points to burst/volume
-     * (many simultaneous small UDP flows) rather than raw link quality - so shrink the candidate set:
-     *   - ice-tcp=FALSE: drop TCP host/srflx candidates. We've never seen a TCP pair succeed anyway
-     *     (this device doesn't do real ICE-TCP), so they're pure wasted conncheck traffic.
-     *   - force-relay=TRUE: skip host/srflx UDP entirely, gather ONLY relay candidates - i.e. do what
-     *     Teams does (one relay path) instead of racing many simultaneous pairs. */
+    /* Keep the candidate set small. With full trickle ICE (host, srflx and several relays, 10-20
+     * pairs each retrying every 500 ms) connectivity checks went unanswered on WiFi, so:
+     *   - ice-tcp=FALSE: no TCP host/srflx candidates; a TCP pair never succeeded.
+     *   - force-relay: only relay candidates, a single relay path - but only when there is a TURN
+     *     server to relay through, or there would be no candidates at all. */
     g_object_set(sm->agent, "ice-tcp", FALSE, NULL);
-    g_object_set(sm->agent, "force-relay", TRUE, NULL);
-    g_message("signal_media: ice-tcp=off force-relay=on (matching Teams' single-relay-path approach)");
+    g_object_set(sm->agent, "force-relay", g_n_turn > 0, NULL);
+    g_message("signal_media: %d TURN relay(s), %s", g_n_turn,
+              g_n_turn > 0 ? "relay candidates only" : "host and server-reflexive candidates");
 
-    sm_trace("build_ice: role set");
 
     /* STUN (agent-global): gathers server-reflexive (srflx) candidates so we learn our public
      * ip:port behind NAT. Signal feeds this via a RELAY line before START. Set before gathering. */
     if (g_stun_port) {
-        sm_trace("build_ice: setting STUN");
         g_object_set(sm->agent, "stun-server", g_stun_host,
                      "stun-server-port", (guint)g_stun_port, NULL);
-        g_message("signal_media: STUN server %s:%d", g_stun_host, g_stun_port);
-        sm_trace("build_ice: STUN set");
     }
 
     sm->component = 1;
     sm->stream_id = nice_agent_add_stream(sm->agent, 1 /* rtcp-mux -> single component */);
     if (!sm->stream_id) { g_printerr("signal_media: add_stream failed\n"); return FALSE; }
-    sm_trace("build_ice: stream added");
 
-    /* TURN relays (per component): Signal RELAYS all calls for IP privacy, so relay candidates are
-     * how the two peers actually reach each other. Must be set after add_stream, before gather. */
-    {
-        char tb[128];
-        snprintf(tb, sizeof tb, "build_ice: applying %d TURN relay(s)", g_n_turn);
-        sm_trace(tb);
-    }
+    /* TURN relays (per component): relay candidates are how the two peers reach each other.
+     * Must be set after add_stream, before gathering. */
     for (int i = 0; i < g_n_turn; i++) {
         SmTurn *t = &g_turn[i];
-        char tb[256];
-        snprintf(tb, sizeof tb, "build_ice: set_relay_info[%d] %s:%d type=%d ulen=%zu plen=%zu",
-                 i, t->host, t->port, (int)t->type, strlen(t->user), strlen(t->pass));
-        sm_trace(tb);
-        if (nice_agent_set_relay_info(sm->agent, sm->stream_id, sm->component,
-                                      t->host, (guint)t->port,
-                                      t->user, t->pass, t->type))
-            g_message("signal_media: TURN relay %s:%d type=%d", t->host, t->port, (int)t->type);
-        else
+        if (!nice_agent_set_relay_info(sm->agent, sm->stream_id, sm->component,
+                                       t->host, (guint)t->port,
+                                       t->user, t->pass, t->type))
             g_printerr("signal_media: set_relay_info failed for %s:%d\n", t->host, t->port);
-        sm_trace("build_ice: set_relay_info done");
     }
 
     if (our_ufrag && our_pwd)
@@ -609,17 +595,10 @@ static gboolean build_ice(SignalMedia *sm, const char *our_ufrag, const char *ou
 }
 
 /* Actually start ICE gathering: opens libnice's UDP sockets and kicks off STUN/TURN discovery. Split
- * out of build_ice() and called AFTER build_pipeline()'s ALSA devices are opened (PLAYING state) - see
- * signal_media_start(). Root-caused via NICE_DEBUG: "agent_recv_message_unlocked returned -1, errno
- * (25): Inappropriate ioctl for device" on 2-3 of the ICE UDP sockets a few hundred ms into gathering,
- * which made libnice silently DETACH those sockets (no more responses ever read on them) - explaining
- * "we send checks, peer replies, but we never see anything". ENOTTY on a UDP socket is the classic
- * signature of an fd NUMBER getting reused for a different resource while a GSource still references
- * the old fd. The previous ordering created nice's sockets (build_ice, fds allocated) BEFORE the
- * GMainLoop that services them existed (that only starts after build_pipeline + gst_element_set_state
- * PLAYING, which is exactly when ALSA opens /dev/snd device nodes - heavy fd churn), leaving a window
- * where nice's just-opened socket fds could collide with fds ALSA opens/closes moments later. Opening
- * nice's sockets AFTER ALSA's device-open churn has already settled removes that overlap window. */
+ * out of build_ice() and called after the pipeline is PLAYING, i.e. after the audio devices are open
+ * - see signal_media_start(). With the sockets opened first, a few of them failed with ENOTTY a few
+ * hundred ms into gathering and libnice detached them (an fd number reused while a GSource still
+ * watched it, during the device-open fd churn), so replies on them were never read. */
 static gboolean sm_start_gathering(SignalMedia *sm)
 {
     if (!nice_agent_gather_candidates(sm->agent, sm->stream_id)) {
@@ -635,7 +614,7 @@ static gboolean build_pipeline(SignalMedia *sm)
 {
     sm->pipeline = gst_pipeline_new("signal-call");
 
-    /* -------- RX: nicesrc -> srtpdec -> rtpopusdepay -> opusdec -> alsasink device=voip -------- */
+    /* -------- RX: nicesrc -> srtpdec -> rtpopusdepay -> opusdec -> pulsesink device=voipcall ---- */
     GstElement *nsrc   = mk("nicesrc",       "rx-nicesrc");
     GstElement *rxcaps = mk("capsfilter",    "rx-srtpcaps");   /* label bytes as x-srtp for srtpdec */
     GstElement *sdec   = mk("srtpdec",       "rx-srtpdec");
@@ -647,11 +626,11 @@ static gboolean build_pipeline(SignalMedia *sm)
     /* AEC reference tap: rxcaps2 forces S16LE/48k/mono; a read probe on it stashes the latest played
      * frame as the echo reference. Audio still flows straight to the sink (no reframing needed). */
     GstElement *rxcaps2= mk("capsfilter",     "rx-aeccaps");
-    GstElement *asink  = mk("alsasink",      "rx-alsasink");
+    GstElement *asink  = mk("pulsesink",     "rx-pulsesink");
     GstElement *rxrtcp = mk("fakesink",      "rx-rtcp-drain");  /* drain srtpdec rtcp_src (rtcp-mux) */
 
-    /* -------- TX: alsasrc device=voipsource -> opusenc -> rtpopuspay -> srtpenc -> nicesink ----- */
-    GstElement *asrc   = mk("alsasrc",       "tx-alsasrc");
+    /* -------- TX: pulsesrc device=webcall -> opusenc -> rtpopuspay -> srtpenc -> nicesink -------- */
+    GstElement *asrc   = mk("pulsesrc",      "tx-pulsesrc");
     GstElement *txconv = mk("audioconvert",  "tx-aconv");
     GstElement *txre   = mk("audioresample", "tx-ares");
     GstElement *txcaps = mk("capsfilter",    "tx-rawcaps");    /* force 48k/mono for opusenc */
@@ -662,11 +641,10 @@ static gboolean build_pipeline(SignalMedia *sm)
     GstElement *pay    = mk("rtpopuspay",    "tx-pay");
     GstElement *senc   = mk("srtpenc",       "tx-srtpenc");
     GstElement *nsink  = mk("nicesink",      "tx-nicesink");
-    /* rtp-data (Accepted) TX: appsrc (pre-SRTP-encrypted x-srtp bytes) -> funnel -> the SINGLE audio
-     * nicesink. There must be exactly ONE nicesink: two concurrent nice_agent_send callers on one
-     * libnice 0.1.21 agent deadlock the agent (proven via pcap - audio, data AND STUN all froze at
-     * once with two nicesinks). The funnel merges the occasional data buffer into the audio SRTP
-     * stream so a single nicesink sends everything. */
+    /* rtp-data (Accepted) TX: appsrc (pre-SRTP-encrypted x-srtp bytes) -> funnel -> the single audio
+     * nicesink. There must be exactly one nicesink: two concurrent nice_agent_send callers on one
+     * agent deadlocked it (audio, data and STUN all froze at once). The funnel merges the occasional
+     * data buffer into the audio SRTP stream so a single nicesink sends everything. */
     GstElement *dsrc   = mk("appsrc",        "tx-datasrc");
     GstElement *funnel = mk("funnel",        "tx-funnel");
     /* CRITICAL: a queue between funnel and nicesink. A funnel merges pads but does NOT serialize
@@ -676,7 +654,7 @@ static gboolean build_pipeline(SignalMedia *sm)
      * single task thread that drives everything downstream of it, so the nicesink - and thus the one
      * nice_agent_send caller - always runs on that ONE thread. Single sender = no deadlock. */
     GstElement *txq    = mk("queue",         "tx-queue");
-    /* Leaky downstream + shallow: a full blocking queue back-pressures the alsasrc mic ("Can't record
+    /* Leaky downstream + shallow: a full blocking queue back-pressures the mic source ("Can't record
      * audio fast enough / Dropped N samples / DISCONT"), which wrecks the call in ~3s. Drop old egress
      * buffers instead of ever stalling capture; a live call would rather lose a few ms than wedge. */
     if (txq) g_object_set(txq, "leaky", 2 /*downstream*/, "max-size-time", (guint64)100000000 /*100ms*/,
@@ -687,20 +665,18 @@ static gboolean build_pipeline(SignalMedia *sm)
         if (sm->pipeline) { gst_object_unref(sm->pipeline); sm->pipeline = NULL; }
         return FALSE;
     }
-    /* AEC is optional: it needs audiobuffersplit (for the fixed 10ms frames Speex wants) on both RX and
-     * TX. If that element is missing, run without echo cancellation rather than fail the call. */
-    /* AEC is OPT-IN via /media/internal/signal_aec. It works (SpeexDSP loads + cancels) but 48 kHz
-     * echo cancellation is too CPU-heavy for the TouchPad - it starves the mic (drops ~320ms of samples)
-     * and the ICE thread, breaking the call. Off by default so calls work; enable the gate file only to
-     * test a future lighter (16 kHz) AEC. */
+    /* Echo cancellation is on unless SIGNAL_MEDIA_AEC=0. It needs audiobuffersplit (for the fixed 10 ms
+     * frames Speex wants); without that element the call runs without it rather than failing. At
+     * 48 kHz it is CPU-heavy: on the HP TouchPad (under legacy webOS) it starved the mic and the ICE
+     * thread, which is what the variable is for. */
     gboolean g_have_aec = (rxcaps2 != NULL && txsplit != NULL) &&
-                          (access("/media/internal/signal_aec", F_OK) == 0);
+                          g_strcmp0(g_getenv("SIGNAL_MEDIA_AEC"), "0") != 0;
     if (g_have_aec) {
         sm_echo_init();
         g_have_aec = g_echo_ready;   /* speex init could still fail */
     }
     if (!g_have_aec)
-        g_message("signal_media: AEC OFF (gate /media/internal/signal_aec absent, or unavailable)");
+        g_message("signal_media: echo cancellation off");
 
     /* nice binding: RX nicesrc + TX audio nicesink + TX data nicesink all share the one component. */
     g_object_set(nsrc,  "agent", sm->agent, "stream", sm->stream_id, "component", sm->component, NULL);
@@ -731,7 +707,7 @@ static gboolean build_pipeline(SignalMedia *sm)
      * -> the opus decoder gets PLC gaps instead of garbled/choppy audio). 120ms is a good voice latency.
      * No RTCP is wired (rtcp-mux RTCP is drained), so it runs in buffer-only mode - fine for audio. */
     g_object_set(rxjb, "latency", 120, "do-lost", TRUE, "mode", 1 /*slave/low-latency*/, NULL);
-    g_object_set(asink, "device", "voip", "sync", FALSE, NULL);
+    g_object_set(asink, "device", "voipcall", "sync", FALSE, NULL);
     g_object_set(rxrtcp, "sync", FALSE, "async", FALSE, NULL);  /* never stall the pipeline */
 
     if (g_have_aec) {
@@ -757,14 +733,12 @@ static gboolean build_pipeline(SignalMedia *sm)
                                        "rate",     G_TYPE_INT,    SIGNAL_OPUS_CLOCKRATE,
                                        "channels", G_TYPE_INT,    SIGNAL_OPUS_CHANNELS, NULL);
       g_object_set(txcaps, "caps", c, NULL); gst_caps_unref(c); }
-    /* alsasrc: bigger ring + provide-clock off so a momentary scheduling hiccup doesn't overrun the
-     * mic ("Can't record audio fast enough"). buffer-time 200ms, latency-time 40ms. */
-    g_object_set(asrc, "device", "voipsource",
+    /* Mic: bigger ring + provide-clock off so a momentary scheduling hiccup doesn't overrun it
+     * ("Can't record audio fast enough"). buffer-time 200ms, latency-time 40ms. */
+    g_object_set(asrc, "device", "webcall",
                  "buffer-time", (gint64)200000, "latency-time", (gint64)40000,
                  "provide-clock", FALSE, NULL);
-    /* opusenc: complexity 0/24k was an emergency cut for the mic overrun, but the realtime-priority fix
-     * (setpriority in signal_media_init) removed that CPU pressure, so raise quality now that we have
-     * headroom: complexity 5 + 32 kbps + inband FEC (resilient to the packet loss that garbled audio).
+    /* opusenc: complexity 5 + 32 kbps + inband FEC (resilient to the packet loss that garbled audio).
      * complexity/bitrate/percentage are ints; audio-type is a GEnum set via string nick. */
     g_object_set(oenc, "complexity", 5, "bitrate", 32000,
                  "inband-fec", TRUE, "packet-loss-percentage", 10, NULL);
@@ -780,9 +754,15 @@ static gboolean build_pipeline(SignalMedia *sm)
 
     gst_bin_add_many(GST_BIN(sm->pipeline),
                      nsrc, rxcaps, sdec, rxrtp, rxjb, depay, odec, aconv, asink, rxrtcp,
-                     asrc, txconv, txre, txcaps, oenc, pay, senc, nsink, dsrc, funnel, txq, NULL);
+                     txconv, txre, txcaps, oenc, pay, senc, nsink, dsrc, funnel, txq, NULL);
     if (g_have_aec)
         gst_bin_add_many(GST_BIN(sm->pipeline), rxcaps2, txsplit, NULL);
+    /* The microphone: in the pipeline from the start for an outgoing (or already answered) call;
+     * for an incoming one held back until the user answers, so PulseAudio records nothing while it
+     * rings. */
+    gboolean mic_now = sm->is_caller || g_accepted;
+    if (mic_now) gst_bin_add(GST_BIN(sm->pipeline), asrc);
+    else         sm->mic = gst_object_ref_sink(asrc);
 
     /* srtpdec has STATIC/ALWAYS pads: rtp_src (decrypted RTP) and rtcp_src (decrypted RTCP). Link the
      * main RTP chain statically (rtp_src -> rxrtp -> depay -> ...). CRITICAL: with rtcp-mux the peer
@@ -791,7 +771,7 @@ static gboolean build_pipeline(SignalMedia *sm)
      * unlinked that push returns GST_FLOW_NOT_LINKED, which stops the whole RX stream ("not-linked")
      * the instant real media arrives -> call dropped. Loopback never hit this (it sends no RTCP).
      * Drain rtcp_src into a fakesink so RTCP is discarded and RTP keeps flowing. */
-    /* RX: ...odec -> aconv -> [rxcaps2(S16LE, probe stashes reference) ->] alsasink. Audio plays as
+    /* RX: ...odec -> aconv -> [rxcaps2(S16LE, probe stashes reference) ->] pulsesink. Audio plays as
      * normal; the probe just observes the played frames for the AEC reference. */
     if (g_have_aec) {
         if (!gst_element_link_many(nsrc, rxcaps, sdec, rxrtp, rxjb, depay, odec, aconv, rxcaps2, asink, NULL)) {
@@ -803,15 +783,18 @@ static gboolean build_pipeline(SignalMedia *sm)
     if (!gst_element_link_pads(sdec, "rtcp_src", rxrtcp, "sink")) {
         g_printerr("signal_media: RX rtcp_src -> fakesink link failed\n"); return FALSE;
     }
-    /* audio: alsasrc -> aconv -> ares -> txcaps -> [txsplit(10ms, probe=speex_echo_capture in-place) ->]
+    /* audio: pulsesrc -> aconv -> ares -> txcaps -> [txsplit(10ms, probe=speex_echo_capture in-place) ->]
      * opusenc -> pay -> srtpenc -> funnel; data: appsrc -> funnel; funnel -> queue -> the single
      * nicesink. The txsplit's probe subtracts the speaker echo from each mic frame before encoding. */
     if (g_have_aec) {
-        if (!gst_element_link_many(asrc, txconv, txre, txcaps, txsplit, oenc, pay, senc, funnel, txq, nsink, NULL)) {
+        if (!gst_element_link_many(txconv, txre, txcaps, txsplit, oenc, pay, senc, funnel, txq, nsink, NULL)) {
             g_printerr("signal_media: TX (audio, with AEC) link failed\n"); return FALSE;
         }
-    } else if (!gst_element_link_many(asrc, txconv, txre, txcaps, oenc, pay, senc, funnel, txq, nsink, NULL)) {
+    } else if (!gst_element_link_many(txconv, txre, txcaps, oenc, pay, senc, funnel, txq, nsink, NULL)) {
         g_printerr("signal_media: TX (audio) link failed\n"); return FALSE;
+    }
+    if (mic_now && !gst_element_link(asrc, txconv)) {
+        g_printerr("signal_media: TX (microphone) link failed\n"); return FALSE;
     }
     if (!gst_element_link(dsrc, funnel)) {
         g_printerr("signal_media: TX (data) link failed\n"); return FALSE;
@@ -820,13 +803,17 @@ static gboolean build_pipeline(SignalMedia *sm)
     /* TX gate: drop every buffer (audio AND the rtp-data Accepted, both flow through txq before
      * nicesink) until ICE is CONNECTED - see sm_tx_gate_probe's comment. */
     g_ice_tx_ready = FALSE;
+    /* Mic gate, on the encoded audio before it joins the rtp-data in the funnel. */
+    { GstPad *p = gst_element_get_static_pad(oenc, "src");
+      gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, sm_tx_audio_gate_probe, NULL, NULL);
+      gst_object_unref(p); }
     { GstPad *p = gst_element_get_static_pad(txq, "src");
       gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, sm_tx_gate_probe, NULL, NULL);
       gst_object_unref(p); }
 
     GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(sm->pipeline));
     GSource *src = gst_bus_create_watch(bus);
-    g_source_set_callback(src, (GSourceFunc)on_bus, sm, NULL);
+    g_source_set_callback(src, G_SOURCE_FUNC(on_bus), sm, NULL);
     g_source_attach(src, sm->ctx);   /* watch fires on the media thread */
     g_source_unref(src);
     gst_object_unref(bus);
@@ -846,63 +833,10 @@ static gpointer media_thread(gpointer data)
 
 /* ------------------------------------------------------------------ public API ----------------- */
 
-/* Crash handler: on SIGBUS/SIGSEGV, log the faulting address + a backtrace to stderr (-> the engine's
- * sigmedia_call.log) so we can see the exact crashing frame instead of a truncated minicore. Temp
- * diagnostic. Uses async-signal-unsafe backtrace_symbols_fd but we're already crashing. */
-static void sm_crash_handler(int sig, siginfo_t *si, void *uctx)
-{
-    (void)uctx;
-    void *bt[32];
-    int n = backtrace(bt, 32);
-    char hdr[128];
-    int len = snprintf(hdr, sizeof hdr, "\n*** signal_media CRASH sig=%d addr=%p bt=%d frames ***\n",
-                       sig, si ? si->si_addr : NULL, n);
-    if (write(2, hdr, len) < 0) { /* ignore */ }
-    backtrace_symbols_fd(bt, n, 2);   /* fd 2 = stderr = sigmedia_call.log */
-    _exit(128 + sig);
-}
-
-/* Force libnice's conncheck-level debug logging to actually reach sigmedia_call.log.
- * NICE_DEBUG/G_MESSAGES_DEBUG=all env vars were set on the engine spawn but produced NOTHING - the
- * device's libnice.so (independently confirmed to have nice_debug()/the debug strings compiled in, so
- * it's NOT an NDEBUG-stripped build) never actually printed conncheck internals. Rather than keep
- * guessing at g_parse_debug_string/G_MESSAGES_DEBUG env-var mechanics, force it directly: call the
- * public nice_debug_enable() API (bypasses NICE_DEBUG parsing) and install our own handler for the
- * "libnice"/"libnice-stun" log domains that unconditionally writes to stderr (bypasses any
- * G_MESSAGES_DEBUG gating in the default handler). */
-static void sm_nice_log_handler(const gchar *domain, GLogLevelFlags level, const gchar *msg, gpointer u)
-{
-    (void)level; (void)u;
-    fprintf(stderr, "[%s] %s\n", domain ? domain : "libnice", msg ? msg : "");
-    fflush(stderr);
-}
-
-static void sm_enable_nice_debug(void)
-{
-    nice_debug_enable(TRUE);   /* TRUE = also enable STUN-level logging */
-    g_log_set_handler("libnice", G_LOG_LEVEL_MASK, sm_nice_log_handler, NULL);
-    g_log_set_handler("libnice-stun", G_LOG_LEVEL_MASK, sm_nice_log_handler, NULL);
-    g_message("signal_media: forced libnice debug logging on (nice_debug_enable + custom log handler)");
-}
 
 int signal_media_init(int *argc, char ***argv)
 {
     if (g_once_init_enter(&g_inited)) {
-        /* Realtime priority for the whole call. The mic (alsasrc) kept overrunning ("Can't record
-         * audio fast enough") because this spawned engine ran at default nice and got CPU-starved by
-         * the transport + others while doing Opus enc+dec + GCM SRTP + ICE. WhatsApp calling renices
-         * during a call for the same reason (see whatsapp-call-audio-quality). The transport runs as
-         * root so a negative nice is permitted; -15 puts us well above normal work. */
-        if (setpriority(PRIO_PROCESS, 0, -15) != 0)
-            g_message("signal_media: setpriority(-15) failed (continuing at default nice)");
-
-        struct sigaction sa;
-        memset(&sa, 0, sizeof sa);
-        sa.sa_sigaction = sm_crash_handler;
-        sa.sa_flags = SA_SIGINFO;
-        sigaction(SIGBUS,  &sa, NULL);
-        sigaction(SIGSEGV, &sa, NULL);
-        sigaction(SIGILL,  &sa, NULL);   /* the webrtc lib's load-time LDREX alignment trap is SIGILL */
         gst_init(argc, argv);
         g_once_init_leave(&g_inited, 1);
     }
@@ -966,12 +900,12 @@ int signal_media_add_remote_candidate(const char *sdp_candidate)
                       : g_strconcat("a=", sdp_candidate, NULL);
     NiceCandidate *c = nice_agent_parse_remote_candidate_sdp(g_sm.agent, g_sm.stream_id, attr);
     g_free(attr);
-    if (!c) { g_printerr("signal_media: could not parse remote candidate: %s\n", sdp_candidate); return -1; }
+    if (!c) { g_printerr("signal_media: could not parse a remote candidate\n"); return -1; }
     GSList *list = g_slist_append(NULL, c);
     int added = nice_agent_set_remote_candidates(g_sm.agent, g_sm.stream_id, g_sm.component, list);
     g_slist_free(list);
     nice_candidate_free(c);
-    g_message("signal_media: REMOTE candidate (added=%d) -> %s", added, sdp_candidate);
+    g_debug("signal_media: remote candidate (added=%d) %s", added, sdp_candidate);
     return added > 0 ? 0 : -1;
 }
 
@@ -995,6 +929,7 @@ void signal_media_stop(void)
     sm_echo_free();     /* now that the streaming threads (probe callers) are stopped, free the AEC */
 
     if (g_sm.pipeline) { gst_object_unref(g_sm.pipeline); g_sm.pipeline = NULL; }
+    if (g_sm.mic)      { gst_object_unref(g_sm.mic);      g_sm.mic = NULL; }   /* never answered */
     if (g_sm.agent)    { g_object_unref(g_sm.agent);      g_sm.agent = NULL; }
     if (g_sm.rx_master){ gst_buffer_unref(g_sm.rx_master); g_sm.rx_master = NULL; }
     if (g_sm.loop)     { g_main_loop_unref(g_sm.loop);    g_sm.loop = NULL; }
@@ -1165,16 +1100,21 @@ int signal_media_loopback_selftest(void)
 /* ------------------------------------------------------------------ standalone main ------------ */
 #ifndef SIGNAL_MEDIA_NO_MAIN
 
-/* --answer IPC driver: the separate-process contract the presage bridge speaks (see RUNTIME_STATUS).
- * presage spawns `signal_media --answer`, then talks a line protocol over the pipes:
+/* IPC driver: the separate-process contract purple-presage speaks. It spawns `signal_media --answer`
+ * (incoming call) or `--caller` (outgoing), then talks a line protocol over the pipes:
  *
  *   presage -> us (stdin):
+ *     PREPARE <priv_hex64>                (caller only: report PUB for the Offer, no media yet)
+ *     RELAY stun <host> <port>            (STUN/TURN servers, before START)
+ *     RELAY turn <ip> <port> <user> <pass> <udp|tcp|tls>
  *     START <priv_hex64> <pub_hex64> <callerid_hex> <calleeid_hex> <ourufrag> <ourpwd> <remufrag> <rempwd>
  *     RCAND <candidate:... sdp line>      (peer IceUpdate, may repeat / trickle)
- *     STOP
+ *     ACCEPT <call_id>                    (the user answered: send RingRTC's Accepted, open the mic)
+ *     STOP                                (or EOF on stdin)
  *   us -> presage (stdout, line-buffered):
+ *     PUB <pub_hex64>                     (our X25519 public key)
  *     CAND <candidate:... sdp line>       (our local candidate to send as an IceUpdate)
- *     AUDIOD <0|1>                        (bridge should drive audiod scenario)
+ *     AUDIOD <0|1>                        (media pipeline up / down)
  *     READY                               (engine started ok)
  *     ERR <msg>                           (fatal; we exit non-zero)
  *
@@ -1182,6 +1122,7 @@ int signal_media_loopback_selftest(void)
  * spaces). Our callbacks fire from the engine's GMainContext thread, so stdout writes take a lock. */
 static GMutex g_out_lock;
 
+static void emit(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
 static void emit(const char *fmt, ...)
 {
     va_list ap; va_start(ap, fmt);
@@ -1242,35 +1183,33 @@ static int run_ipc(int is_caller)
              * yet - the answerer's key + ICE creds arrive later in START. */
             emit_pubkey_from_priv_hex(line + 8);
         } else if (strncmp(line, "RELAY ", 6) == 0) {
-            sm_trace("ipc: RELAY line");
             /* STUN/TURN config, sent before START:  RELAY stun <host> <port>
              *                                       RELAY turn <ip> <port> <user> <pass> <transport> */
             char *sp = NULL;
             char *kind = strtok_r(line + 6, " ", &sp);
             char *host = strtok_r(NULL, " ", &sp);
             char *ports = strtok_r(NULL, " ", &sp);
-            if (kind && host && ports) {
-                int port = atoi(ports);
+            char *pend = NULL;
+            long port = ports ? strtol(ports, &pend, 10) : -1;
+            if (kind && host && ports && *pend == '\0' && port > 0 && port <= 65535) {
                 if (strcmp(kind, "stun") == 0) {
                     snprintf(g_stun_host, sizeof g_stun_host, "%s", host);
-                    g_stun_port = port;
+                    g_stun_port = (int)port;
                 } else if (strcmp(kind, "turn") == 0 && g_n_turn < SM_MAX_TURN) {
                     char *user = strtok_r(NULL, " ", &sp);
                     char *pass = strtok_r(NULL, " ", &sp);
                     char *tr   = strtok_r(NULL, " ", &sp);
                     SmTurn *t = &g_turn[g_n_turn++];
                     snprintf(t->host, sizeof t->host, "%s", host);
-                    t->port = port;
+                    t->port = (int)port;
                     snprintf(t->user, sizeof t->user, "%s", user ? user : "");
                     snprintf(t->pass, sizeof t->pass, "%s", pass ? pass : "");
                     t->type = (tr && strcmp(tr, "tcp") == 0) ? NICE_RELAY_TYPE_TURN_TCP
                             : (tr && strcmp(tr, "tls") == 0) ? NICE_RELAY_TYPE_TURN_TLS
                             :                                  NICE_RELAY_TYPE_TURN_UDP;
-                    sm_trace("RELAY: stored turn entry");
                 }
             }
         } else if (strncmp(line, "START ", 6) == 0) {
-            sm_trace("ipc: START line");
             if (started) { emit("ERR already-started\n"); continue; }
             /* Tokenise the 8 START fields. strtok is fine: no field contains whitespace. */
             char *sp = NULL;
@@ -1326,9 +1265,7 @@ static int run_ipc(int is_caller)
 
 int main(int argc, char **argv)
 {
-    sm_trace("main: enter");
     signal_media_init(&argc, &argv);
-    sm_trace("main: gst_init done");
     if (argc >= 2 && (strcmp(argv[1], "--loopback") == 0 || strcmp(argv[1], "--selftest") == 0)) {
         int rc = signal_media_loopback_selftest();
         return rc;
@@ -1339,7 +1276,7 @@ int main(int argc, char **argv)
     if (argc >= 2 && strcmp(argv[1], "--caller") == 0) {
         return run_ipc(1);   /* caller (outgoing): RX=answer_key, TX=offer_key */
     }
-    g_print("Signal call media engine (webOS).\n");
+    g_print("Signal call media engine.\n");
     g_print("  %s --loopback   run the SRTP-GCM+RTP+Opus loopback self-test\n", argv[0]);
     g_print("  %s --answer     drive a live INCOMING call over the stdin/stdout IPC (presage bridge)\n", argv[0]);
     g_print("  %s --caller     drive a live OUTGOING call over the stdin/stdout IPC (presage bridge)\n", argv[0]);

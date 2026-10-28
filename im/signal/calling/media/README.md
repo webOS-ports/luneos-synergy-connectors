@@ -1,143 +1,91 @@
-# Signal 1:1 call — MEDIA ENGINE (webOS / HP TouchPad)
+# Signal 1:1 call media engine
 
-Answerer-side audio media for an **incoming** Signal voice call, built on the device's stock
-GStreamer 1.20.7 stack and reusing the exact audio recipe proven for the Telegram port.
-
-Status (2026-07-21): **cross-compiles to an ARM binary + static lib; the crypto KDF is verified
-byte-for-byte against the Python reference; the GStreamer loopback path builds but is NOT yet run
-(no device tonight).** See "What is verified vs unverified" below.
+Audio for 1:1 Signal voice calls on LuneOS. purple-presage (the Signal libpurple plug-in, built by
+meta-webos-ports' `purple-presage` recipe with its calling patch) starts this engine as a separate
+process for every call and drives it over stdin/stdout. The `signal-call-media` recipe builds it
+with the `Makefile` here and installs it as `${libexecdir}/signal-call-media`.
 
 ## Files
 
 | file | what |
 |------|------|
-| `srtp_kdf.c` / `srtp_kdf.py` | RingRTC SRTP key derivation (X25519 DH + HKDF-SHA256). **Pre-existing, verified, untouched.** |
-| `srtp_kdf.h` | header exposing `signal_negotiate_srtp_keys()` + `signal_x25519_public_from_private()` to the engine (new; does not modify `srtp_kdf.c`). |
-| `signal_media.c` | the media engine: ICE (libnice) + manual AEAD_AES_256_GCM SRTP + Opus over RTP + ALSA, plus a `--loopback` self-test. |
-| `signal_media.h` | clean C API the presage bridge will call. |
-| `build-signal-media.sh` | cross-compile for ARM; `host` arg builds just the KDF self-test. |
+| `signal_media.c` | the engine: ICE (libnice) + manually keyed AEAD_AES_256_GCM SRTP + Opus over RTP + PulseAudio, the stdin/stdout protocol, and a `--loopback` self-test |
+| `signal_media.h` | its C API |
+| `srtp_kdf.c` / `srtp_kdf.h` | RingRTC SRTP key derivation (X25519 DH + HKDF-SHA256) |
+| `srtp_kdf.py` | the Python reference the KDF was checked against byte for byte |
+| `Makefile` | builds `signal_media`; `make check` runs the loopback self-test |
+| `turn_loopback.c` | a stand-alone TURN test tool from bring-up; not built or installed |
+| `build-*.sh`, `RUNTIME_STATUS.md` | the earlier build and bring-up on the HP TouchPad under legacy webOS (history) |
 
 ## Architecture
 
-Signal 1:1 media is **ICE + AEAD_AES_256_GCM SRTP + Opus — NOT DTLS.** The SRTP master keys come
-from an X25519 DH on the `public_key` inside the offer's `ConnectionParametersV4` (see `srtp_kdf.c`).
-As the **callee/answerer** we DECRYPT the caller with `offer_key/offer_salt` and ENCRYPT ours with
-`answer_key/answer_salt` (both peers derive the identical 88-byte OKM).
+Signal 1:1 media is **ICE + AEAD_AES_256_GCM SRTP + Opus, not DTLS.** The SRTP master keys come from
+an X25519 DH on the `public_key` in the peers' `ConnectionParametersV4` (see `srtp_kdf.c`). As the
+answerer the engine decrypts the caller with `offer_key/offer_salt` and encrypts its own audio with
+`answer_key/answer_salt`; as the caller it is the other way round (both peers derive the same
+88-byte OKM).
 
 One `NiceAgent`, one stream, one RTP component (rtcp-mux), shared by both pipeline branches:
 
 ```
-RX: nicesrc ─ caps(x-srtp) ─ srtpdec ─ caps(x-rtp OPUS) ─ rtpopusdepay ─ opusdec ─ audioconvert ─ alsasink device=voip
-                └ request-key ⇒ offer_key‖offer_salt (aes-256-gcm)
+RX: nicesrc ─ caps(x-srtp) ─ srtpdec ─ caps(x-rtp OPUS) ─ rtpjitterbuffer ─ rtpopusdepay ─ opusdec ─ audioconvert ─ pulsesink device=voipcall
+                └ request-key ⇒ the peer's key‖salt (aes-256-gcm)
 
-TX: alsasrc device=voipsource ─ audioconvert ─ audioresample ─ caps(48k/mono) ─ opusenc ─ rtpopuspay ─ srtpenc ─ nicesink
-                                                                                            key = answer_key‖answer_salt (aes-256-gcm)
+TX: pulsesrc device=webcall ─ audioconvert ─ audioresample ─ caps(48k/mono) ─ opusenc ─ rtpopuspay ─ srtpenc ─ funnel ─ queue ─ nicesink
+                                                                                         our key‖salt (aes-256-gcm) ┘
+    appsrc (RingRTC rtp-data "Accepted", SRTP-encrypted with libsrtp2) ───────────────────────────────────┘
 ```
 
-- **srtpenc** takes the 44-byte master (`key32‖salt12`) via its `key` property, `rtp-cipher`/
-  `rtcp-cipher = aes-256-gcm`, `rtp-auth`/`rtcp-auth = null` (GCM is AEAD).
-- **srtpdec** has no static key property; it fires the `request-key` signal per SSRC and we return a
-  `GstCaps` carrying `srtp-key` (the offer master), `srtp-cipher = aes-256-gcm`, `srtp-auth = null`.
-- **libnice** creates the agent (RFC5245 full ICE, controlled role), sets our + the remote ufrag/pwd,
-  gathers local candidates (emitted back through a callback for the bridge to relay as `IceUpdate`),
-  and accepts remote candidates parsed from standard `candidate:…` SDP strings.
+- **srtpenc** takes the 44-byte master (`key32‖salt12`) via its `key` property, with `rtp-cipher`/
+  `rtcp-cipher = aes-256-gcm` and `rtp-auth`/`rtcp-auth = null` (GCM is AEAD).
+- **srtpdec** fires `request-key` per SSRC and gets caps carrying `srtp-key` and the same cipher.
+- **libnice** runs RFC 5245 ICE with Google's renomination (which RingRTC uses to nominate), STUN
+  binding requests as keepalives (RingRTC's consent freshness), and, when Signal's TURN servers are
+  known, relay candidates only.
+- **Accepted:** RingRTC keeps the caller ringing with media gated until the callee sends an
+  `Accepted` message over its RTP data channel (PT 101, SSRC 0xD). The engine sends it about twice
+  a second once the user answers.
+- **Microphone:** for an incoming call the engine starts when the offer arrives, so ICE is ready when
+  the user answers, but the `pulsesrc` only joins the pipeline on `ACCEPT`: nothing is recorded
+  while the phone rings.
+- **Echo cancellation:** SpeexDSP, on by default; `SIGNAL_MEDIA_AEC=0` turns it off. PulseAudio's
+  call sink and source have no echo canceller of their own.
 
-### webOS audio + audiod (same as Telegram/WhatsApp)
+### Audio routing
 
-- Capture from ALSA `voipsource`, play to `voip` — these route to PulseAudio `pvoip`/`pvoipsource`
-  (the real mic/loudspeaker under the phone scenario). **Not `default`.**
-- The engine fires an optional `audiod_cb(active)` when the pipeline reaches PLAYING / on stop. The
-  bridge (`call.c`, which already owns the `com.palm.signal.call` **private** `LSHandle`) must send,
-  exactly like `wacallm` / Telegram `callLunaSetCallAudio()`:
-  - on active: `palm://com.palm.audio/phone/CallStatusUpdate`
-    `{"lines":[{"state":"active","calls":[{"id":1,"address":"signal","origin":"incoming","video":false,"transport":"com.palm.signal"}]}]}`
-    then `palm://com.palm.audio/phone/setCurrentScenario {"scenario":"phone_back_speaker"}`
-  - on hangup: `palm://com.palm.audio/phone/CallStatusUpdate {"lines":[]}`
-- **CRUCIAL runtime detail (not a build issue):** gst's `alsasrc`/`alsasink` load `libasound`; it must
-  be the **system** `/usr/lib/libasound.so.2`, not the Atlas one on `LD_LIBRARY_PATH` (the Atlas
-  libasound can't resolve `voip`→pulse). Control this at launch with the ALSA config / library path.
+The engine plays to the PulseAudio sink `voipcall` and records from the source `webcall`.
+module-palm-policy routes a stream that names `voipcall` onto the output audiod picked for the call
+and `webcall` onto its input. purple-presage reports the call to audiod itself with
+`palm://com.palm.audio/phone/CallStatusUpdate` (transport `com.palm.signal`) when it becomes active
+and `{"lines":[]}` when it ends; audiod then picks the device (the earpiece first). The engine does
+not choose a scenario.
 
-## Build
+## Protocol
+
+See the comment above `run_ipc()` in `signal_media.c`: `PREPARE`, `RELAY`, `START`, `RCAND`,
+`ACCEPT` and `STOP` in; `PUB`, `CAND`, `AUDIOD`, `READY` and `ERR` out. Keys are hex.
+
+## Build and self-test
 
 ```sh
-cd messaging/signal/calling/media
-./build-signal-media.sh            # cross-compile for ARM -> signal_media, libsignalmedia.a
-./build-signal-media.sh host       # host build of the KDF self-test only -> ./srtp_kdf_host
+make                 # needs pkg-config for gstreamer-1.0, gstreamer-app-1.0, nice, libsrtp2, libcrypto, speexdsp
+make check           # signal_media --loopback
 ```
 
-Toolchain `/home/herrie/x-tools/arm-unknown-linux-gnueabi-gcc125` (gcc 12.5, softfp glibc); GStreamer
-+ libnice + libsrtp2 + opus from the staging sysroot `/home/herrie/webos/wpe/staging-glibc-252` via
-pkg-config. **OpenSSL:** links `libcrypto.so.3` — the same OpenSSL 3.x that the staging
-libnice/libsrtp are built against (Atlas/WPE 2.52 bundles it in its deviceroot). The engine runs
-inside that Atlas GStreamer runtime, so it must match; it is *not* the webOS system 1.1.1w. The KDF
-API is identical on both. Producing:
-
-- `signal_media` — standalone ARM test binary (`./signal_media --loopback`).
-- `libsignalmedia.a` — `srtp_kdf.o` + `signal_media.o` (`-DSIGNAL_MEDIA_NO_MAIN`) for the bridge.
-
-Confirmed NEEDED: `libgst{app,base,reamer}-1.0`, `libnice.so.10`, `libsrtp2.so.1`, `libopus.so.0`,
-`libcrypto.so.3`, glib/gio/gobject — all present in the wpe-252 deviceroot.
-
-## Loopback self-test (primary verifiable deliverable)
-
-`signal_media --loopback` (or `signal_media_loopback_selftest()`) round-trips a test tone entirely
-in-process, no ICE / no ALSA / no device:
+The loopback self-test round-trips a test tone in-process, with no ICE and no audio devices:
 
 ```
 audiotestsrc → audioconvert → audioresample → [48k/mono] → opusenc → rtpopuspay
    → srtpenc(master) → srtpdec(same master via request-key) → rtpopusdepay → opusdec → fakesink
 ```
 
-The 44-byte master is a **real** `AEAD_AES_256_GCM` key from `signal_negotiate_srtp_keys()` (the same
-fixed vector as `srtp_kdf.py --demo`, so you can eyeball it). A pad probe counts decoded Opus frames;
-it prints `PASS` once ≥25 frames decode (≈0.5 s), else `FAIL`/timeout(10 s). This proves the
-SRTP-GCM + RTP + Opus path links and negotiates. **It must be run on device** (or any host with
-gstreamer-1.0 + the srtp/opus/rtp plugins); this build host has no `gstreamer-1.0.pc`.
+The master is a real `AEAD_AES_256_GCM` key from `signal_negotiate_srtp_keys()`. It prints `PASS`
+once 25 frames have decoded (about 0.5 s), or `FAIL` after 10 s. It needs the opus, rtp, srtp and
+audiotestsrc GStreamer elements; libsrtp2 must have its GCM ciphers (built with OpenSSL).
 
-Deploy + run on device:
-```sh
-# ensure the Atlas gst runtime is visible:
-export LD_LIBRARY_PATH=<wpe-252>/lib:$LD_LIBRARY_PATH
-export GST_PLUGIN_PATH=<wpe-252>/lib/gstreamer-1.0
-./signal_media --loopback     # expect: "decoded N Opus frames through SRTP-GCM -> PASS"
-```
+## Not yet verified on LuneOS
 
-## What is verified vs unverified
-
-**Verified (host, this session):**
-- `srtp_kdf.c` cross-checks byte-for-byte with `srtp_kdf.py` (`offer_key=2c6a45c7…`, `answer_key=122de4d5…`).
-- Both build targets cross-compile clean to ARM; all `signal_media_*` symbols exported; deps consistent.
-
-**Built but UNVERIFIED (needs the device, morning):**
-- The loopback pipeline actually decoding frames (caps negotiation between srtpenc↔srtpdec and the
-  `application/x-rtp` OPUS caps is reasoned-out, not run).
-- The live-call pipeline (nicesrc/nicesink binding, ALSA voip routing, real GCM interop with Signal).
-
-## Stubbed / TODO (the precise presage-integration points still needed)
-
-The engine exposes `signal_media_start / add_remote_candidate / stop` + two callbacks. Still to wire
-in `messaging/signal/plugin/purple-presage` (mostly Rust + `call.c`):
-
-1. **Generate our ephemeral X25519 keypair** per call; keep the private for `signal_media_start`,
-   put the public into the Answer.
-2. **Build + send the Answer `ConnectionParametersV4` protobuf opaque** (public_key, our ice_ufrag,
-   ice_pwd, audio codec = Opus, max_bitrate) via a new presage Rust send path
-   (`presage_rust_send_call_answer`) — analogous to the planned `…send_call_hangup`.
-3. **Relay ICE both ways:** decode the peer's `IceUpdate` opaque → `candidate:…` string →
-   `signal_media_add_remote_candidate()`; and take our local candidates from the `cand_cb` →
-   encode as `IceUpdate` opaque → send via presage.
-4. **Lifecycle:** on `CallMessage::Offer` (state incoming, user accepts) call `signal_media_start`
-   with the derived material; on `Hangup`/decline call `signal_media_stop`.
-5. **audiod hook:** implement `audiod_cb` in `call.c` using its existing private `LSHandle` (the two
-   `LSCallOneReply`s above).
-6. **Opus payload type / bitrate:** currently hard-coded `PT=102`; parse the real PT + `max_bitrate`
-   from the offer's `ConnectionParametersV4`.
-7. **TURN relays:** Signal offers include TURN relay candidates; to use a relay we likely also need
-   `nice_agent_set_relay_info()` fed with Signal's TURN servers (host/srflx work without it).
-8. **Runtime libasound:** ensure gst's alsa elements load the system libasound (see audio note).
-
-## Biggest risk
-
-The manual-key SRTP GCM interop and the ALSA `voip`/`voipsource` routing are the two things most
-likely to bite, and neither is verifiable without the device. The loopback test de-risks the
-SRTP-GCM+Opus+RTP half; the ICE half and the ALSA half remain to be proven live.
+The loopback path is the only part tested without a live call. The ICE settings, the Accepted
+message and the pipeline layout come from bring-up against real calls on the HP TouchPad under
+legacy webOS (see `RUNTIME_STATUS.md` and the comments in `signal_media.c`); on LuneOS none of it
+has been through a live call yet.
