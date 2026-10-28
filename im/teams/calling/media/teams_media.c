@@ -1,5 +1,5 @@
 /*
- * teams_media.c - Microsoft Teams (personal/TFL) 1:1 call MEDIA ENGINE for webOS, answerer side.
+ * teams_media.c - Microsoft Teams (personal/TFL) 1:1 call MEDIA ENGINE for LuneOS.
  *
  * Forked from the on-device-proven Signal engine (signal_media.c). Teams consumer calling turns out
  * to offer EXACTLY what that engine already does: AEAD_AES_256_GCM SRTP + Opus (PT 102) + ICE
@@ -9,31 +9,23 @@
  *   - generate our own random TX master and hand it back (base64) for the SDP answer's a=crypto.
  * We also generate our own ICE ufrag/pwd (libnice) and emit them + our candidates for the answer.
  *
- *   RX: nicesrc -> srtpdec(peer master via request-key) -> rtpptdemux --pt 102--> rtpopusdepay -> opusdec -> alsasink device=voip
- *                                                                    `--pt 107--> h264 bridge (see below)
- *   TX: alsasrc device=voipsource -> opusenc -> rtpopuspay(pt) --\
- *       h264 bridge (see below) -----------------------------funnel -> srtpenc(our master) -> nicesink
+ *   RX: nicesrc -> srtpdec(peer master via request-key) -> rtpptdemux --pt 102--> rtpjitterbuffer
+ *       -> rtpopusdepay -> opusdec -> pulsesink device=voipcall
+ *                                                       `--other PTs--> fakesink
+ *   TX: pulsesrc device=webcall -> opusenc -> rtpopuspay -> srtpenc(our master) -> queue -> nicesink
  *
- * H.264 video (BUNDLE'd onto the SAME ICE/SRTP transport+key as audio, PT 107, RFC 6184 FU-A):
- * this process does NOT depacketize/decode H.264 or talk to skypekit/clonk at all - that bridge
- * (h264_rtp.c/voipkit.cpp) now lives in the main plugin process (libteams-personal.so), which has
- * the LS2 access the clonk session needs and, critically, is the ONLY process whose runtime
- * environment can satisfy libpalmgstskype.so's transitive libmedia-clonk/libpbnjson_cpp/
- * liblunaservice dependency chain (that chain needs the OLD system libstdc++/libc; this process's
- * gst-1.20/libnice stack needs wpe-glibc's NEWER libc - no single environment satisfies both, as
- * established by extensive live on-device testing). Instead, this process just relays whole,
- * already-RTP-framed H.264 packets across an extra UNIX-domain-socket hop to/from the plugin:
- *   RX: on_rx_video_sample() forwards raw (post-SRTP-decrypt) video RTP packets, length-prefixed,
- *       to whatever plugin-side client is connected to TM_RELAY_SOCK. No-op if nothing's connected.
- *   TX: raw RTP packets arriving FROM the relay client (already correctly built by the plugin's own
- *       h264_packetize()+header code) are pushed into tx-video-src as-is, joining the shared funnel/
- *       srtpenc/nicesink TX chain.
- * The relay socket listens unconditionally once the pipeline is up (relay_listen_start(), called from
- * tm_run_pipeline()) - there is no STARTVIDEO/STOPVIDEO IPC step; an audio-only call simply never
- * gets a client connection, and the video branches sit idle.
+ * Voice only. The peer BUNDLEs video onto the same ICE/SRTP transport when it has a camera on; those
+ * packets (and RTX) are split off by rtpptdemux and dropped.
+ *
+ * Audio uses the PulseAudio call devices by name: voipcall (playback) and webcall (capture). A stream
+ * that names its sink is routed by palm-policy to the output device for the call (earpiece, speaker,
+ * headset or Bluetooth, as audiod sets it), which the plugin has told audiod about with
+ * phone/CallStatusUpdate.
  *
  * IPC (line protocol over stdin/stdout, driven by teams_calling.c):
- *   in : START <rx_master_b64> <remote_ufrag> <remote_pwd> <pt>
+ *   in : START <rx_master_b64> <remote_ufrag> <remote_pwd> <pt>   (--answer)
+ *        START [pt]                                              (--caller)
+ *        ANSWER <rx_master_b64> <remote_ufrag> <remote_pwd>       (--caller, the peer's answer)
  *        RELAY turn <ip> <port> <user> <pass> <udp|tcp|tls>   (optional; MS-TURN relay)
  *        RELAY stun <host> <port>                             (optional)
  *        RCAND <candidate:... sdp line>                       (a remote ICE candidate; repeatable)
@@ -49,43 +41,33 @@
  *        TXKEY <tx_master_b64>                                (our a=crypto inline key for the answer)
  *        CAND <candidate:... sdp line>                        (our local ICE candidate)
  *        AUDIOD <0|1>
- *        READY | ERR <msg>
+ *        READY | ANSWERED | RESTARTED | ERR <msg>
  *
- * Standalone build also supports --loopback (SRTP-GCM+RTP+Opus round-trip, no ICE/ALSA).
+ * Diagnostics go to stderr (g_message/g_printerr), which the plugin's process passes through. The
+ * SRTP keys and TURN credentials are never logged.
+ *
+ * --loopback runs a self-test: an SRTP-GCM + RTP + Opus round trip, without ICE or audio devices,
+ * with the receive key supplied through srtpdec's request-key as on a call.
  */
 
 #include <gst/gst.h>
-#include <gst/app/gstappsink.h>
-#include <gst/app/gstappsrc.h>
 #include <nice/agent.h>
 #include <glib.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
-#include <unistd.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/mman.h>
+#include <sys/random.h>
 
 /* Opus RTP: 48 kHz. PT is dictated by the peer's offer (Teams uses 102); parsed from START. */
 #define TM_OPUS_CLOCKRATE 48000
 #define TM_OPUS_CHANNELS  1
 #define TM_DEFAULT_PT     102
 
-/* H.264 video RTP: 90 kHz, PT 107 — matches what teams_calling.c's SDP always advertises for
- * rtpmap:107 H264/90000 (both answer and offer), so this is a fixed constant, not negotiated
- * over the IPC protocol the way the audio PT is. */
-#define TM_VIDEO_CLOCKRATE 90000
-#define TM_VIDEO_PT        107
-
-/* UNIX-domain socket the plugin process's teams_video_relay.cpp connects to once video is
- * negotiated. Each direction's wire format is a 2-byte big-endian length prefix followed by exactly
- * one whole RTP packet (12-byte header + payload) - see the top-of-file comment. */
-#define TM_RELAY_SOCK      "/tmp/teams-video-relay.sock"
-#define TM_RELAY_BUF_MAX   2048
+/* The PulseAudio call devices (pulseaudio-distro-conf's webos-virtual-devices.pa). */
+#define TM_PLAYBACK_DEVICE "voipcall"
+#define TM_CAPTURE_DEVICE  "webcall"
 
 #define SRTP_CIPHER_GCM256 "aes-256-gcm"
 #define SRTP_AUTH_NULL     "null"          /* GCM is AEAD -> no separate auth transform */
@@ -102,6 +84,7 @@ typedef struct {
 
     GstElement   *pipeline;
 
+    GMutex        key_lock;     /* rx_master: swapped by RESTART, read by srtpdec's request-key */
     GstBuffer    *rx_master;    /* peer's SRTP master (decrypt RX), 44B */
     GstBuffer    *tx_master;    /* our SRTP master (encrypt TX), 44B */
     int           pt;           /* opus payload type from the offer */
@@ -112,26 +95,7 @@ typedef struct {
     gboolean      audiod_on;
     gboolean      running;
 
-    /* H.264 video: pipeline branches are always built (see build_pipeline()); whether they carry
-     * real data depends purely on whether a plugin-side client is connected to the relay socket
-     * below (see the top-of-file comment - no STARTVIDEO/STOPVIDEO IPC gate needed). */
-    GstElement        *video_appsrc;     /* tx-video-src: pushed from on_relay_client_readable */
-    GstElement        *rx_audio_caps;    /* rx-rtpcaps: ptdemux routing target for the audio PT */
-    GstElement        *rx_video_caps;    /* rx-video-rtpcaps: ptdemux routing target for PT 107 */
-    int                video_pt;         /* TM_VIDEO_PT, set once in tm_start() */
-
-    /* Video RTP relay socket (see TM_RELAY_SOCK). relay_listen_fd/relay_listen_src live for the
-     * whole call; relay_fd/relay_client_src come and go as the plugin connects/disconnects (e.g.
-     * across a renegotiation that drops video mid-call). relay_rx_* track the small read-state
-     * machine in on_relay_client_readable (2-byte length prefix, then that many payload bytes). */
-    int        relay_listen_fd;
-    int        relay_fd;
-    GSource   *relay_listen_src;
-    GSource   *relay_client_src;
-    guint8     relay_rxbuf[TM_RELAY_BUF_MAX];
-    gsize      relay_rx_have;
-    gsize      relay_rx_want;
-    gboolean   relay_rx_have_len;
+    GstElement   *rx_audio_caps;    /* rx-rtpcaps: ptdemux routing target for the audio PT */
 } TeamsMedia;
 
 static TeamsMedia g_tm;
@@ -145,12 +109,6 @@ static int    g_stun_port;
 static TmTurn g_turn[TM_MAX_TURN];
 static int    g_n_turn;
 
-static void tm_trace(const char *msg)
-{
-    FILE *f = fopen("/media/internal/teams-media.log", "a");
-    if (f) { fputs(msg, f); fputc('\n', f); fclose(f); }
-}
-
 /* ------------------------------------------------------------------ helpers ------------------- */
 
 static GstBuffer *master_buffer_from_bytes(const guchar *data, gsize len)
@@ -162,6 +120,34 @@ static GstBuffer *master_buffer_from_bytes(const guchar *data, gsize len)
     memcpy(map.data, data, len < TM_GCM_MASTER_SIZE ? len : TM_GCM_MASTER_SIZE);
     gst_buffer_unmap(buf, &map);
     return buf;
+}
+
+/* Decode a base64 SRTP master (key||salt). NULL if it is too short to be one. */
+static GstBuffer *master_buffer_from_b64(const char *b64)
+{
+    gsize len = 0;
+    guchar *k;
+    GstBuffer *buf = NULL;
+    if (!b64) return NULL;
+    k = g_base64_decode(b64, &len);
+    if (k && len >= 32) buf = master_buffer_from_bytes(k, len);
+    if (k) { memset(k, 0, len); g_free(k); }
+    return buf;
+}
+
+/* Fill buf with len bytes from the kernel CSPRNG. */
+static gboolean random_bytes(guchar *buf, gsize len)
+{
+    gsize got = 0;
+    while (got < len) {
+        ssize_t r = getrandom(buf + got, len - got, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return FALSE;
+        }
+        got += (gsize) r;
+    }
+    return TRUE;
 }
 
 static GstElement *mk(const char *factory, const char *name)
@@ -184,212 +170,31 @@ static GstCaps *on_srtpdec_request_key(GstElement *dec, guint ssrc, gpointer use
 {
     (void)dec;
     TeamsMedia *tm = (TeamsMedia *)user;
+    GstBuffer *key;
     g_message("teams_media: srtpdec request-key ssrc %u (inbound SRTP arriving)", ssrc);
-    if (!tm->rx_master) return NULL;
+    g_mutex_lock(&tm->key_lock);
+    key = tm->rx_master ? gst_buffer_ref(tm->rx_master) : NULL;
+    g_mutex_unlock(&tm->key_lock);
+    if (!key) return NULL;
     GstCaps *caps = gst_caps_new_simple("application/x-srtp",
                                         "srtp-cipher",  G_TYPE_STRING, SRTP_CIPHER_GCM256,
                                         "srtp-auth",    G_TYPE_STRING, SRTP_AUTH_NULL,
                                         "srtcp-cipher", G_TYPE_STRING, SRTP_CIPHER_GCM256,
                                         "srtcp-auth",   G_TYPE_STRING, SRTP_AUTH_NULL, NULL);
-    gst_caps_set_simple(caps, "srtp-key", GST_TYPE_BUFFER, gst_buffer_ref(tm->rx_master), NULL);
+    gst_caps_set_simple(caps, "srtp-key", GST_TYPE_BUFFER, key, NULL);
+    gst_buffer_unref(key);
     return caps;
 }
 
-/* ---- direct qspkd speaker output (bypasses the atlasqspksink element, which fails to activate in
- * the live call pipeline). We take decoded PCM off an appsink and write it straight to qspkd's unix
- * socket: header {magic,format,rate,channels} once, then raw interleaved S16LE. Same wire protocol as
- * libgstatlasqspksink.so; qspkd relays to system PulseAudio -> speaker. One client at a time. ---- */
-#define QSPK_SOCK  "/tmp/qspkd.sock"
-#define QSPK_MAGIC 0x5153504bU
-#define QSPK_FMT_S16LE 0
-struct qspk_hdr { guint32 magic, format, rate, channels; };
-static int      g_qspk_fd = -1;
-static gboolean g_qspk_hdr_sent = FALSE;
-
-static gboolean qspk_send_all(int fd, const void *buf, gsize n)
+/* Replace the RX master (RESTART with a new key). srtpdec picks it up on its next request-key. */
+static void set_rx_master(TeamsMedia *tm, GstBuffer *master)
 {
-    const guint8 *p = buf;
-    while (n) {
-        gssize w = send(fd, p, n, MSG_NOSIGNAL);
-        if (w < 0) { if (errno == EINTR) continue; return FALSE; }
-        p += w; n -= (gsize) w;
-    }
-    return TRUE;
-}
-
-static void qspk_close(void)
-{
-    if (g_qspk_fd >= 0) { close(g_qspk_fd); g_qspk_fd = -1; }
-    g_qspk_hdr_sent = FALSE;
-}
-
-/* appsink "new-sample": pull decoded PCM, lazily connect to qspkd (sending the header from the
- * negotiated caps), then stream the raw samples. Runs on the RX streaming thread. */
-static GstFlowReturn on_rx_sample(GstElement *sink, gpointer user)
-{
-    (void) user;
-    GstSample *sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
-    if (!sample) return GST_FLOW_OK;
-    GstBuffer *buf = gst_sample_get_buffer(sample);
-    GstCaps   *caps = gst_sample_get_caps(sample);
-    GstMapInfo map;
-    if (buf && caps && gst_buffer_map(buf, &map, GST_MAP_READ)) {
-        if (g_qspk_fd < 0) {
-            int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-            struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;
-            g_strlcpy(a.sun_path, QSPK_SOCK, sizeof a.sun_path);
-            if (fd >= 0 && connect(fd, (struct sockaddr *)&a, sizeof a) == 0) {
-                g_qspk_fd = fd; g_qspk_hdr_sent = FALSE;
-                tm_trace("qspk: connected to qspkd");
-            } else { if (fd >= 0) close(fd); tm_trace("qspk: connect FAILED"); }
-        }
-        if (g_qspk_fd >= 0 && !g_qspk_hdr_sent) {
-            GstStructure *s = gst_caps_get_structure(caps, 0);
-            gint rate = 48000, ch = 1;
-            gst_structure_get_int(s, "rate", &rate);
-            gst_structure_get_int(s, "channels", &ch);
-            struct qspk_hdr h = { QSPK_MAGIC, QSPK_FMT_S16LE, (guint32) rate, (guint32) ch };
-            if (qspk_send_all(g_qspk_fd, &h, sizeof h)) {
-                g_qspk_hdr_sent = TRUE;
-                { char t[64]; g_snprintf(t, sizeof t, "qspk: header sent %dch %dHz", ch, rate); tm_trace(t); }
-            } else { qspk_close(); }
-        }
-        if (g_qspk_fd >= 0 && g_qspk_hdr_sent) {
-            if (!qspk_send_all(g_qspk_fd, map.data, map.size)) { tm_trace("qspk: write failed"); qspk_close(); }
-        }
-        gst_buffer_unmap(buf, &map);
-    }
-    gst_sample_unref(sample);
-    return GST_FLOW_OK;
-}
-
-/* ---- direct qmicd mic capture (bypasses the qmicsrc element). The gst qmicsrc element connects fine,
- * but by the time OUR pipeline finishes gst state-change negotiation and its GstPushSrc task first
- * calls create(), qmicd's ring (8 slots x 20ms = 160ms deep) has already wrapped many times over -
- * every backlogged {seq,slot} message in the socket refers to a long-overwritten slot, so every read
- * hits the seqlock retry and exhausts GST_FLOW_ERROR. Reading the socket ourselves, on a dedicated
- * thread started the moment we begin building the pipeline (not gated on GStreamer reaching PLAYING),
- * avoids that backlog and feeds an appsrc instead. Same wire protocol as gstqmicsrc.c. ---- */
-#define QMICD_SHM    "/tmp/qmicd.shm"
-#define QMICD_SOCK   "/tmp/qmicd.sock"
-#define QMICD_MAGIC  0x44494d51u
-#define QMIC_SLOT0_OFF 4096u
-#define QMIC_RATE    16000
-#define QMIC_CH      1
-#define QMIC_CHUNK_BYTES ((QMIC_RATE*QMIC_CH*2*20)/1000)   /* 20ms S16LE mono = 640B */
-#define QMIC_NUM_SLOTS   8
-#define QMIC_CHUNK_NS    (GST_SECOND/(1000/20))
-
-struct qmicd_hdr { guint32 magic, rate, channels, fmt, chunk_bytes, num_slots, seq, pad; };
-struct qmicd_chunk_msg { guint32 seq, slot; };
-
-static int       g_qmic_fd = -1;
-static guint8    *g_qmic_shm = NULL;
-static gsize      g_qmic_shm_sz = 0;
-static GThread   *g_qmic_thread = NULL;
-static volatile gboolean g_qmic_running = FALSE;
-static GstElement *g_qmic_appsrc = NULL;
-
-static gboolean qmic_read_full(int fd, void *buf, gsize n)
-{
-    guint8 *p = buf; gsize got = 0;
-    while (got < n) {
-        ssize_t r = read(fd, p + got, n - got);
-        if (r <= 0) { if (r < 0 && errno == EINTR) continue; return FALSE; }
-        got += (gsize) r;
-    }
-    return TRUE;
-}
-
-static gpointer qmic_reader_thread(gpointer user)
-{
-    (void) user;
-    struct qmicd_hdr *hdr = (struct qmicd_hdr *) g_qmic_shm;
-    guint64 pts = 0;
-    guint chunks = 0; gint16 peak = 0;
-    tm_trace("qmic: reader thread started");
-    while (g_qmic_running) {
-        struct qmicd_chunk_msg msg;
-        guint32 csz, seq_after;
-        const guint8 *src;
-        if (!qmic_read_full(g_qmic_fd, &msg, sizeof msg)) {
-            tm_trace("qmic: qmicd closed connection"); break;
-        }
-        if (hdr->magic != QMICD_MAGIC) { tm_trace("qmic: bad shm magic"); break; }
-        csz = hdr->chunk_bytes;
-        if (!csz || csz > QMIC_CHUNK_BYTES || msg.slot >= hdr->num_slots) {
-            tm_trace("qmic: bad chunk meta"); break;
-        }
-        src = g_qmic_shm + QMIC_SLOT0_OFF + (gsize) msg.slot * QMIC_CHUNK_BYTES;
-        GstBuffer *buf = gst_buffer_new_allocate(NULL, csz, NULL);
-        if (!buf) continue;
-        gst_buffer_fill(buf, 0, src, csz);
-        seq_after = hdr->seq;
-        if (seq_after - msg.seq >= hdr->num_slots) {
-            /* torn read (daemon wrapped onto this slot mid-copy) - drop this one, keep going */
-            gst_buffer_unref(buf);
-            continue;
-        }
-        GST_BUFFER_PTS(buf) = pts;
-        GST_BUFFER_DURATION(buf) = QMIC_CHUNK_NS;
-        pts += QMIC_CHUNK_NS;
-        /* peak-amplitude sanity check: is qmicd handing us real audio or silence? logged 1x/sec. */
-        { GstMapInfo m; if (gst_buffer_map(buf, &m, GST_MAP_READ)) {
-            const gint16 *s = (const gint16 *) m.data; gsize n = m.size / 2;
-            for (gsize i = 0; i < n; i++) { gint16 v = s[i] < 0 ? -s[i] : s[i]; if (v > peak) peak = v; }
-            gst_buffer_unmap(buf, &m); } }
-        if (++chunks >= 50) {   /* 50 * 20ms = 1s */
-            char t[64]; g_snprintf(t, sizeof t, "qmic: 1s peak amplitude = %d/32767", peak);
-            tm_trace(t); chunks = 0; peak = 0;
-        }
-        if (g_qmic_appsrc) {
-            GstFlowReturn fr;
-            g_signal_emit_by_name(g_qmic_appsrc, "push-buffer", buf, &fr);
-        }
-        gst_buffer_unref(buf);
-    }
-    tm_trace("qmic: reader thread exiting");
-    return NULL;
-}
-
-/* Connect + mmap qmicd (starts the daemon's mic recording) and spawn the reader thread. Call as early
- * as possible (before/while the gst pipeline negotiates) so we start draining the ring immediately. */
-static gboolean qmic_start(GstElement *appsrc)
-{
-    int fd, shm_fd;
-    struct sockaddr_un addr;
-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) { tm_trace("qmic: socket() failed"); return FALSE; }
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    g_strlcpy(addr.sun_path, QMICD_SOCK, sizeof addr.sun_path);
-    if (connect(fd, (struct sockaddr *) &addr, sizeof addr) < 0) {
-        tm_trace("qmic: connect FAILED (is qmicd running?)"); close(fd); return FALSE;
-    }
-    shm_fd = open(QMICD_SHM, O_RDONLY);
-    if (shm_fd < 0) { tm_trace("qmic: open shm FAILED"); close(fd); return FALSE; }
-    g_qmic_shm_sz = QMIC_SLOT0_OFF + (gsize) QMIC_NUM_SLOTS * QMIC_CHUNK_BYTES;
-    g_qmic_shm = mmap(NULL, g_qmic_shm_sz, PROT_READ, MAP_SHARED, shm_fd, 0);
-    close(shm_fd);
-    if (g_qmic_shm == MAP_FAILED) { tm_trace("qmic: mmap FAILED"); g_qmic_shm = NULL; close(fd); return FALSE; }
-    g_qmic_fd = fd;
-    g_qmic_appsrc = appsrc;
-    g_qmic_running = TRUE;
-    g_qmic_thread = g_thread_new("qmic-reader", qmic_reader_thread, NULL);
-    tm_trace("qmic: connected to qmicd; mic recording starting");
-    return TRUE;
-}
-
-static void qmic_stop(void)
-{
-    if (!g_qmic_running && g_qmic_fd < 0) return;
-    g_qmic_running = FALSE;
-    if (g_qmic_fd >= 0) { shutdown(g_qmic_fd, SHUT_RDWR); }   /* unblock the reader thread's read() */
-    if (g_qmic_thread) { g_thread_join(g_qmic_thread); g_qmic_thread = NULL; }
-    if (g_qmic_fd >= 0) { close(g_qmic_fd); g_qmic_fd = -1; }
-    if (g_qmic_shm) { munmap(g_qmic_shm, g_qmic_shm_sz); g_qmic_shm = NULL; }
-    g_qmic_appsrc = NULL;
-    tm_trace("qmic: stopped, mic released");
+    GstBuffer *old;
+    g_mutex_lock(&tm->key_lock);
+    old = tm->rx_master;
+    tm->rx_master = master;
+    g_mutex_unlock(&tm->key_lock);
+    if (old) gst_buffer_unref(old);
 }
 
 static GstCaps *opus_rtp_caps(int pt)
@@ -399,145 +204,6 @@ static GstCaps *opus_rtp_caps(int pt)
                                "clock-rate",    G_TYPE_INT,    TM_OPUS_CLOCKRATE,
                                "encoding-name", G_TYPE_STRING, "OPUS",
                                "payload",       G_TYPE_INT,    pt, NULL);
-}
-
-static GstCaps *h264_rtp_video_caps(int pt)
-{
-    return gst_caps_new_simple("application/x-rtp",
-                               "media",         G_TYPE_STRING, "video",
-                               "clock-rate",    G_TYPE_INT,    TM_VIDEO_CLOCKRATE,
-                               "encoding-name", G_TYPE_STRING, "H264",
-                               "payload",       G_TYPE_INT,    pt, NULL);
-}
-
-/* ---- Video RTP relay: shuttles whole RTP packets across TM_RELAY_SOCK to/from the plugin
- * process, which now owns the actual H.264 depacketize/packetize and skypekit/clonk bridge (see
- * the top-of-file comment). We never touch RTP semantics here beyond reading the header's first
- * couple of bytes for routing (already done by on_rtpptdemux_new_pt upstream). ---- */
-
-/* appsink "new-sample" on rx-video-appsink: pull one decrypted RTP video packet and forward it,
- * length-prefixed, to the connected relay client (if any - a no-op otherwise, e.g. audio-only
- * calls or before the plugin has connected). Best-effort, non-blocking: a stalled/slow client just
- * drops frames, same policy as the appsink's own drop=TRUE. */
-static GstFlowReturn on_rx_video_sample(GstElement *sink, gpointer user)
-{
-    TeamsMedia *tm = (TeamsMedia *)user;
-    GstSample *sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
-    if (!sample) return GST_FLOW_OK;
-    GstBuffer *buf = gst_sample_get_buffer(sample);
-    GstMapInfo map;
-    if (buf && gst_buffer_map(buf, &map, GST_MAP_READ)) {
-        if (tm->relay_fd >= 0 && map.size >= 12 && map.size <= 0xffff) {
-            guint16 framelen = (guint16)map.size;
-            guint8 lenhdr[2] = { (guint8)(framelen >> 8), (guint8)(framelen & 0xff) };
-            if (send(tm->relay_fd, lenhdr, 2, MSG_NOSIGNAL) == 2)
-                send(tm->relay_fd, map.data, map.size, MSG_NOSIGNAL);
-        }
-        gst_buffer_unmap(buf, &map);
-    }
-    gst_sample_unref(sample);
-    return GST_FLOW_OK;
-}
-
-/* GIOChannel watch on the connected relay client: read whatever's available, accumulating one
- * length-prefixed RTP packet at a time (relay_rx_have/relay_rx_want/relay_rx_have_len track the
- * two-stage state machine). A complete packet is already correctly RTP-framed by the plugin side
- * (h264_packetize + its own header build) - push it into tx-video-src as-is. */
-static gboolean on_relay_client_readable(GIOChannel *ch, GIOCondition cond, gpointer user)
-{
-    TeamsMedia *tm = (TeamsMedia *)user;
-    if (cond & (G_IO_HUP | G_IO_ERR)) {
-        tm_trace("relay: client disconnected");
-        close(tm->relay_fd); tm->relay_fd = -1; tm->relay_client_src = NULL;
-        return FALSE;
-    }
-    gsize got = 0;
-    GIOStatus st = g_io_channel_read_chars(ch, (gchar *)(tm->relay_rxbuf + tm->relay_rx_have),
-                                           tm->relay_rx_want - tm->relay_rx_have, &got, NULL);
-    if (st == G_IO_STATUS_ERROR || (st == G_IO_STATUS_EOF && got == 0)) {
-        tm_trace("relay: client read error/EOF");
-        close(tm->relay_fd); tm->relay_fd = -1; tm->relay_client_src = NULL;
-        return FALSE;
-    }
-    tm->relay_rx_have += got;
-    if (tm->relay_rx_have < tm->relay_rx_want) return TRUE;   /* wait for the rest */
-
-    if (!tm->relay_rx_have_len) {
-        guint16 framelen = (guint16)(((guint)tm->relay_rxbuf[0] << 8) | tm->relay_rxbuf[1]);
-        if (framelen < 12 || framelen > TM_RELAY_BUF_MAX) {
-            tm_trace("relay: bad frame length from client, dropping connection");
-            close(tm->relay_fd); tm->relay_fd = -1; tm->relay_client_src = NULL;
-            return FALSE;
-        }
-        tm->relay_rx_have_len = TRUE;
-        tm->relay_rx_have = 0;
-        tm->relay_rx_want = framelen;
-    } else {
-        if (tm->video_appsrc) {
-            GstBuffer *pkt = gst_buffer_new_and_alloc((guint)tm->relay_rx_want);
-            gst_buffer_fill(pkt, 0, tm->relay_rxbuf, tm->relay_rx_want);
-            GstFlowReturn fr;
-            g_signal_emit_by_name(tm->video_appsrc, "push-buffer", pkt, &fr);
-            gst_buffer_unref(pkt);
-        }
-        tm->relay_rx_have_len = FALSE;
-        tm->relay_rx_have = 0;
-        tm->relay_rx_want = 2;
-    }
-    return TRUE;
-}
-
-/* Listen-socket watch: accept the plugin's connection (replacing any stale prior one - only one
- * call, hence one client, at a time) and start watching it for readability. Stays registered for
- * the whole call so a reconnect (e.g. after a renegotiation drops and re-adds video) works too. */
-static gboolean on_relay_listen_readable(GIOChannel *ch, GIOCondition cond, gpointer user)
-{
-    (void)ch; (void)cond;
-    TeamsMedia *tm = (TeamsMedia *)user;
-    int fd = accept(tm->relay_listen_fd, NULL, NULL);
-    if (fd < 0) return TRUE;
-    if (tm->relay_client_src) { g_source_destroy(tm->relay_client_src); tm->relay_client_src = NULL; }
-    if (tm->relay_fd >= 0) { close(tm->relay_fd); tm->relay_fd = -1; }
-    fcntl(fd, F_SETFL, O_NONBLOCK);
-    tm->relay_fd = fd;
-    tm->relay_rx_have = 0; tm->relay_rx_want = 2; tm->relay_rx_have_len = FALSE;
-    GIOChannel *cch = g_io_channel_unix_new(fd);
-    g_io_channel_set_encoding(cch, NULL, NULL);
-    g_io_channel_set_buffered(cch, FALSE);
-    GSource *src = g_io_create_watch(cch, G_IO_IN | G_IO_HUP | G_IO_ERR);
-    g_source_set_callback(src, (GSourceFunc)on_relay_client_readable, tm, NULL);
-    g_source_attach(src, tm->ctx);
-    g_source_unref(src);
-    tm->relay_client_src = src;
-    g_io_channel_unref(cch);
-    tm_trace("relay: client connected");
-    return TRUE;
-}
-
-/* Bind+listen TM_RELAY_SOCK, unconditionally, for the lifetime of the call. Idle/harmless if the
- * plugin never connects (audio-only calls). Called once from tm_run_pipeline(). */
-static void relay_listen_start(TeamsMedia *tm)
-{
-    unlink(TM_RELAY_SOCK);
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) { tm_trace("relay: socket() failed"); return; }
-    struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;
-    g_strlcpy(a.sun_path, TM_RELAY_SOCK, sizeof a.sun_path);
-    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0 || listen(fd, 1) != 0) {
-        tm_trace("relay: bind/listen failed"); close(fd); return;
-    }
-    fcntl(fd, F_SETFL, O_NONBLOCK);
-    tm->relay_listen_fd = fd;
-    GIOChannel *ch = g_io_channel_unix_new(fd);
-    g_io_channel_set_encoding(ch, NULL, NULL);
-    g_io_channel_set_buffered(ch, FALSE);
-    GSource *src = g_io_create_watch(ch, G_IO_IN);
-    g_source_set_callback(src, (GSourceFunc)on_relay_listen_readable, tm, NULL);
-    g_source_attach(src, tm->ctx);
-    g_source_unref(src);
-    tm->relay_listen_src = src;
-    g_io_channel_unref(ch);
-    tm_trace("relay: listening");
 }
 
 /* ------------------------------------------------------------------ bus ------------------------ */
@@ -552,8 +218,6 @@ static gboolean on_bus(GstBus *bus, GstMessage *msg, gpointer user)
             gst_message_parse_error(msg, &err, &dbg);
             g_printerr("teams_media: pipeline ERROR from %s: %s (%s)\n",
                        GST_OBJECT_NAME(msg->src), err ? err->message : "?", dbg ? dbg : "");
-            { char t[1024]; g_snprintf(t, sizeof t, "PIPELINE ERROR %s: %s | dbg=%s",
-                GST_OBJECT_NAME(msg->src), err ? err->message : "?", dbg ? dbg : "(none)"); tm_trace(t); }
             if (err) g_error_free(err);
             g_free(dbg);
             break;
@@ -561,8 +225,8 @@ static gboolean on_bus(GstBus *bus, GstMessage *msg, gpointer user)
         case GST_MESSAGE_WARNING: {
             GError *err = NULL; gchar *dbg = NULL;
             gst_message_parse_warning(msg, &err, &dbg);
-            { char t[1024]; g_snprintf(t, sizeof t, "PIPELINE WARN %s: %s | dbg=%s",
-                GST_OBJECT_NAME(msg->src), err ? err->message : "?", dbg ? dbg : "(none)"); tm_trace(t); }
+            g_printerr("teams_media: pipeline WARNING from %s: %s (%s)\n",
+                       GST_OBJECT_NAME(msg->src), err ? err->message : "?", dbg ? dbg : "");
             if (err) g_error_free(err);
             g_free(dbg);
             break;
@@ -572,7 +236,6 @@ static gboolean on_bus(GstBus *bus, GstMessage *msg, gpointer user)
                 GstState o, n; gst_message_parse_state_changed(msg, &o, &n, NULL);
                 if (n == GST_STATE_PLAYING && !tm->audiod_on) {
                     g_message("teams_media: pipeline PLAYING");
-                    tm_trace("pipeline PLAYING");
                     tm->audiod_on = TRUE;
                     if (tm->audiod_cb) tm->audiod_cb(1);
                 }
@@ -592,20 +255,18 @@ static void on_nice_candidate(NiceAgent *agent, NiceCandidate *cand, gpointer us
     if (sdp) {
         const char *bare = (strncmp(sdp, "a=", 2) == 0) ? sdp + 2 : sdp;
         g_message("teams_media: LOCAL candidate -> %s", bare);
-        { char t[320]; g_snprintf(t, sizeof t, "LOCAL cand: %.280s", bare); tm_trace(t); }
         if (tm->cand_cb) tm->cand_cb(bare);
         g_free(sdp);
     }
 }
 
 static void on_nice_gathering_done(NiceAgent *agent, guint stream_id, gpointer user)
-{ (void)agent;(void)stream_id;(void)user; g_message("teams_media: ICE gathering done"); tm_trace("ICE gathering done"); }
+{ (void)agent;(void)stream_id;(void)user; g_message("teams_media: ICE gathering done"); }
 
 static void on_nice_state(NiceAgent *agent, guint stream_id, guint cid, guint state, gpointer user)
 {
     (void)user;
     g_message("teams_media: ICE state -> %s", nice_component_state_to_string(state));
-    { char t[96]; g_snprintf(t, sizeof t, "ICE state %s", nice_component_state_to_string(state)); tm_trace(t); }
     if (state == NICE_COMPONENT_STATE_CONNECTED || state == NICE_COMPONENT_STATE_READY) {
         NiceCandidate *lc = NULL, *rc = NULL;
         if (nice_agent_get_selected_pair(agent, stream_id, cid, &lc, &rc) && lc && rc) {
@@ -622,7 +283,6 @@ static void on_nice_state(NiceAgent *agent, guint stream_id, guint cid, guint st
  * controlling = TRUE for the CALLER (outgoing), FALSE for the answerer (incoming). */
 static gboolean build_ice(TeamsMedia *tm, gboolean controlling, const char *remote_ufrag, const char *remote_pwd)
 {
-    tm_trace("build_ice enter");
     /* NICE_COMPATIBILITY_RFC5245 = standard ICE. Teams' MS-ICE is close enough for host/srflx/relay
      * pairing in practice; if MS-specific quirks block it we may need MS-TURN via RELAY. */
     tm->agent = nice_agent_new(tm->ctx, NICE_COMPATIBILITY_RFC5245);
@@ -635,7 +295,6 @@ static gboolean build_ice(TeamsMedia *tm, gboolean controlling, const char *remo
      * but never nominates it without this -> ICE goes connecting -> FAILED (exactly our symptom).
      * libnice 0.1.21 implements it behind support-renomination (defaults FALSE). Enable it. */
     g_object_set(tm->agent, "support-renomination", TRUE, NULL);
-    tm_trace("build_ice: support-renomination enabled");
 
     if (g_stun_port)
         g_object_set(tm->agent, "stun-server", g_stun_host, "stun-server-port", (guint)g_stun_port, NULL);
@@ -668,27 +327,24 @@ static gboolean build_ice(TeamsMedia *tm, gboolean controlling, const char *remo
 
 /* ------------------------------------------------------------------ pipeline ------------------- */
 
-/* rtpptdemux "pad-added": one static-in-effect src pad appears the first time each payload type is
- * seen on the decrypted RTP stream (BUNDLE'd audio+video share one srtpdec/ICE component, split
- * here). Pad names are "src_%u" where %u is the payload type. Route the audio PT to the existing
- * Opus chain, the video PT to the new H.264 bridge, and anything else (e.g. rtx PT 99 — no
- * RTX/NACK/PLI handling in this build) to a fresh fakesink so it doesn't stall the demux. */
+/* rtpptdemux "pad-added": a src pad appears the first time each payload type is seen on the
+ * decrypted RTP stream (the peer BUNDLEs audio, video and RTX onto one srtpdec/ICE component).
+ * Pad names are "src_%u" where %u is the payload type. Route the audio PT to the Opus chain and
+ * anything else to a fresh fakesink so it doesn't stall the demux. */
 static void on_rtpptdemux_new_pt(GstElement *demux, GstPad *pad, gpointer user)
 {
     (void)demux;
     TeamsMedia *tm = (TeamsMedia *)user;
     guint pt = 0;
     if (sscanf(GST_PAD_NAME(pad), "src_%u", &pt) != 1) {
-        tm_trace("ptdemux: pad-added with unparsable name, ignoring"); return;
+        g_printerr("teams_media: ptdemux pad-added with unparsable name %s\n", GST_PAD_NAME(pad));
+        return;
     }
 
-    GstElement *target = NULL;
-    if ((int)pt == tm->pt)         target = tm->rx_audio_caps;
-    else if ((int)pt == tm->video_pt) target = tm->rx_video_caps;
-
+    gboolean audio = (int)pt == tm->pt;
     GstPad *sink = NULL;
-    if (target) {
-        sink = gst_element_get_static_pad(target, "sink");
+    if (audio) {
+        sink = gst_element_get_static_pad(tm->rx_audio_caps, "sink");
     } else {
         GstElement *fs = mk("fakesink", NULL);
         if (fs) {
@@ -701,12 +357,8 @@ static void on_rtpptdemux_new_pt(GstElement *demux, GstPad *pad, gpointer user)
     if (sink) {
         GstPadLinkReturn r = gst_pad_link(pad, sink);
         gst_object_unref(sink);
-        char t[64]; g_snprintf(t, sizeof t, "ptdemux: PT %u -> %s (%s)", pt,
-            target ? (target == tm->rx_video_caps ? "video" : "audio") : "fakesink",
-            r == GST_PAD_LINK_OK ? "linked" : "LINK FAILED");
-        tm_trace(t);
-    } else {
-        tm_trace("ptdemux: no sink pad available to route to");
+        g_message("teams_media: ptdemux PT %u -> %s (%s)", pt, audio ? "audio" : "dropped",
+                  r == GST_PAD_LINK_OK ? "linked" : "LINK FAILED");
     }
 }
 
@@ -720,109 +372,76 @@ static gboolean build_pipeline(TeamsMedia *tm)
     GstElement *ptdemux = mk("rtpptdemux", "rx-ptdemux");   /* splits BUNDLE'd audio/video by PT */
     GstElement *rtcpfake = mk("fakesink",  "rx-rtcpfake");   /* discards rtcp-mux'd RTCP from srtpdec */
     GstElement *rxrtp = mk("capsfilter",   "rx-rtpcaps");
+    GstElement *rxjb  = mk("rtpjitterbuffer", "rx-jitterbuf"); /* reorder/dejitter + PLC */
     GstElement *depay = mk("rtpopusdepay", "rx-depay");
     GstElement *odec  = mk("opusdec",      "rx-opusdec");
     GstElement *aconv = mk("audioconvert", "rx-aconv");
     GstElement *ares  = mk("audioresample","rx-ares");
-    GstElement *rxs16 = mk("capsfilter",   "rx-s16");   /* force S16LE for the qspkd wire format */
-    /* RX speaker output: appsink -> we write PCM straight to qspkd's socket (on_rx_sample). We use an
-     * appsink instead of the atlasqspksink element because that element fails to ACTIVATE in the live
-     * call pipeline (-> "not-linked"); appsink is a pure software sink that always accepts buffers, and
-     * we control the qspkd socket lifecycle ourselves. qspkd -> system PulseAudio -> speaker. */
-    GstElement *asink = mk("appsink", "rx-appsink");
+    GstElement *asink = mk("pulsesink",    "rx-pulsesink");
 
-    /* RX video: appsink hands raw (post-decrypt) RTP video packets to on_rx_video_sample, which
-     * forwards them as-is (length-prefixed) to the plugin process over the relay socket. No
-     * gstreamer-side H.264 decode here — mediaserver's clonk pipeline (in the plugin process) does
-     * that, via teams_video_relay.cpp. */
-    GstElement *vrtp  = mk("capsfilter", "rx-video-rtpcaps");
-    GstElement *vsink = mk("appsink",    "rx-video-appsink");
-
-    /* TX mic source: appsrc fed by our own qmicd reader thread (qmic_start), NOT the qmicsrc element -
-     * see the qmic_start/qmic_reader_thread comment for why. /media/internal/teams-txtone forces a
-     * diagnostic tone instead (kept for isolating ICE/RX from the mic path). */
-    gboolean tx_tone = g_file_test("/media/internal/teams-txtone", G_FILE_TEST_EXISTS);
-    GstElement *asrc  = mk(tx_tone ? "audiotestsrc" : "appsrc", "tx-src");
+    GstElement *asrc  = mk("pulsesrc",     "tx-pulsesrc");
     GstElement *tconv = mk("audioconvert", "tx-aconv");
     GstElement *tres  = mk("audioresample","tx-ares");
     GstElement *tcap  = mk("capsfilter",   "tx-rawcaps");
     GstElement *oenc  = mk("opusenc",      "tx-opusenc");
     GstElement *pay   = mk("rtpopuspay",   "tx-pay");
     GstElement *senc  = mk("srtpenc",      "tx-srtpenc");
+    GstElement *txq   = mk("queue",        "tx-queue");
     GstElement *nsink = mk("nicesink",     "tx-nicesink");
 
-    /* TX video source: appsrc pushed from on_relay_client_readable (already-RTP-framed packets
-     * arriving from the plugin's teams_video_relay.cpp over the relay socket). Joins the audio TX
-     * branch at funnel before the SHARED srtpenc/nicesink — same BUNDLE transport+key as audio, no
-     * second crypto context needed. */
-    GstElement *vsrc    = mk("appsrc", "tx-video-src");
-    GstElement *funnel  = mk("funnel", "tx-funnel");
-
-    if (!nsrc||!rxcap||!sdec||!ptdemux||!rxrtp||!depay||!odec||!aconv||!ares||!rxs16||!asink||!rtcpfake||
-        !vrtp||!vsink||
-        !asrc||!tconv||!tres||!tcap||!oenc||!pay||!senc||!nsink||!vsrc||!funnel) {
-        if (tm->pipeline) { gst_object_unref(tm->pipeline); tm->pipeline = NULL; } return FALSE;
+    if (!nsrc||!rxcap||!sdec||!ptdemux||!rtcpfake||!rxrtp||!rxjb||!depay||!odec||!aconv||!ares||!asink||
+        !asrc||!tconv||!tres||!tcap||!oenc||!pay||!senc||!txq||!nsink) {
+        GstElement *all[] = { nsrc, rxcap, sdec, ptdemux, rtcpfake, rxrtp, rxjb, depay, odec, aconv,
+                              ares, asink, asrc, tconv, tres, tcap, oenc, pay, senc, txq, nsink };
+        for (gsize i = 0; i < G_N_ELEMENTS(all); i++)
+            if (all[i]) gst_object_unref(gst_object_ref_sink(all[i]));
+        gst_object_unref(tm->pipeline); tm->pipeline = NULL;
+        return FALSE;
     }
     g_object_set(rtcpfake, "sync", FALSE, "async", FALSE, NULL);
 
     g_object_set(nsrc,  "agent", tm->agent, "stream", tm->stream_id, "component", tm->component, NULL);
-    g_object_set(nsink, "agent", tm->agent, "stream", tm->stream_id, "component", tm->component, NULL);
+    /* sync=FALSE async=FALSE: live RTP egress - send as captured, never wait for preroll (as in the
+     * Signal engine). */
+    g_object_set(nsink, "agent", tm->agent, "stream", tm->stream_id, "component", tm->component,
+                 "sync", FALSE, "async", FALSE, NULL);
+    /* A leaky, shallow queue in front of nicesink, as in the Signal engine: it gives nicesink a single
+     * sending thread, and drops old egress buffers instead of back-pressuring the microphone. */
+    g_object_set(txq, "leaky", 2 /*downstream*/, "max-size-time", (guint64)100000000 /*100ms*/,
+                 "max-size-buffers", 0, "max-size-bytes", 0, NULL);
 
     { GstCaps *c = gst_caps_new_empty_simple("application/x-srtp"); g_object_set(rxcap, "caps", c, NULL); gst_caps_unref(c); }
     g_signal_connect(sdec, "request-key", G_CALLBACK(on_srtpdec_request_key), tm);
     g_signal_connect(ptdemux, "pad-added", G_CALLBACK(on_rtpptdemux_new_pt), tm);
     { GstCaps *c = opus_rtp_caps(tm->pt); g_object_set(rxrtp, "caps", c, NULL); gst_caps_unref(c); }
-    { GstCaps *c = gst_caps_new_simple("audio/x-raw", "format", G_TYPE_STRING, "S16LE", NULL);
-      g_object_set(rxs16, "caps", c, NULL); gst_caps_unref(c); }
-    /* appsink: hand every decoded buffer to on_rx_sample (writes to qspkd). No clock sync - qspkd's
-     * blocking pa_simple_write paces us to real time. */
-    g_object_set(asink, "emit-signals", TRUE, "sync", FALSE, "max-buffers", 8, "drop", FALSE, NULL);
-    g_signal_connect(asink, "new-sample", G_CALLBACK(on_rx_sample), &g_tm);
-
-    { GstCaps *c = h264_rtp_video_caps(tm->video_pt); g_object_set(vrtp, "caps", c, NULL); gst_caps_unref(c); }
-    /* drop=TRUE: RTP packet queue, not full frames - bound memory if the relay client (plugin
-     * process) briefly stalls (e.g. mid keyframe-restart); live video wants the latest data, not a
-     * backlog. */
-    g_object_set(vsink, "emit-signals", TRUE, "sync", FALSE, "max-buffers", 64, "drop", TRUE, NULL);
-    g_signal_connect(vsink, "new-sample", G_CALLBACK(on_rx_video_sample), tm);
+    /* 120 ms of reordering and concealment, low-latency mode: the Signal engine's tuning. */
+    g_object_set(rxjb, "latency", 120, "do-lost", TRUE, "mode", 1 /*slave*/, NULL);
+    /* No clock sync on playback: the network paces RX, as with the Signal engine's alsasink. */
+    g_object_set(asink, "device", TM_PLAYBACK_DEVICE, "sync", FALSE, NULL);
+    /* A 200 ms capture ring, so a scheduling hiccup doesn't overrun the microphone, and not the
+     * pipeline clock: as with the Signal engine's alsasrc. */
+    g_object_set(asrc, "device", TM_CAPTURE_DEVICE,
+                 "buffer-time", (gint64)200000, "latency-time", (gint64)20000,
+                 "provide-clock", FALSE, NULL);
 
     { GstCaps *c = gst_caps_new_simple("audio/x-raw", "format", G_TYPE_STRING, "S16LE",
         "rate", G_TYPE_INT, TM_OPUS_CLOCKRATE, "channels", G_TYPE_INT, TM_OPUS_CHANNELS, NULL);
       g_object_set(tcap, "caps", c, NULL); gst_caps_unref(c); }
-    /* audiotestsrc (tx-tone diagnostic) must be live + a quiet sine so Android hears we're sending.
-     * appsrc (real mic) declares the qmicd wire format (16k mono S16LE); qmic_start() feeds it after
-     * linking, from a thread that starts draining qmicd immediately (see qmic_start's comment). */
-    if (tx_tone) {
-        g_object_set(asrc, "is-live", TRUE, "wave", 0 /*sine*/, "freq", 440.0, "volume", 0.2, NULL);
-    } else {
-        GstCaps *c = gst_caps_new_simple("audio/x-raw", "format", G_TYPE_STRING, "S16LE",
-            "rate", G_TYPE_INT, QMIC_RATE, "channels", G_TYPE_INT, QMIC_CH, "layout", G_TYPE_STRING, "interleaved", NULL);
-        g_object_set(asrc, "caps", c, "is-live", TRUE, "format", GST_FORMAT_TIME, "block", FALSE, NULL);
-        gst_caps_unref(c);
-    }
+    g_object_set(oenc, "bitrate", 32000, NULL);
+    gst_util_set_object_arg(G_OBJECT(oenc), "audio-type", "voice");
     g_object_set(pay,  "pt", tm->pt, NULL);
     configure_srtpenc(senc, tm->tx_master);
 
-    /* tx-video-src: RTP packets pushed pre-built (header+payload) by video_rtp_emit, so its caps
-     * only need to describe the RTP session (payload/clock-rate), not a raw media format. */
-    { GstCaps *c = h264_rtp_video_caps(tm->video_pt);
-      g_object_set(vsrc, "caps", c, "is-live", TRUE, "format", GST_FORMAT_TIME, "block", FALSE, NULL);
-      gst_caps_unref(c); }
-
     tm->rx_audio_caps = rxrtp;
-    tm->rx_video_caps = vrtp;
-    tm->video_appsrc  = vsrc;
 
     gst_bin_add_many(GST_BIN(tm->pipeline),
-        nsrc, rxcap, sdec, ptdemux, rxrtp, depay, odec, aconv, ares, rxs16, asink, rtcpfake,
-        vrtp, vsink,
-        asrc, tconv, tres, tcap, oenc, pay, senc, nsink, vsrc, funnel, NULL);
+        nsrc, rxcap, sdec, ptdemux, rtcpfake, rxrtp, rxjb, depay, odec, aconv, ares, asink,
+        asrc, tconv, tres, tcap, oenc, pay, senc, txq, nsink, NULL);
 
     if (!gst_element_link_many(nsrc, rxcap, sdec, NULL)) {
         g_printerr("teams_media: RX link (nsrc..sdec) failed\n"); return FALSE; }
-    /* srtpdec has STATIC "always" pads rtp_src/rtcp_src (proven below by the rtcp_src handling,
-     * unchanged from before this edit). Link rtp_src to rtpptdemux explicitly rather than via
-     * gst_element_link (which would be ambiguous between sdec's two src pads). */
+    /* srtpdec has STATIC "always" pads rtp_src/rtcp_src. Link rtp_src to rtpptdemux explicitly
+     * rather than via gst_element_link (which would be ambiguous between sdec's two src pads). */
     { GstPad *rtp_src = gst_element_get_static_pad(sdec, "rtp_src");
       GstPad *demux_sink = gst_element_get_static_pad(ptdemux, "sink");
       gboolean ok = rtp_src && demux_sink && gst_pad_link(rtp_src, demux_sink) == GST_PAD_LINK_OK;
@@ -830,34 +449,23 @@ static gboolean build_pipeline(TeamsMedia *tm)
       if (demux_sink) gst_object_unref(demux_sink);
       if (!ok) { g_printerr("teams_media: sdec.rtp_src -> ptdemux.sink link failed\n"); return FALSE; } }
     /* ptdemux's src pads appear dynamically (on_rtpptdemux_new_pt), one per payload type actually
-     * seen on the wire - the audio/video branches below just wait, already built+added to the bin. */
-    if (!gst_element_link_many(rxrtp, depay, odec, aconv, ares, rxs16, asink, NULL)) {
+     * seen on the wire - the audio branch below just waits, already built+added to the bin. */
+    if (!gst_element_link_many(rxrtp, rxjb, depay, odec, aconv, ares, asink, NULL)) {
         g_printerr("teams_media: RX audio link failed\n"); return FALSE; }
-    if (!gst_element_link(vrtp, vsink)) {
-        g_printerr("teams_media: RX video link failed\n"); return FALSE; }
-    /* srtpdec has a STATIC "always" rtcp_src pad (rtcp-mux'd RTCP, decrypted). Nothing above touched
-     * it, so it stays unlinked -> its push returns NOT_LINKED and kills the RX chain. Drain it to the
-     * fakesink explicitly (get_static_pad, since it exists at creation - no pad-added). */
+    /* srtpdec's rtcp_src (rtcp-mux'd RTCP, decrypted) would return NOT_LINKED and kill the RX chain:
+     * drain it into a fakesink. */
     { GstPad *rtcp = gst_element_get_static_pad(sdec, "rtcp_src");
       GstPad *fsink = gst_element_get_static_pad(rtcpfake, "sink");
-      if (rtcp && fsink)
-          tm_trace(gst_pad_link(rtcp, fsink) == GST_PAD_LINK_OK ? "rtcp_src -> fakesink linked"
-                                                                : "rtcp_src -> fakesink link FAILED");
-      else tm_trace("rtcp_src/fakesink pad missing");
+      gboolean ok = rtcp && fsink && gst_pad_link(rtcp, fsink) == GST_PAD_LINK_OK;
       if (rtcp) gst_object_unref(rtcp);
-      if (fsink) gst_object_unref(fsink); }
-    if (!gst_element_link_many(asrc, tconv, tres, tcap, oenc, pay, NULL)) {
+      if (fsink) gst_object_unref(fsink);
+      if (!ok) { g_printerr("teams_media: sdec.rtcp_src -> fakesink link failed\n"); return FALSE; } }
+    if (!gst_element_link_many(asrc, tconv, tres, tcap, oenc, pay, senc, txq, nsink, NULL)) {
         g_printerr("teams_media: TX audio link failed\n"); return FALSE; }
-    /* pay (audio) and vsrc (video) both feed funnel's request sink pads; funnel's single src feeds
-     * the ONE shared srtpenc/nicesink (same BUNDLE transport+key for both streams). */
-    if (!gst_element_link(pay, funnel) || !gst_element_link(vsrc, funnel) ||
-        !gst_element_link(funnel, senc) || !gst_element_link(senc, nsink)) {
-        g_printerr("teams_media: TX funnel/srtpenc/nicesink link failed\n"); return FALSE; }
-    if (!tx_tone) qmic_start(asrc);   /* begin draining qmicd now, ahead of PLAYING, to avoid backlog */
 
     GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(tm->pipeline));
     GSource *src = gst_bus_create_watch(bus);
-    g_source_set_callback(src, (GSourceFunc)on_bus, tm, NULL);
+    g_source_set_callback(src, G_SOURCE_FUNC(on_bus), tm, NULL);
     g_source_attach(src, tm->ctx);
     g_source_unref(src);
     gst_object_unref(bus);
@@ -878,27 +486,27 @@ static void tm_init(void)
     if (g_once_init_enter(&g_inited)) { gst_init(NULL, NULL); g_once_init_leave(&g_inited, 1); }
 }
 
-/* Start the engine. rx_master_b64 = peer's SRTP key from the offer's a=crypto. Generates our TX key
- * (returned via *out_txkey_b64, caller frees) and uses libnice-generated local creds (returned via
- * *out_ufrag/*out_pwd, caller frees). */
-static gboolean g_is_caller = FALSE;
-
 /* Bring the pipeline up (needs rx_master set). Shared by the answerer path and, for the caller, by
  * tm_apply_answer once the peer's answer arrives. */
 static int tm_run_pipeline(void)
 {
-    if (!build_pipeline(&g_tm)) return -1;
+    if (g_tm.pipeline) return 0;   /* a repeated ANSWER: already running */
+    if (!build_pipeline(&g_tm)) {
+        if (g_tm.pipeline) { gst_object_unref(g_tm.pipeline); g_tm.pipeline = NULL; }
+        return -1;
+    }
     if (gst_element_set_state(g_tm.pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
         g_printerr("teams_media: set PLAYING failed\n"); return -1;
     }
-    relay_listen_start(&g_tm);
     if (!g_tm.thread) { g_tm.running = TRUE; g_tm.thread = g_thread_new("teams-media", media_thread, &g_tm); }
     return 0;
 }
 
 /* is_caller=0 (answerer): rx_master from the OFFER, pipeline starts now.
  * is_caller=1 (caller):   rx_master_b64/remote_* are NULL; we generate the TX key + local ICE and
- *                         emit them for our OFFER, but DEFER the pipeline until tm_apply_answer(). */
+ *                         emit them for our OFFER, but DEFER the pipeline until tm_apply_answer().
+ * Our TX key is returned via *out_txkey_b64 and our libnice-generated local creds via
+ * *out_ufrag and *out_pwd; the caller frees them. */
 static int tm_start(int is_caller, const char *rx_master_b64, const char *remote_ufrag,
                     const char *remote_pwd, int pt,
                     void (*cand_cb)(const char*), void (*audiod_cb)(int),
@@ -906,26 +514,25 @@ static int tm_start(int is_caller, const char *rx_master_b64, const char *remote
 {
     tm_init();
     memset(&g_tm, 0, sizeof g_tm);
+    g_mutex_init(&g_tm.key_lock);
     g_tm.cand_cb = cand_cb; g_tm.audiod_cb = audiod_cb;
     g_tm.pt = pt > 0 ? pt : TM_DEFAULT_PT;
-    g_tm.video_pt = TM_VIDEO_PT;
-    g_tm.relay_listen_fd = -1;   /* memset above leaves these 0, which is a valid fd (stdin) */
-    g_tm.relay_fd = -1;
-    g_is_caller = is_caller ? TRUE : FALSE;
 
     if (!is_caller) {
-        gsize rxlen = 0;
-        guchar *rxk = g_base64_decode(rx_master_b64, &rxlen);
-        if (!rxk || rxlen < 32) { g_free(rxk); g_printerr("teams_media: bad rx master\n"); return -1; }
-        g_tm.rx_master = master_buffer_from_bytes(rxk, rxlen);
-        g_free(rxk);
+        g_tm.rx_master = master_buffer_from_b64(rx_master_b64);
+        if (!g_tm.rx_master) { g_printerr("teams_media: bad rx master\n"); return -1; }
     }
 
     /* TX master: 44 random bytes, emitted as base64 for our a=crypto (offer or answer). */
     guchar txk[TM_GCM_MASTER_SIZE];
-    for (int i = 0; i < TM_GCM_MASTER_SIZE; i++) txk[i] = (guchar)(g_random_int() & 0xff);
+    if (!random_bytes(txk, sizeof txk)) {
+        g_printerr("teams_media: no random bytes for the SRTP key: %s\n", g_strerror(errno));
+        return -1;
+    }
     g_tm.tx_master = master_buffer_from_bytes(txk, TM_GCM_MASTER_SIZE);
     if (out_txkey_b64) *out_txkey_b64 = g_base64_encode(txk, TM_GCM_MASTER_SIZE);
+    memset(txk, 0, sizeof txk);
+    if (!g_tm.tx_master) return -1;
 
     g_tm.ctx  = g_main_context_new();
     g_tm.loop = g_main_loop_new(g_tm.ctx, FALSE);
@@ -951,15 +558,14 @@ static int tm_start(int is_caller, const char *rx_master_b64, const char *remote
  * remote ICE creds, and bring the pipeline up. */
 static int tm_apply_answer(const char *rx_master_b64, const char *remote_ufrag, const char *remote_pwd)
 {
-    gsize rxlen = 0; guchar *rxk;
+    GstBuffer *master;
     if (!g_tm.agent) return -1;
-    rxk = g_base64_decode(rx_master_b64, &rxlen);
-    if (!rxk || rxlen < 32) { g_free(rxk); tm_trace("apply_answer: bad rx master"); return -1; }
-    g_tm.rx_master = master_buffer_from_bytes(rxk, rxlen);
-    g_free(rxk);
+    master = master_buffer_from_b64(rx_master_b64);
+    if (!master) { g_printerr("teams_media: apply_answer: bad rx master\n"); return -1; }
+    set_rx_master(&g_tm, master);
     if (remote_ufrag && remote_pwd)
         nice_agent_set_remote_credentials(g_tm.agent, g_tm.stream_id, remote_ufrag, remote_pwd);
-    tm_trace("apply_answer: rx key + remote creds set, starting pipeline");
+    g_message("teams_media: answer applied, starting pipeline");
     return tm_run_pipeline();
 }
 
@@ -975,39 +581,32 @@ static int tm_add_remote_candidate(const char *sdp_candidate)
     int added = nice_agent_set_remote_candidates(g_tm.agent, g_tm.stream_id, g_tm.component, l);
     g_slist_free(l); nice_candidate_free(c);
     g_message("teams_media: REMOTE candidate added=%d -> %s", added, sdp_candidate);
-    { char t[320]; g_snprintf(t, sizeof t, "REMOTE cand added=%d: %.270s", added, sdp_candidate); tm_trace(t); }
     return added > 0 ? 0 : -1;
 }
 
+/* Tear down whatever tm_start() set up, also after it failed half-way. */
 static void tm_stop(void)
 {
-    if (!g_tm.running) return;
     g_tm.running = FALSE;
-    qmic_stop();    /* stop the mic reader BEFORE the pipeline (it pushes into the appsrc) */
-    /* Tear down the relay socket before the pipeline (its handlers touch video_appsrc/relay_fd). */
-    if (g_tm.relay_client_src) { g_source_destroy(g_tm.relay_client_src); g_tm.relay_client_src = NULL; }
-    if (g_tm.relay_fd >= 0) { close(g_tm.relay_fd); g_tm.relay_fd = -1; }
-    if (g_tm.relay_listen_src) { g_source_destroy(g_tm.relay_listen_src); g_tm.relay_listen_src = NULL; }
-    if (g_tm.relay_listen_fd >= 0) { close(g_tm.relay_listen_fd); g_tm.relay_listen_fd = -1; }
-    unlink(TM_RELAY_SOCK);
     if (g_tm.pipeline) gst_element_set_state(g_tm.pipeline, GST_STATE_NULL);
-    qspk_close();   /* release the qspkd socket (one client at a time) */
     if (g_tm.audiod_on && g_tm.audiod_cb) g_tm.audiod_cb(0);
     g_tm.audiod_on = FALSE;
     if (g_tm.loop) g_main_loop_quit(g_tm.loop);
     if (g_tm.thread) { g_thread_join(g_tm.thread); g_tm.thread = NULL; }
     if (g_tm.pipeline) { gst_object_unref(g_tm.pipeline); g_tm.pipeline = NULL; }
     if (g_tm.agent) { g_object_unref(g_tm.agent); g_tm.agent = NULL; }
-    if (g_tm.rx_master) { gst_buffer_unref(g_tm.rx_master); g_tm.rx_master = NULL; }
+    set_rx_master(&g_tm, NULL);
     if (g_tm.tx_master) { gst_buffer_unref(g_tm.tx_master); g_tm.tx_master = NULL; }
     if (g_tm.loop) { g_main_loop_unref(g_tm.loop); g_tm.loop = NULL; }
     if (g_tm.ctx) { g_main_context_unref(g_tm.ctx); g_tm.ctx = NULL; }
+    g_mutex_clear(&g_tm.key_lock);
 }
 
 /* ------------------------------------------------------------------ IPC ------------------------ */
 #ifndef TEAMS_MEDIA_NO_MAIN
 
 static GMutex g_out_lock;
+static void emit(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
 static void emit(const char *fmt, ...)
 {
     va_list ap; va_start(ap, fmt);
@@ -1016,6 +615,10 @@ static void emit(const char *fmt, ...)
 }
 static void ipc_cand(const char *sdp)  { emit("CAND %s\n", sdp); }
 static void ipc_audiod(int active)     { emit("AUDIOD %d\n", active ? 1 : 0); }
+
+/* Wipe a line or string that carried key material. explicit_bzero, because a plain memset right
+ * before a free can be dropped as a dead store. */
+static void wipe(char *s, size_t n) { explicit_bzero(s, n); }
 
 static int run_ipc(int is_caller)
 {
@@ -1045,6 +648,7 @@ static int run_ipc(int is_caller)
                             : (tr && !strcmp(tr,"tls")) ? NICE_RELAY_TYPE_TURN_TLS : NICE_RELAY_TYPE_TURN_UDP;
                 }
             }
+            wipe(line, sizeof line);
         } else if (strncmp(line, "START", 5) == 0) {
             if (started) { emit("ERR already-started\n"); continue; }
             char *sp = NULL; int rc; gchar *uf = NULL, *pw = NULL, *txk = NULL;
@@ -1060,15 +664,21 @@ static int run_ipc(int is_caller)
                 char *ruf = strtok_r(NULL, " ", &sp);
                 char *rpw = strtok_r(NULL, " ", &sp);
                 char *pts = strtok_r(NULL, " ", &sp);
-                if (!rxk || !ruf || !rpw) { emit("ERR start-missing-fields\n"); continue; }
+                if (!rxk || !ruf || !rpw) { wipe(line, sizeof line); emit("ERR start-missing-fields\n"); continue; }
                 rc = tm_start(0, rxk, ruf, rpw, pts ? atoi(pts) : TM_DEFAULT_PT,
                               ipc_cand, ipc_audiod, &uf, &pw, &txk);
             }
-            if (rc != 0) { emit("ERR start-failed\n"); return 1; }
+            wipe(line, sizeof line);
+            if (rc != 0) {
+                emit("ERR start-failed\n");
+                g_free(uf); g_free(pw); if (txk) { wipe(txk, strlen(txk)); g_free(txk); }
+                tm_stop();
+                return 1;
+            }
             emit("UFRAG %s\n", uf ? uf : "");
             emit("PWD %s\n",   pw ? pw : "");
             emit("TXKEY %s\n", txk ? txk : "");
-            g_free(uf); g_free(pw); g_free(txk);
+            g_free(uf); g_free(pw); if (txk) { wipe(txk, strlen(txk)); g_free(txk); }
             started = 1;
             emit("READY\n");
         } else if (strncmp(line, "ANSWER ", 7) == 0) {
@@ -1077,8 +687,11 @@ static int run_ipc(int is_caller)
             char *rxk = strtok_r(line + 7, " ", &sp);
             char *ruf = strtok_r(NULL, " ", &sp);
             char *rpw = strtok_r(NULL, " ", &sp);
-            if (rxk) { tm_apply_answer(rxk, ruf, rpw); emit("ANSWERED\n"); }
-            else emit("ERR answer-missing-fields\n");
+            int rc = (started && rxk) ? tm_apply_answer(rxk, ruf, rpw) : -1;
+            wipe(line, sizeof line);
+            if (!started || !rxk) emit("ERR answer-missing-fields\n");
+            else if (rc != 0) emit("ERR answer-failed\n");
+            else emit("ANSWERED\n");
         } else if (strncmp(line, "RCAND ", 6) == 0) {
             if (!started) { emit("ERR rcand-before-start\n"); continue; }
             tm_add_remote_candidate(line + 6);
@@ -1107,18 +720,17 @@ static int run_ipc(int is_caller)
             char *rxk = strtok_r(line + 8, " ", &sp);
             char *ruf = strtok_r(NULL, " ", &sp);
             char *rpw = strtok_r(NULL, " ", &sp);
-            if (!started || !g_tm.agent || !ruf || !rpw) { emit("ERR restart-missing-fields\n"); continue; }
+            gboolean new_key = FALSE;
+            if (!started || !g_tm.agent || !ruf || !rpw) {
+                wipe(line, sizeof line);
+                emit("ERR restart-missing-fields\n"); continue;
+            }
             if (rxk && strcmp(rxk, "-") != 0) {
-                gsize rxlen = 0;
-                guchar *k = g_base64_decode(rxk, &rxlen);
-                if (k && rxlen >= 32) {
-                    GstBuffer *nb = master_buffer_from_bytes(k, rxlen);
-                    if (g_tm.rx_master) gst_buffer_unref(g_tm.rx_master);
-                    g_tm.rx_master = nb;
-                }
-                g_free(k);
+                GstBuffer *nb = master_buffer_from_b64(rxk);
+                if (nb) { set_rx_master(&g_tm, nb); new_key = TRUE; }
             }
             if (!nice_agent_restart_stream(g_tm.agent, g_tm.stream_id)) {
+                wipe(line, sizeof line);
                 emit("ERR restart-stream-failed\n"); continue;
             }
             { gchar *uf = NULL, *pw = NULL;
@@ -1127,8 +739,9 @@ static int run_ipc(int is_caller)
               emit("PWD %s\n",   pw ? pw : "");
               g_free(uf); g_free(pw); }
             nice_agent_set_remote_credentials(g_tm.agent, g_tm.stream_id, ruf, rpw);
+            wipe(line, sizeof line);
             g_message("teams_media: ICE restart - stream reset, new local+remote creds applied%s",
-                      (rxk && strcmp(rxk, "-") != 0) ? " (+ new rx key)" : "");
+                      new_key ? " (+ new rx key)" : "");
             emit("RESTARTED\n");
         } else if (!strcmp(line, "STOP")) {
             break;
@@ -1141,9 +754,56 @@ static int run_ipc(int is_caller)
 }
 
 /* ------------------------------------------------------------------ loopback ------------------- */
+
+/* Counts the Opus frames that came out of the decoder, i.e. made it through SRTP-GCM both ways. */
+static GstPadProbeReturn count_buffers(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    (void)pad; (void)info;
+    g_atomic_int_inc((gint *)user);
+    return GST_PAD_PROBE_OK;
+}
+
+static gboolean loopback_bus(GstBus *bus, GstMessage *msg, gpointer user)
+{
+    (void)bus;
+    GMainLoop *loop = user;
+    if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+        GError *err = NULL; gchar *dbg = NULL;
+        gst_message_parse_error(msg, &err, &dbg);
+        g_printerr("[loopback] ERROR from %s: %s\n", GST_OBJECT_NAME(msg->src), err ? err->message : "?");
+        if (err) g_error_free(err);
+        g_free(dbg);
+        g_main_loop_quit(loop);
+    } else if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_EOS) {
+        g_main_loop_quit(loop);
+    }
+    return TRUE;
+}
+
+/* srtpenc puts its key in its output caps, and srtpdec would take it from there. On a call the
+ * caps carry no key and srtpdec asks for it with request-key, so the loopback strips the key to
+ * test that path. */
+static GstPadProbeReturn strip_srtp_key(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    GstEvent *ev = GST_PAD_PROBE_INFO_EVENT(info);
+    (void)pad; (void)user;
+    if (GST_EVENT_TYPE(ev) == GST_EVENT_CAPS) {
+        GstCaps *caps;
+        gst_event_parse_caps(ev, &caps);
+        caps = gst_caps_copy(caps);
+        gst_structure_remove_fields(gst_caps_get_structure(caps, 0), "srtp-key", "srtp-cipher",
+                                    "srtp-auth", "srtcp-cipher", "srtcp-auth", "mki", NULL);
+        gst_event_unref(ev);
+        GST_PAD_PROBE_INFO_DATA(info) = gst_event_new_caps(caps);
+        gst_caps_unref(caps);
+    }
+    return GST_PAD_PROBE_OK;
+}
+
 static int loopback(void)
 {
     tm_init();
+    g_mutex_init(&g_tm.key_lock);
     guchar k[TM_GCM_MASTER_SIZE]; for (int i=0;i<TM_GCM_MASTER_SIZE;i++) k[i]=(guchar)(i+1);
     GstBuffer *master = master_buffer_from_bytes(k, TM_GCM_MASTER_SIZE);
     GMainLoop *loop = g_main_loop_new(NULL, FALSE);
@@ -1152,9 +812,11 @@ static int loopback(void)
         *caps=mk("capsfilter","cf"),*oenc=mk("opusenc","oe"),*pay=mk("rtpopuspay","p"),
         *senc=mk("srtpenc","se"),*sdec=mk("srtpdec","sd"),*rxc=mk("capsfilter","rc"),
         *depay=mk("rtpopusdepay","dp"),*odec=mk("opusdec","od"),*sink=mk("fakesink","fs");
-    if (!pipe||!src||!conv||!res||!caps||!oenc||!pay||!senc||!sdec||!rxc||!depay||!odec||!sink) {
+    gint decoded = 0;
+    int rc = 0;
+    if (!master||!pipe||!src||!conv||!res||!caps||!oenc||!pay||!senc||!sdec||!rxc||!depay||!odec||!sink) {
         g_printerr("[loopback] missing element(s)\n"); return 3; }
-    g_object_set(src, "is-live", TRUE, "num-buffers", 200, NULL);
+    g_object_set(src, "num-buffers", 200, "samplesperbuffer", 480, NULL);   /* 10 ms at 48 kHz */
     { GstCaps *c=gst_caps_new_simple("audio/x-raw","format",G_TYPE_STRING,"S16LE","rate",G_TYPE_INT,TM_OPUS_CLOCKRATE,"channels",G_TYPE_INT,TM_OPUS_CHANNELS,NULL);
       g_object_set(caps,"caps",c,NULL); gst_caps_unref(c); }
     g_object_set(pay,"pt",TM_DEFAULT_PT,NULL);
@@ -1166,55 +828,42 @@ static int loopback(void)
     gst_bin_add_many(GST_BIN(pipe),src,conv,res,caps,oenc,pay,senc,sdec,rxc,depay,odec,sink,NULL);
     if (!gst_element_link_many(src,conv,res,caps,oenc,pay,senc,NULL)||
         !gst_element_link_many(senc,sdec,NULL)||
-        !gst_element_link_many(sdec,rxc,depay,odec,sink,NULL)) { g_printerr("[loopback] link failed\n"); return 4; }
-    g_timeout_add_seconds(8,(GSourceFunc)g_main_loop_quit,loop);
+        !gst_element_link_many(sdec,rxc,depay,odec,sink,NULL)) {
+        g_printerr("[loopback] link failed\n");
+        gst_object_unref(pipe); gst_buffer_unref(master); g_main_loop_unref(loop);
+        return 4;
+    }
+    { GstPad *p = gst_element_get_static_pad(sink, "sink");
+      gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, count_buffers, &decoded, NULL);
+      gst_object_unref(p); }
+    { GstPad *p = gst_element_get_static_pad(sdec, "rtp_sink");
+      gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, strip_srtp_key, NULL, NULL);
+      gst_object_unref(p); }
+    { GstBus *b = gst_pipeline_get_bus(GST_PIPELINE(pipe)); gst_bus_add_watch(b, loopback_bus, loop); gst_object_unref(b); }
     g_print("[loopback] SRTP-GCM+RTP+Opus round-trip...\n");
-    gst_element_set_state(pipe,GST_STATE_PLAYING);
-    g_main_loop_run(loop);
+    if (gst_element_set_state(pipe, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+        g_printerr("[loopback] set PLAYING failed\n"); rc = 5;
+    } else {
+        g_main_loop_run(loop);
+    }
     gst_element_set_state(pipe,GST_STATE_NULL);
-    g_print("[loopback] done (check for ERROR above; no error = PASS)\n");
+    /* 200 x 10 ms test buffers make 100 20 ms Opus frames; allow a few to be lost at the edges. */
+    if (!rc && g_atomic_int_get(&decoded) < 90) rc = 6;
+    g_print("[loopback] %d frames decoded: %s\n", g_atomic_int_get(&decoded), rc ? "FAIL" : "PASS");
+    { GstBus *b = gst_pipeline_get_bus(GST_PIPELINE(pipe)); gst_bus_remove_watch(b); gst_object_unref(b); }
     gst_object_unref(pipe); gst_buffer_unref(master); g_main_loop_unref(loop);
-    return 0;
-}
-
-/* Isolation tests for the qspkd/qmicd audio bridge (no ICE/SRTP). */
-static int audiotest(int mic)
-{
-    tm_init();
-    GMainLoop *loop = g_main_loop_new(NULL, FALSE);
-    GstElement *pipe = gst_pipeline_new("at");
-    /* mic=0: audiotestsrc tone -> speaker; mic=1: real mic (qmicsrc) -> speaker (loopback) */
-    GstElement *src  = mk(mic ? "qmicsrc" : "audiotestsrc", "src");
-    GstElement *conv = mk("audioconvert",  "conv");
-    GstElement *res  = mk("audioresample", "res");
-    GstElement *sink = mk("atlasqspksink", "sink");
-    if (!pipe||!src||!conv||!res||!sink) { g_printerr("[audiotest] missing element(s)\n"); return 3; }
-    if (!mic) g_object_set(src, "is-live", TRUE, "wave", 0 /*sine*/, "freq", 440.0, NULL);
-    g_object_set(sink, "sync", FALSE, NULL);
-    gst_bin_add_many(GST_BIN(pipe), src, conv, res, sink, NULL);
-    if (!gst_element_link_many(src, conv, res, sink, NULL)) { g_printerr("[audiotest] link failed\n"); return 4; }
-    { GstBus *b = gst_pipeline_get_bus(GST_PIPELINE(pipe)); gst_bus_add_watch(b, on_bus, &g_tm); gst_object_unref(b); }
-    g_timeout_add_seconds(8, (GSourceFunc)g_main_loop_quit, loop);
-    g_print("[audiotest] %s -> atlasqspksink for 8s (listen for %s)...\n",
-            mic ? "qmicsrc" : "audiotestsrc", mic ? "your voice echoed" : "a 440Hz tone");
-    tm_trace(mic ? "audiotest: qmicsrc->qspk" : "audiotest: tone->qspk");
-    gst_element_set_state(pipe, GST_STATE_PLAYING);
-    g_main_loop_run(loop);
-    gst_element_set_state(pipe, GST_STATE_NULL);
-    g_print("[audiotest] done\n");
-    gst_object_unref(pipe); g_main_loop_unref(loop);
-    return 0;
+    set_rx_master(&g_tm, NULL);
+    g_mutex_clear(&g_tm.key_lock);
+    return rc;
 }
 
 int main(int argc, char **argv)
 {
     tm_init();
     if (argc >= 2 && (!strcmp(argv[1],"--loopback")||!strcmp(argv[1],"--selftest"))) return loopback();
-    if (argc >= 2 && !strcmp(argv[1],"--qspktest")) return audiotest(0);
-    if (argc >= 2 && !strcmp(argv[1],"--mictest"))  return audiotest(1);
     if (argc >= 2 && !strcmp(argv[1],"--answer")) return run_ipc(0);
     if (argc >= 2 && !strcmp(argv[1],"--caller")) return run_ipc(1);
-    g_print("Teams call media engine (webOS).\n  %s --loopback\n  %s --answer\n  %s --caller\n", argv[0], argv[0], argv[0]);
+    g_print("Teams call media engine.\n  %s --loopback\n  %s --answer\n  %s --caller\n", argv[0], argv[0], argv[0]);
     return 0;
 }
 #endif

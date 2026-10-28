@@ -1,4 +1,8 @@
 #!/bin/sh
+# Legacy webOS only, kept for reference. On LuneOS teams_media is built with the Makefile next to
+# this script (meta-webos-ports' teams-media recipe); it now plays and records through PulseAudio's
+# voipcall/webcall, not the TouchPad's qspkd/qmicd, and has no video relay.
+#
 # Cross-compile the Teams call media engine (teams_media.c) for the HP TouchPad (webOS ARMv7,
 # gst-1.20.7 from the Atlas/WPE staging). Simpler than the Signal build: no OpenSSL / no KDF -
 # Teams uses SDES keys carried in the SDP, so there is no DH to derive. Produces:

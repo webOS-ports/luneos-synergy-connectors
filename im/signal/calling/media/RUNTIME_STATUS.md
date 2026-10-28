@@ -1,5 +1,9 @@
 # signal_media — on-device runtime status
 
+The bring-up of the engine on the HP TouchPad under legacy webOS (WPE gst runtime, patchelf'd
+loader, ALSA `voip`). Kept as history; on LuneOS the engine is built by the `signal-call-media`
+recipe and run by purple-presage, see README.md.
+
 ## Build: ✅ cross-compiles clean to ARM
 `build-signal-media.sh` → `signal_media` (ELF ARM) + `libsignalmedia.a`. Exports
 `signal_media_start`, `signal_media_add_remote_candidate`, `signal_media_stop`,

@@ -83,7 +83,7 @@
             "pauseCode": [],
             "waitCode": [],
             "keyHoldMappings": [],
-            "videoFormat": "both"
+            "videoFormat": "none"
         }
     ]
 }]

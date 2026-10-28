@@ -1,10 +1,11 @@
 /*
- * signal_media.h - clean C API for the Signal 1:1 call MEDIA ENGINE (GStreamer + libnice + manual
- * AEAD_AES_256_GCM SRTP), for the future presage bridge (messaging/signal/plugin/purple-presage).
+ * signal_media.h - C API of the Signal 1:1 call media engine (GStreamer + libnice + manually keyed
+ * AEAD_AES_256_GCM SRTP). purple-presage runs the engine as a process and talks to it over stdin/
+ * stdout (signal_media.c, run_ipc); this API is what that process uses.
  *
- * This is the ANSWERER (callee) side of an INCOMING Signal voice call:
- *   RX: nicesrc -> srtpdec(offer_key||offer_salt) -> rtpopusdepay -> opusdec -> alsasink device=voip
- *   TX: alsasrc device=voipsource -> opusenc -> rtpopuspay -> srtpenc(answer_key||answer_salt) -> nicesink
+ * For an incoming call (answerer):
+ *   RX: nicesrc -> srtpdec(offer_key||offer_salt) -> rtpopusdepay -> opusdec -> pulsesink device=voipcall
+ *   TX: pulsesrc device=webcall -> opusenc -> rtpopuspay -> srtpenc(answer_key||answer_salt) -> nicesink
  * Keys are derived by srtp_kdf.c from the X25519 DH in ConnectionParametersV4 - NOT DTLS.
  *
  * See README.md for the architecture, build, loopback self-test and the presage integration points.
@@ -23,10 +24,9 @@ extern "C" {
  * Called on the media engine's own GMainContext thread - keep it short / re-marshal if needed. */
 typedef void (*signal_media_candidate_cb)(const char *sdp_candidate, void *user);
 
-/* Called when the media engine wants audiod told a voip call is up (active=1) or gone (active=0).
- * The bridge (call.c, which already owns the com.palm.signal.call private LSHandle g_prv) should
- * issue the two LSCallOneReply calls documented in README (CallStatusUpdate + setCurrentScenario).
- * Optional: pass NULL to skip. Called on the media thread. */
+/* Called when the media pipeline is up (active=1) or torn down (active=0). purple-presage reports
+ * the call to audiod itself, from the call state, so this is informational. Optional: pass NULL to
+ * skip. Called on the media thread. */
 typedef void (*signal_media_audiod_cb)(int active, void *user);
 
 /* One-time process init (wraps gst_init). Safe to call more than once. Returns 0 on success. */
