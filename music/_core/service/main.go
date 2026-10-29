@@ -119,6 +119,7 @@ func main() {
 	tokenFile := flag.String("token-file", tokenPath, "where to persist the OAuth token (survives restarts)")
 	flag.Parse()
 	tokenPath = *tokenFile
+	syncSecrets() // before anything reads a token file (secrets.go)
 	sess.librespotName = *librespotName
 	cfg.addr = *addr
 	cfg.clientID = *clientID

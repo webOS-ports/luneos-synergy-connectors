@@ -153,12 +153,9 @@ func saveLibrespotToken(tok *oauth2.Token) {
 	if err != nil {
 		return
 	}
-	tmp := librespotTokenPath + ".tmp"
-	if err := os.WriteFile(tmp, b, 0600); err != nil {
+	if err := writeSecret(librespotTokenPath, b); err != nil {
 		log.Printf("librespot token: %v", err)
-		return
 	}
-	_ = os.Rename(tmp, librespotTokenPath)
 }
 
 // restoreLibrespotToken reloads librespot's token at startup, if it signed in before.

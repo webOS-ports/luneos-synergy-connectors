@@ -22,7 +22,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -90,7 +89,7 @@ func handleQobuzAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Persist as (email\npassword); qobuzDL scrapes app_id/app_secret itself.
-	if err := os.WriteFile(qobuzAuthFile, []byte(email+"\n"+pw+"\n"), 0600); err != nil {
+	if err := writeSecret(qobuzAuthFile, []byte(email+"\n"+pw+"\n")); err != nil {
 		httpErr(w, http.StatusInternalServerError, "write cred: "+err.Error())
 		return
 	}
@@ -98,7 +97,7 @@ func handleQobuzAuthLogin(w http.ResponseWriter, r *http.Request) {
 	// leave a broken account that 502s on every search.
 	q := newQobuzDL()
 	if err := q.ensureAuth(r.Context()); err != nil {
-		_ = os.Remove(qobuzAuthFile)
+		removeSecret(qobuzAuthFile)
 		httpErr(w, http.StatusBadGateway, "qobuz login failed: "+err.Error())
 		return
 	}
@@ -122,7 +121,7 @@ func handleDeezerAuthSave(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, http.StatusBadRequest, "arl required")
 		return
 	}
-	if err := os.WriteFile(deezerArlFile, []byte(arl), 0600); err != nil {
+	if err := writeSecret(deezerArlFile, []byte(arl)); err != nil {
 		httpErr(w, http.StatusInternalServerError, "write cred: "+err.Error())
 		return
 	}
@@ -130,7 +129,7 @@ func handleDeezerAuthSave(w http.ResponseWriter, r *http.Request) {
 	// public preview-only without one.
 	d := newDeezerDL()
 	if err := d.auth(r.Context()); err != nil {
-		_ = os.Remove(deezerArlFile)
+		removeSecret(deezerArlFile)
 		httpErr(w, http.StatusBadGateway, "deezer ARL invalid: "+err.Error())
 		return
 	}
@@ -161,14 +160,14 @@ func handleDeezerAuthLogin(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	if err := os.WriteFile(deezerArlFile, []byte(arl), 0600); err != nil {
+	if err := writeSecret(deezerArlFile, []byte(arl)); err != nil {
 		httpErr(w, http.StatusInternalServerError, "write cred: "+err.Error())
 		return
 	}
 	// Validate the pulled ARL end-to-end before registering.
 	d := newDeezerDL()
 	if err := d.auth(r.Context()); err != nil {
-		_ = os.Remove(deezerArlFile)
+		removeSecret(deezerArlFile)
 		httpErr(w, http.StatusBadGateway, "deezer ARL invalid: "+err.Error())
 		return
 	}
@@ -275,7 +274,7 @@ func tidalExchangePKCE(ctx context.Context, code string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(tidalTokenFile, bb, 0600); err != nil {
+	if err := writeSecret(tidalTokenFile, bb); err != nil {
 		return "", err
 	}
 	tidalPKCEMu.Lock()

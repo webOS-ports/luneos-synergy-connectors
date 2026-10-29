@@ -26,12 +26,9 @@ func saveToken(tok *oauth2.Token) {
 	if err != nil {
 		return
 	}
-	tmp := tokenPath + ".tmp"
-	if err := os.WriteFile(tmp, b, 0600); err != nil {
+	if err := writeSecret(tokenPath, b); err != nil {
 		log.Printf("saveToken: %v", err)
-		return
 	}
-	_ = os.Rename(tmp, tokenPath) // atomic-ish replace
 }
 
 func loadToken() *oauth2.Token {
