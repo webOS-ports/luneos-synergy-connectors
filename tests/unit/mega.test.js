@@ -657,17 +657,53 @@ test("listAlbums: the Cloud Drive root is an album when it holds images itself",
 		[{ aid: "RRRRRRRR", name: "Cloud Drive", size: { images: 1 } }]);
 });
 
-test("listPhotos: each image downloaded and decrypted to PHOTO_TMP_DIR, file:// links; kept for the next time", async () => {
+test("listPhotos: each image downloaded and decrypted to PHOTO_TMP_DIR/<aid>, temporary file:// links; kept for the next time", async () => {
 	const t = start();
 	const r = await t.call("listPhotos", { accountId: "acc", aid: "DDDDDDDD" }, PHOTOS);
-	const local = path.join(Config.PHOTO_TMP_DIR, "PPPPPPPP-pic.jpg");
+	const local = path.join(Config.PHOTO_TMP_DIR, "DDDDDDDD", "PPPPPPPP-pic.jpg");
 	assert.deepStrictEqual(r, { returnValue: true, photos: [{ pid: "PPPPPPPP", src_big: "file://" + local, src_small: "file://" + local,
-		caption: "pic.jpg", type: "image", fileName: "pic.jpg" }] });
+		caption: "pic.jpg", type: "image", fileName: "pic.jpg", temporary: true }] });
 	assert.ok(fs.readFileSync(local).equals(PIC_BYTES));
 	await t.call("listPhotos", { accountId: "acc", aid: "DDDDDDDD" }, PHOTOS);
 	assert.strictEqual(cmdsOf(t.st, "g").length, 1, "a copy with the right size is not fetched again");
 	assert.deepStrictEqual(await start().call("listPhotos", { accountId: "acc", aid: "" }, PHOTOS), { returnValue: true, photos: [] });
 	assert.deepStrictEqual(await start().call("listPhotos", { accountId: "acc" }, PHOTOS), { returnValue: true, photos: [] });
+});
+
+test("listPhotos: what the caller has is not fetched and its copy goes; copies of images gone from the album go", async () => {
+	fs.rmSync(Config.PHOTO_TMP_DIR, { recursive: true, force: true });
+	const album = path.join(Config.PHOTO_TMP_DIR, "DDDDDDDD");
+	const local = path.join(album, "PPPPPPPP-pic.jpg");
+	const t = start();
+	await t.call("listPhotos", { accountId: "acc", aid: "DDDDDDDD" }, PHOTOS);
+	assert.ok(fs.existsSync(local));
+	// Left by an image deleted in the cloud, and by a download that died
+	fs.writeFileSync(path.join(album, "GGGGGGGG-gone.jpg"), "x");
+	fs.writeFileSync(local + ".mzenc", "x");
+	const r = await t.call("listPhotos", { accountId: "acc", aid: "DDDDDDDD", have: ["PPPPPPPP"] }, PHOTOS);
+	assert.deepStrictEqual(r.photos, [{ pid: "PPPPPPPP", src_big: "file://" + local, src_small: "file://" + local,
+		caption: "pic.jpg", type: "image", fileName: "pic.jpg" }], "listed, not temporary");
+	assert.deepStrictEqual(fs.readdirSync(album), [], "nothing kept");
+	assert.strictEqual(cmdsOf(t.st, "g").length, 1, "not fetched again");
+	// `have` that is not a list is no pids
+	for (const have of ["PPPPPPPP", 5, { PPPPPPPP: true }]) {
+		const r2 = await t.call("listPhotos", { accountId: "acc", aid: "DDDDDDDD", have }, PHOTOS);
+		assert.strictEqual(r2.returnValue, true, JSON.stringify(have));
+		assert.strictEqual(r2.photos[0].temporary, true, JSON.stringify(have));
+	}
+	assert.ok(fs.existsSync(local));
+});
+
+test("listAlbums: the copies of albums that are gone, and loose ones at the top, go; not when the tree cannot be read", async () => {
+	fs.rmSync(Config.PHOTO_TMP_DIR, { recursive: true, force: true });
+	const dir = Config.PHOTO_TMP_DIR;
+	for (const d of ["DDDDDDDD", "GONEGONE"]) { fs.mkdirSync(path.join(dir, d), { recursive: true }); fs.writeFileSync(path.join(dir, d, "x.jpg"), "x"); }
+	fs.writeFileSync(path.join(dir, "PPPPPPPP-pic.jpg"), "an older version's copy");
+	await start(mega({ on: (c) => (c.a === "f" ? -15 : undefined) })).call("listAlbums", { accountId: "acc" }, PHOTOS);
+	assert.deepStrictEqual(fs.readdirSync(dir).sort(), ["DDDDDDDD", "GONEGONE", "PPPPPPPP-pic.jpg"], "an unread tree removes nothing");
+	await start().call("listAlbums", { accountId: "acc" }, PHOTOS);
+	assert.deepStrictEqual(fs.readdirSync(dir), ["DDDDDDDD"]);
+	assert.deepStrictEqual(fs.readdirSync(path.join(dir, "DDDDDDDD")), ["x.jpg"], "a listed album's copies are listPhotos' business");
 });
 
 test("listPhotos: an image that cannot be had is left out; the listing failing fails the call", async () => {
