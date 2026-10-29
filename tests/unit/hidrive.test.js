@@ -422,6 +422,18 @@ test("upload (Photos): into the album listAlbums named (its encoded aid), or hom
 		"GET " + USER_ME, `POST ${API}/dir?path=${enc("/users/me/Camera Uploads")}`, `PUT ${API}/file?dir=${enc("/users/me/Camera Uploads")}&name=local.bin`]);
 });
 
+test("upload (Photos): into the home album, with the home HiDrive really gives (root/users/<name>)", async () => {
+	const home = "root/users/me";
+	const { call, lines } = start([["GET", /\/user\/me/, () => ok(Object.assign({}, ME, { home }))],
+		["GET", /\/dir\?/, () => ok({ members: [img(home + "/a.jpg")] })],
+		["PUT", /\/file\?/, (q) => ok({ name: "local.bin", path: new URL(q.url).searchParams.get("dir").split("/").map(enc).join("/") + "/local.bin", size: 5000 }, 201)]]);
+	const albums = (await call("listAlbums", { accountId: "acc" }, PHOTOS)).albums;
+	assert.deepStrictEqual(albums, [{ aid: enc(home), name: "HiDrive", size: { images: 1 } }]);
+	assert.deepStrictEqual(await call("upload", { accountId: "acc", albumId: albums[0].aid, path: LOCAL }, PHOTOS),
+		{ returnValue: true, pid: home + "/local.bin", name: "local.bin", size: 5000 });
+	assert.strictEqual(lines().pop(), `PUT ${API}/file?dir=${enc(home)}&name=local.bin`, "the dir encoded once");
+});
+
 test("upload (Photos): an album folder that cannot be made is HIDRIVE_MKDIR_FAILED and nothing is uploaded", async () => {
 	const { call, requests } = start([["GET", /\/user\/me/, () => ok(ME)], ["POST", /\/dir\?/, () => ok({}, 507)], ["PUT", /./, () => ok({})]]);
 	const r = await call("upload", { accountId: "acc", path: LOCAL }, PHOTOS);
