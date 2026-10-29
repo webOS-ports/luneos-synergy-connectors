@@ -169,7 +169,7 @@ func (t *tidalDL) refresh(ctx context.Context) error {
 	snapshot := t.tok
 	t.mu.Unlock()
 	if b, err := json.MarshalIndent(snapshot, "", "  "); err == nil {
-		_ = os.WriteFile(tidalTokenFile, b, 0600) // best-effort persist
+		_ = writeSecret(tidalTokenFile, b) // best-effort persist
 	}
 	return nil
 }

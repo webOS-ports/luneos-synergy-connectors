@@ -61,7 +61,7 @@ func saveYtToken(t *ytToken) {
 	ytTok = t
 	ytTokMu.Unlock()
 	if b, err := json.MarshalIndent(t, "", "  "); err == nil {
-		_ = os.WriteFile(ytTokenFile, b, 0600)
+		_ = writeSecret(ytTokenFile, b)
 	}
 }
 

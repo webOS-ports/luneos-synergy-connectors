@@ -626,7 +626,7 @@ func handleAppleAuthSave(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, http.StatusBadRequest, "musicUserToken required")
 		return
 	}
-	if err := os.WriteFile(appleUserTokenFile, []byte(tok), 0600); err != nil {
+	if err := writeSecret(appleUserTokenFile, []byte(tok)); err != nil {
 		httpErr(w, http.StatusInternalServerError, "write token: "+err.Error())
 		return
 	}
