@@ -1,0 +1,8 @@
+{
+    "allowedNames": [
+        "com.palm.service.immich"
+    ],
+    "synergy-immich.operation": [
+        "dev"
+    ]
+}

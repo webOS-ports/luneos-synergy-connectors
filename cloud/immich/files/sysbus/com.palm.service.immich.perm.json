@@ -1,0 +1,11 @@
+{
+    "com.palm.service.immich": ["accountsservice.operation", "activity.operation", "systemsettings.query", "time.query"],
+    "com.palm.service.accounts": ["synergy-immich.operation"],
+    "com.palm.app.accounts": ["synergy-immich.operation"],
+    "com.palm.app.accounts-*": ["synergy-immich.operation"],
+    "com.palm.app.immich-auth-*": ["synergy-immich.operation"],
+    "com.palm.app.immich-auth": ["synergy-immich.operation"],
+    "org.webosports.app.photos-*": ["synergy-immich.operation"],
+    "org.webosports.app.photos": ["synergy-immich.operation"],
+    "com.palm.service.photos": ["synergy-immich.operation"]
+}

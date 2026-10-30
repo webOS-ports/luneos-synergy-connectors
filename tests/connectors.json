@@ -23,6 +23,7 @@
     "com.palm.webdav":      {"key": "webdav",     "family": "cloud", "service": "com.palm.service.webdav",     "auth": "login",      "package": null},
     "com.palm.flickr":      {"key": "flickr",     "family": "cloud", "service": "com.palm.service.flickr",     "auth": "oauth1",     "package": null, "documents": false},
     "com.palm.smugmug":     {"key": "smugmug",    "family": "cloud", "service": "com.palm.service.smugmug",    "auth": "oauth1",     "package": null, "documents": false},
+    "com.palm.immich":      {"key": "immich",     "family": "cloud", "service": "com.palm.service.immich",     "auth": "login",      "package": null, "documents": false},
 
     "org.webosports.app.music.spotify":    {"key": "spotify",    "family": "music", "provider": "spotify",    "auth": "spotify-oauth", "package": null},
     "org.webosports.app.music.apple":      {"key": "apple",      "family": "music", "provider": "apple",      "auth": "apple-token",   "package": null},

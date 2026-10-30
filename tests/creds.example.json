@@ -13,6 +13,7 @@
   "kdrive":   {"credentials": {"common": {"accessToken": "SECRET"}}},
   "s3":       {"credentials": {"common": {"accessToken": "AKIA... (the access key id)", "secretAccessKey": "SECRET", "endpoint": "s3.eu-central-1.amazonaws.com", "region": "eu-central-1", "bucket": "luneos-harness", "pathStyle": true}}},
   "webdav":   {"credentials": {"common": {"flavor": "nextcloud", "server": "https://cloud.example.org/remote.php/dav/files/you/", "username": "you", "accessToken": "SECRET (an app password)"}}},
+  "immich":   {"credentials": {"common": {"server": "https://photos.example.org", "apiKey": "IMMICH-API-KEY"}}},
 
   "qobuz":    {"email": "you@example.org", "password": "SECRET"},
   "deezer":   {"arl": "SECRET"},

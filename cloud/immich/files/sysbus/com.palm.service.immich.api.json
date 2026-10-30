@@ -1,0 +1,5 @@
+{
+    "synergy-immich.operation": [
+        "com.palm.service.immich/*"
+    ]
+}

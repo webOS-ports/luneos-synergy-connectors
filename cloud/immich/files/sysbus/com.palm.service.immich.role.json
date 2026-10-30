@@ -1,0 +1,19 @@
+{
+    "appId": "com.palm.service.immich",
+    "allowedNames": [
+        "com.palm.service.immich"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "com.palm.service.immich",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}
