@@ -1,0 +1,33 @@
+{
+	"templateId": "com.palm.immich",
+	"loc_name": "Immich",
+	"loc_usernameLabel": "EMAIL",
+	"icon": {
+		"loc_32x32": "images/immich-32x32.png",
+		"loc_48x48": "images/immich-48x48.png"
+	},
+
+	"__comment": "Immich, a self-hosted photo server. No OAuth: the customUI app com.palm.app.immich-auth collects the server's address and an API key the user made in Immich, and calls com.palm.service.immich/login, which checks them (/server/version, then /users/me) and returns the stored credentials. A PHOTO source only - no DOCUMENTS capability, no files app.",
+	"validator": {
+		"customUI": { "appId": "com.palm.app.immich-auth", "name": "login.html" },
+		"address":  "palm://com.palm.service.immich/login"
+	},
+	"onCredentialsChanged": "palm://com.palm.service.immich/checkCredentials",
+
+	"__comment2": "com.palm.app.immich-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists.",
+	"__comment3": "com.palm.service.immich is in read+writePermissions so the service itself can readCredentials(accountId) for the photo-provider calls. An API key does not expire, so writeCredentials is unused after create (kept for symmetry).",
+	"readPermissions":  ["com.palm.app.immich-auth", "com.palm.service.immich", "org.webosports.app.photos", "org.webosports.app.photos-*", "com.palm.service.photos"],
+	"writePermissions": ["com.palm.app.immich-auth", "com.palm.service.immich", "com.palm.service.photos"],
+
+	"capabilityProviders": [
+		{
+			"capability": "PHOTO.UPLOAD",
+			"id": "com.palm.immich.photos",
+			"implementation": "palm://com.palm.service.photos",
+			"onEnabled": "palm://com.palm.service.photos/onEnabled",
+			"onDelete": "palm://com.palm.service.photos/onDelete",
+			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
+			"__comment": "Makes the Immich account a photo source. implementation/hooks point at the stock Photos AGGREGATOR (com.palm.service.photos), which discovers PHOTO.UPLOAD accounts and (its service name derived from the templateId) calls com.palm.service.immich/listAlbums+listPhotos and downloads each photo from the URL listPhotos gives (the API key in it as ?apiKey=)."
+		}
+	]
+}
