@@ -1,0 +1,19 @@
+{
+    "appId": "com.palm.service.smugmug",
+    "allowedNames": [
+        "com.palm.service.smugmug"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "com.palm.service.smugmug",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}

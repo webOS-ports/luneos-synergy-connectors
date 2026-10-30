@@ -1,0 +1,5 @@
+{
+    "synergy-smugmug.operation": [
+        "com.palm.service.smugmug/*"
+    ]
+}

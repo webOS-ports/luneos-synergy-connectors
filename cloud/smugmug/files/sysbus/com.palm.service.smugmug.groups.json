@@ -1,0 +1,8 @@
+{
+    "allowedNames": [
+        "com.palm.service.smugmug"
+    ],
+    "synergy-smugmug.operation": [
+        "dev"
+    ]
+}
