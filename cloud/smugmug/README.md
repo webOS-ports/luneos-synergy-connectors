@@ -7,6 +7,32 @@ documents/files role and no upload: the token is read-only.
 It is cloud/flickr's design with SmugMug's API v2 behind it: the same OAuth 1.0a signer, the
 same Atlas sign-in flow, the same Photos contract.
 
+## Status and limitations
+
+> **Works, but not in the LuneOS image yet.** It signed in to a real account and brought that
+> account's photos down byte for byte (2026-10-30). Whether its API key lasts is not known, so
+> it stays out of the image until that is settled.
+
+- **The API key may not outlast a subscription.** SmugMug says API access *"is available to
+  all current SmugMug subscribers"*, and has no free accounts. The LuneOS key was registered on
+  a two-week trial (from 2026-10-30); nothing was found saying whether a key keeps working once
+  the subscription behind it ends. To check a key without its secret, sign a `getRequestToken`
+  with a wrong secret: a live key answers `oauth_problem=signature_invalid`, an unknown or
+  revoked one `oauth_problem=consumer_key_unknown`. If it dies, the key needs a paying account
+  (someone who already has one can register it at no cost to them).
+- **Users need a paid SmugMug account** — there is no other kind — but no key of their own.
+- **The key and secret ship in the image.** OAuth 1.0a has no public client: the consumer
+  secret signs every request, so it sits in `config.js` on every device and anyone can read it.
+  If it is abused, SmugMug can revoke it and the account type stops working for everyone.
+- **Read-only, photos only.** Browse and download; no upload. Videos, and images SmugMug is
+  still processing, are left out.
+- **A request token lives 5 minutes.** A sign-in that takes longer fails at the last step and
+  has to be started again with Sign In.
+- **At most 5000 photos per album**, and 5000 albums, are listed.
+- **The icons are placeholders** (plain squares).
+- **Not yet run on a device.** The live checks ran the service on a host with node 22; the
+  sign-in app through Atlas is Flickr's flow, untried with SmugMug.
+
 ## Components
 
 | Path | What it is |
