@@ -29,7 +29,6 @@ same Atlas sign-in flow, the same Photos contract.
 - **A request token lives 5 minutes.** A sign-in that takes longer fails at the last step and
   has to be started again with Sign In.
 - **At most 5000 photos per album**, and 5000 albums, are listed.
-- **The icons are placeholders** (plain squares).
 - **Not yet run on a device.** The live checks ran the service on a host with node 22; the
   sign-in app through Atlas is Flickr's flow, untried with SmugMug.
 
@@ -39,7 +38,7 @@ same Atlas sign-in flow, the same Photos contract.
 |---|---|
 | `service/com.palm.service.smugmug/` | The node service on `_cloudcore/node` (node 22): `service.js` (the methods), `oauth1.js` (OAuth 1.0a signer and token legs, Flickr's), `adapter.js` (API v2 calls, paging, credentials), `photos.js` (listAlbums/listPhotos), `config.js`. |
 | `apps/com.palm.app.smugmug-auth/` | customUI sign-in app the account template launches. Drives the Atlas login and hands the `oauth_verifier` back to the service. |
-| `account/com.palm.smugmug/` | Synergy account template — **PHOTO.UPLOAD capability only**. The icons are plain placeholders. |
+| `account/com.palm.smugmug/` | Synergy account template — **PHOTO.UPLOAD capability only**. The icons are SmugMug's own app icon, recut to the set's corners. |
 | `files/sysbus/` | The service's LS2 files. |
 
 ## Service methods (`service.js`)
