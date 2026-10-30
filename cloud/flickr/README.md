@@ -24,8 +24,9 @@ no files app.
   `PLACEHOLDER_FLICKR_CLIENT_SECRET` that meta-luneos `cloud-synergy-connector.inc` replaces
   (as cloud/smugmug's are); with `FLICKR_CLIENT_ID` set, the build only warns that it is unused.
 - **Read-only, photos only.** Browse and download; no upload, no videos (they are left out).
-- **The sign-in app logs its result.** `flickrAuth.js` `finish()` writes the whole result to
-  the log, the access token and secret included. cloud/smugmug's logs only how the sign-in ended.
+- **The sign-in app logs its result** until #14 is merged: `flickrAuth.js` `finish()` writes the
+  whole result to the log, the access token and secret included. #14 makes it (and the other
+  sign-in apps) log only how the sign-in ended.
 - **The icons are placeholders** (plain squares).
 
 To make it work: get a key from a Pro account, register the callback below, switch
