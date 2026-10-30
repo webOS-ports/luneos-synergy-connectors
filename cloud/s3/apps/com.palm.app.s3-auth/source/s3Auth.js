@@ -88,7 +88,7 @@ enyo.kind({
 		if (this.done) { return; }
 		this.$.connectButton.setDisabled(false);
 		this.$.status.setContent("Could not connect — check the endpoint, region, bucket and keys.");
-		this.log("s3-auth: login failed " + enyo.json.stringify(inResponse));
+		this.log("s3-auth: login failed " + (inResponse && inResponse.errorCode));
 	},
 
 	authSuccess: function (inSender, inResponse) {
@@ -112,7 +112,9 @@ enyo.kind({
 
 	finish: function (result) {
 		this.done = true;
-		this.log("s3-auth: sending result " + enyo.json.stringify(result));
+		// The result holds the credentials: log only how it ended.
+		this.log("s3-auth: sending result returnValue=" + (result && result.returnValue) +
+			(result && result.errorCode ? " errorCode=" + result.errorCode : ""));
 		this.$.xresult.sendResult(result);
 	}
 });

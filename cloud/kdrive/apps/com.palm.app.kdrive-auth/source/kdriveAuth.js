@@ -61,7 +61,8 @@ enyo.kind({
 		}
 		if (this.serviceUri) { this.$.svc.setService(this.serviceUri); }
 		if (tmpl.loc_name) { this.$.title.setContent(tmpl.loc_name); }
-		this.log("kdrive-auth: launch params " + enyo.json.stringify(this.params));
+		this.log("kdrive-auth: launched for " + ((this.params.template && this.params.template.templateId) || "(no template)") +
+			(this.params.account ? ", an existing account" : ""));
 		if (!this.serviceUri) { this.log("kdrive-auth: no service in template.validator.address"); }
 	},
 
@@ -92,7 +93,7 @@ enyo.kind({
 		if (this.done) { return; }
 		this.$.connectButton.setDisabled(false);
 		this.$.status.setContent("That token didn't work — check it has the ‘Drive’ scope and try again.");
-		this.log("kdrive-auth: verifyToken failed " + enyo.json.stringify(inResponse));
+		this.log("kdrive-auth: verifyToken failed " + (inResponse && inResponse.errorCode));
 	},
 
 	// verifyToken succeeded -> return credentials to Accounts (tag with template on create).
@@ -117,7 +118,9 @@ enyo.kind({
 
 	finish: function (result) {
 		this.done = true;
-		this.log("kdrive-auth: sending result " + enyo.json.stringify(result));
+		// The result holds the credentials: log only how it ended.
+		this.log("kdrive-auth: sending result returnValue=" + (result && result.returnValue) +
+			(result && result.errorCode ? " errorCode=" + result.errorCode : ""));
 		this.$.xresult.sendResult(result);
 	}
 });

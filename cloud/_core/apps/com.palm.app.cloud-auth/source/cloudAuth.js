@@ -127,7 +127,8 @@ enyo.kind({
 			this.$.headerIcon.setSrc(iconPath);
 			this.$.headerIcon.setShowing(true);
 		}
-		this.log("cloud-auth: launch params " + enyo.json.stringify(this.params));
+		this.log("cloud-auth: launched for " + ((this.params.template && this.params.template.templateId) || "(no template)") +
+			(this.params.account ? ", an existing account" : ""));
 		this.log("cloud-auth: serviceUri=" + (this.serviceUri || "(none)"));
 	},
 
@@ -374,7 +375,9 @@ enyo.kind({
 	finish: function (result) {
 		this.done = true;
 		this.clearOAuthTimers();
-		this.log("cloud-auth: sending result " + enyo.json.stringify(result));
+		// The result holds the credentials: log only how it ended.
+		this.log("cloud-auth: sending result returnValue=" + (result && result.returnValue) +
+			(result && result.errorCode ? " errorCode=" + result.errorCode : ""));
 		this.$.xresult.sendResult(result);
 	},
 
