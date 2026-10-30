@@ -20,6 +20,7 @@
     "com.palm.koofr":       {"key": "koofr",      "family": "cloud", "service": "com.palm.service.koofr",      "auth": "oauth2",     "package": null},
     "com.palm.hidrive":     {"key": "hidrive",    "family": "cloud", "service": "com.palm.service.hidrive",    "auth": "oauth2",     "package": null},
     "com.palm.s3":          {"key": "s3",         "family": "cloud", "service": "com.palm.service.s3",         "auth": "login",      "package": null},
+    "com.palm.webdav":      {"key": "webdav",     "family": "cloud", "service": "com.palm.service.webdav",     "auth": "login",      "package": null},
     "com.palm.flickr":      {"key": "flickr",     "family": "cloud", "service": "com.palm.service.flickr",     "auth": "oauth1",     "package": null, "documents": false},
     "com.palm.smugmug":     {"key": "smugmug",    "family": "cloud", "service": "com.palm.service.smugmug",    "auth": "oauth1",     "package": null, "documents": false},
 
