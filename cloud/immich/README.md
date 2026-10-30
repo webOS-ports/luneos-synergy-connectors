@@ -38,7 +38,7 @@ No upload, no documents/files role.
 |---|---|
 | `service/com.palm.service.immich/` | The node service on `_cloudcore/node` (node 22): `service.js` (the methods), `login.js` (the account validator), `adapter.js` (the API, paging, credentials), `photos.js` (listAlbums/listPhotos), `config.js`. |
 | `apps/com.palm.app.immich-auth/` | customUI sign-in form (server address, API key), as cloud/s3's. |
-| `account/com.palm.immich/` | Synergy account template — **PHOTO.UPLOAD capability only**. The icons are Immich's own flower (`design/immich-logo.svg`) on transparent, as Drive's and pCloud's marks are. |
+| `account/com.palm.immich/` | Synergy account template — **PHOTO.UPLOAD capability only**. The icons are Immich's own app icon (`web/static/apple-icon-180.png`): the flower in a white circle, drawn from `web/static/icon.svg`. |
 | `files/sysbus/` | The service's LS2 files. |
 
 ## Service methods
