@@ -11,7 +11,7 @@
 
   "dropbox":  {"account": "existing", "folder": ""},
   "kdrive":   {"credentials": {"common": {"accessToken": "SECRET"}}},
-  "s3":       {"credentials": {"common": {"endpoint": "https://s3.eu-central-1.amazonaws.com", "region": "eu-central-1", "bucket": "luneos-harness", "accessKeyId": "AKIA...", "secretAccessKey": "SECRET", "pathStyle": true}}},
+  "s3":       {"credentials": {"common": {"accessToken": "AKIA... (the access key id)", "secretAccessKey": "SECRET", "endpoint": "s3.eu-central-1.amazonaws.com", "region": "eu-central-1", "bucket": "luneos-harness", "pathStyle": true}}},
 
   "qobuz":    {"email": "you@example.org", "password": "SECRET"},
   "deezer":   {"arl": "SECRET"},
