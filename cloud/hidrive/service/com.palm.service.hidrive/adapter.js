@@ -102,11 +102,13 @@ function createAdapter({ config, http }) {
 	}
 
 	// A folder locator -> its path: the root ("" or "home") is the home; a Photos album id
-	// (listAlbums hands out the path URL-encoded, "%2Fusers%2F...") is decoded back.
+	// (listAlbums hands out the path URL-encoded, so it has no "/") is decoded back. Test for
+	// the "/", not for a leading "%2F": the home HiDrive gives is "root/users/<name>", so the
+	// home album's id is "root%2Fusers%2F<name>", and a plain path always has a "/".
 	async function resolve(s, folderId) {
 		if (!folderId || folderId === HOME || folderId === config.ROOT_FOLDER) { return ensureHome(s); }
 		const f = String(folderId);
-		return /^%2F/i.test(f) ? dec(f) : f;
+		return f.indexOf("/") < 0 ? dec(f) : f;
 	}
 
 	// "dir" or "file" (a symlink is handled through the /file endpoints).
