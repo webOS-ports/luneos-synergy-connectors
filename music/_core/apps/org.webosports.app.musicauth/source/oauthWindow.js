@@ -28,9 +28,14 @@
  *
  *   native scheme (Teams: msauth.<client>://auth)
  *       The engine cannot load that scheme, so it aborts the navigation and location never
- *       changes — polling alone would wait forever. WAM instead reports the URL to the page as
- *       a 'webOSExternalProtocol' event (WebPageBlink::NotifyExternalProtocolNavigation), which
- *       is the LuneOS counterpart of BrowserServer-atlas's actionData("oauthRedirect").
+ *       changes — polling alone would wait forever. WAM watches these the same way, catching
+ *       the redirect where the load is aborted, and reports it with the same events.
+ *
+ *       A WAM that watches only http(s) sends no "watching" for these. It still reports the
+ *       aborted URL as a 'webOSExternalProtocol' event (NotifyExternalProtocolNavigation), but
+ *       only to the window and, from there, to this page — which fails whenever the provider's
+ *       login page runs in a renderer of its own, as Microsoft's does: this page is then out of
+ *       its reach (SecurityError).
  *
  * Both are armed at once and whichever fires first wins, so a caller does not have to know
  * which kind of redirect its provider uses.
@@ -50,10 +55,14 @@
 			}
 		},
 
-		// WAM watches only an http(s) prefix with a host (web_page_blink.cc
-		// IsWatchableRedirectPrefix); for anything else the window is polled.
+		// WAM watches an http(s) prefix with a host, or one of an app's own scheme with
+		// something after the "://" (web_page_blink.cc IsWatchableRedirectPrefix); for anything
+		// else the window is polled.
 		watchable: function (prefix) {
-			return /^https?:\/\/[^\/]/.test(prefix || "");
+			prefix = prefix || "";
+			if (/^https?:/i.test(prefix)) { return /^https?:\/\/[^\/]/i.test(prefix); }
+			var m = /^([a-z][a-z0-9+.\-]*):\/\/[^\/]/i.exec(prefix);
+			return !!m && !/^(file|about|data|blob|javascript|ws|wss|chrome|filesystem|view-source)$/i.test(m[1]);
 		},
 
 		// The window.open() features: the caller's, plus WAM's redirect watch where it applies.

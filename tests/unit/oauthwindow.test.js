@@ -102,10 +102,12 @@ for (const file of COPIES) {
 		assert.strictEqual(r.popups[0].features, "height=300," + watch);
 	});
 
-	test(`${name}: only an http(s) prefix with a host asks WAM to watch`, () => {
+	test(`${name}: an http(s) prefix with a host, or an app's own scheme, asks WAM to watch`, () => {
 		for (const [prefix, asked] of [
 			["https://tidal.com/login/auth", true], ["http://localhost/koofr/oauth2callback", true],
-			["msauth.com.microsoft.teams://auth", false], ["https:///x", false], [undefined, false],
+			["msauth.com.microsoft.teams://auth", true], ["https:///x", false], [undefined, false],
+			["msauth.x://", false], ["msauth.x:///auth", false], ["1app://auth", false],
+			["javascript://x", false], ["FILE://x/y", false], ["data://x", false], ["https://", false],
 		]) {
 			const r = load(file);
 			r.OAuthWindow.open({ url: "https://example.com/a", redirectPrefix: prefix });
@@ -129,6 +131,22 @@ for (const file of COPIES) {
 		r.wam("closed");
 		assert.strictEqual(got.length, 1);
 		assert.deepStrictEqual(r.listeners.webOSOAuthWindow, []);
+	});
+
+	test(`${name}: Teams' native-scheme redirect comes from WAM's watch`, () => {
+		// The login page runs in a renderer of its own, so neither the window's location nor a
+		// webOSExternalProtocol event reaches this page; WAM's "redirect" does.
+		const prefix = "msauth.com.microsoft.teams://auth";
+		const r = load(file);
+		const got = [];
+		r.OAuthWindow.open({ url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+			redirectPrefix: prefix, onRedirect: (u) => got.push(u), onError: (m) => got.push("error: " + m) });
+		assert.strictEqual(r.popups[0].features, 'attributes={"redirectPrefix":"' + prefix + '"}');
+		r.wam("watching");
+		r.tick();
+		assert.deepStrictEqual(got, []);
+		r.wam("redirect", prefix + "/?code=M.C5_Ab");
+		assert.deepStrictEqual(got, [prefix + "/?code=M.C5_Ab"]);
 	});
 
 	test(`${name}: a caller's own attributes are not added to`, () => {
