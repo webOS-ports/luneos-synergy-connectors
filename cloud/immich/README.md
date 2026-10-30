@@ -31,7 +31,6 @@ No upload, no documents/files role.
 - **Immich versions**: 3.2 and later are asked with the new search shape (`filter`/`cursor`);
   older ones with the flat `albumIds`/`page` one, which Immich will drop in v4; a server whose
   search cannot take an album at all lists it through `GET /albums/<id>`. Only 3.3.5 was tried.
-- **The icons are placeholders** (plain squares).
 
 ## Components
 
@@ -39,7 +38,7 @@ No upload, no documents/files role.
 |---|---|
 | `service/com.palm.service.immich/` | The node service on `_cloudcore/node` (node 22): `service.js` (the methods), `login.js` (the account validator), `adapter.js` (the API, paging, credentials), `photos.js` (listAlbums/listPhotos), `config.js`. |
 | `apps/com.palm.app.immich-auth/` | customUI sign-in form (server address, API key), as cloud/s3's. |
-| `account/com.palm.immich/` | Synergy account template — **PHOTO.UPLOAD capability only**. |
+| `account/com.palm.immich/` | Synergy account template — **PHOTO.UPLOAD capability only**. The icons are Immich's own flower (`design/immich-logo.svg`) on white, as its app icon is. |
 | `files/sysbus/` | The service's LS2 files. |
 
 ## Service methods
