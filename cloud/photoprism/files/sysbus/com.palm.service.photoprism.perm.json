@@ -1,0 +1,11 @@
+{
+    "com.palm.service.photoprism": ["accountsservice.operation", "activity.operation", "systemsettings.query", "time.query"],
+    "com.palm.service.accounts": ["synergy-photoprism.operation"],
+    "com.palm.app.accounts": ["synergy-photoprism.operation"],
+    "com.palm.app.accounts-*": ["synergy-photoprism.operation"],
+    "com.palm.app.photoprism-auth-*": ["synergy-photoprism.operation"],
+    "com.palm.app.photoprism-auth": ["synergy-photoprism.operation"],
+    "org.webosports.app.photos-*": ["synergy-photoprism.operation"],
+    "org.webosports.app.photos": ["synergy-photoprism.operation"],
+    "com.palm.service.photos": ["synergy-photoprism.operation"]
+}

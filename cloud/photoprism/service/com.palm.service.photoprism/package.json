@@ -1,0 +1,9 @@
+{
+	"name": "com.palm.service.photoprism",
+	"version": "1.0.0",
+	"description": "PhotoPrism connector for LuneOS Synergy (PHOTO.UPLOAD, read-only)",
+	"main": "service.js",
+	"private": true,
+	"engines": { "node": ">=22" },
+	"license": "GPL-3.0-or-later"
+}

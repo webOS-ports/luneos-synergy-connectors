@@ -1,0 +1,5 @@
+{
+    "synergy-photoprism.operation": [
+        "com.palm.service.photoprism/*"
+    ]
+}

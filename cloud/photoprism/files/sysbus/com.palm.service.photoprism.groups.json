@@ -1,0 +1,8 @@
+{
+    "allowedNames": [
+        "com.palm.service.photoprism"
+    ],
+    "synergy-photoprism.operation": [
+        "dev"
+    ]
+}

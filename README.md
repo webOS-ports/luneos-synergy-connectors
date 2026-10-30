@@ -5,7 +5,7 @@ and plugs a network or service into the stock apps.
 
 | Family | Connectors | What they feed |
 |---|---|---|
-| `cloud/` | box, dropbox, flickr, google (Drive), hidrive, immich, kdrive, koofr, mega, onedrive, pcloud, s3, smugmug, webdav (Nextcloud, ownCloud, any WebDAV server), yandex | Documents (DOCUMENTS) and Photos (PHOTO.UPLOAD) |
+| `cloud/` | box, dropbox, flickr, google (Drive), hidrive, kdrive, koofr, mega, onedrive, pcloud, immich, photoprism, s3, smugmug, webdav (Nextcloud, ownCloud, any WebDAV server), yandex | Documents (DOCUMENTS) and Photos (PHOTO.UPLOAD) |
 | `im/` | discord, facebook (E2EE), googlechat, signal, teams, telegram, whatsapp | Messaging, through `imlibpurpleservice` and libpurple |
 | `music/` | apple, archive, deezer, jamendo, qobuz, soundcloud, spotify, tidal, youtube | Music, through the streaming daemon |
 
@@ -20,6 +20,7 @@ cloud/_core/apps/                  com.palm.app.cloud-auth, the shared OAuth sig
 cloud/<name>/account/              account template + icons  -> /usr/palm/public/accounts/
 cloud/<name>/service/              the connector's service -> /usr/palm/services/
 cloud/<name>/apps/                 its own sign-in app, where it has one (kdrive, mega, s3, webdav, flickr, smugmug, immich)
+cloud/<name>/apps/                 its own sign-in app, where it has one (kdrive, mega, s3, webdav, flickr, smugmug, immich, photoprism)
 cloud/<name>/files/sysbus/         its service's LS2 files (webos_system_bus) -> /usr/share/luna-service2/
 
 im/_core/include/                  webos-ls2-compat.h, shared by the plugins
