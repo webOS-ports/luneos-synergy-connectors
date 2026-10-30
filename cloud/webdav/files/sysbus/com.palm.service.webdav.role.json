@@ -1,0 +1,19 @@
+{
+    "appId": "com.palm.service.webdav",
+    "allowedNames": [
+        "com.palm.service.webdav"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "com.palm.service.webdav",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}

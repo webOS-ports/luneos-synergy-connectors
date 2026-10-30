@@ -1,0 +1,39 @@
+{
+	"templateId": "com.palm.webdav",
+	"loc_name": "WebDAV / Nextcloud",
+	"loc_usernameLabel": "USER",
+	"icon": {
+		"loc_32x32": "images/webdav-32x32.png",
+		"loc_48x48": "images/webdav-48x48.png"
+	},
+
+	"__comment": "Nextcloud, ownCloud and any WebDAV server (a NAS, Apache mod_dav, rclone, ...). No OAuth: the customUI app com.palm.app.webdav-auth collects the server type, address, user name and password (an app password for Nextcloud/ownCloud) and calls com.palm.service.webdav/login, which finds the user's WebDAV folder, checks the sign-in with a PROPFIND and returns the stored credentials. Provides BOTH DOCUMENTS and PHOTO.UPLOAD.",
+	"validator": {
+		"customUI": { "appId": "com.palm.app.webdav-auth", "name": "login.html" },
+		"address":  "palm://com.palm.service.webdav/login"
+	},
+	"onCredentialsChanged": "palm://com.palm.service.webdav/checkCredentials",
+
+	"__comment2": "com.palm.app.webdav-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists.",
+	"__comment3": "com.palm.service.webdav is in read+writePermissions so the service can readCredentials(accountId) for file ops. A password does not expire, so the service does not normally write back, but the permission is kept for symmetry.",
+	"readPermissions":  ["com.palm.app.webdav-auth", "com.palm.service.webdav", "org.webosports.app.documents", "org.webosports.app.documents-*", "org.webosports.app.photos", "org.webosports.app.photos-*", "com.palm.service.photos"],
+	"writePermissions": ["com.palm.app.webdav-auth", "com.palm.service.webdav", "com.palm.service.photos"],
+
+	"capabilityProviders": [
+		{
+			"capability": "DOCUMENTS",
+			"id": "com.palm.webdav.documents",
+			"implementation": "palm://com.palm.service.webdav/",
+			"__comment": "The Documents app, Topaz Explorer's cloud drives and the account-derived QuickOffice reroute consume listFolder/downloadFile/uploadFile/createFolder/moveItem/deleteItem. Locators are paths under the account's WebDAV folder ('/' is that folder; a folder's path ends in '/')."
+		},
+		{
+			"capability": "PHOTO.UPLOAD",
+			"id": "com.palm.webdav.photos",
+			"implementation": "palm://com.palm.service.photos",
+			"onEnabled": "palm://com.palm.service.photos/onEnabled",
+			"onDelete": "palm://com.palm.service.photos/onDelete",
+			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
+			"__comment": "Makes the account a photo source. The Photos aggregator calls com.palm.service.webdav/listAlbums+listPhotos: the photo folder ('Photos' unless the account names another) and each folder in it are albums. WebDAV wants the password on every request, so listPhotos downloads each photo to /media/internal/.webdav-photos and hands file:// links (temporary:true), as MEGA does."
+		}
+	]
+}

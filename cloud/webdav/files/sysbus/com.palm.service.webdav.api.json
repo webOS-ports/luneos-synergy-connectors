@@ -1,0 +1,5 @@
+{
+    "synergy-webdav.operation": [
+        "com.palm.service.webdav/*"
+    ]
+}

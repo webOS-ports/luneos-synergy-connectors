@@ -1,0 +1,14 @@
+{
+    "com.palm.service.webdav": ["accountsservice.operation", "activity.operation", "systemsettings.query", "time.query"],
+    "com.palm.service.accounts": ["synergy-webdav.operation"],
+    "com.palm.app.accounts": ["synergy-webdav.operation"],
+    "com.palm.app.accounts-*": ["synergy-webdav.operation"],
+    "com.palm.app.webdav-auth-*": ["synergy-webdav.operation"],
+    "com.palm.app.webdav-auth": ["synergy-webdav.operation"],
+    "org.webosports.app.documents-*": ["synergy-webdav.operation"],
+    "org.webosports.app.documents": ["synergy-webdav.operation"],
+    "org.webosports.app.photos-*": ["synergy-webdav.operation"],
+    "org.webosports.app.photos": ["synergy-webdav.operation"],
+    "com.palm.service.photos": ["synergy-webdav.operation"],
+    "com.palm.stark.files.service": ["synergy-webdav.operation"]
+}
