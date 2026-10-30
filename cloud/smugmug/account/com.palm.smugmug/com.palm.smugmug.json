@@ -1,0 +1,33 @@
+{
+	"templateId": "com.palm.smugmug",
+	"loc_name": "SmugMug",
+	"loc_usernameLabel": "USERNAME",
+	"icon": {
+		"loc_32x32": "images/smugmug-32x32.png",
+		"loc_48x48": "images/smugmug-48x48.png"
+	},
+
+	"__comment": "OAuth 1.0a (HMAC-SHA1) replaces any username/password validator. customUI hosts the consent webview (like com.palm.eas / com.palm.skype); getAuthorizeUrl runs OAuth leg 1 (getRequestToken) and returns the authorize URL + request token/secret, Atlas captures oauth_verifier from the redirect to Config.CALLBACK_URL, then exchangeCode runs leg 3 (getAccessToken) and returns the stored token credentials. SmugMug is a PHOTO source only - no DOCUMENTS capability, no files app.",
+	"validator": {
+		"customUI": { "appId": "com.palm.app.smugmug-auth", "name": "oauth.html" },
+		"address":  "palm://com.palm.service.smugmug/exchangeCode"
+	},
+	"onCredentialsChanged": "palm://com.palm.service.smugmug/checkCredentials",
+
+	"__comment2": "com.palm.app.smugmug-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists (accounts/handlers/create.js -> Utils.hasPermission). Working templates (teams/telegram/skype/dropbox) list their own auth app, not com.palm.app.accounts.",
+	"__comment3": "com.palm.service.smugmug is in read+writePermissions so the service itself can readCredentials(accountId) to sign photo-provider calls. SmugMug OAuth 1.0a tokens do NOT expire/rotate, so writeCredentials is effectively unused after create (kept for symmetry).",
+	"readPermissions":  ["com.palm.app.smugmug-auth", "com.palm.service.smugmug", "org.webosports.app.photos", "org.webosports.app.photos-*", "com.palm.service.photos"],
+	"writePermissions": ["com.palm.app.smugmug-auth", "com.palm.service.smugmug", "com.palm.service.photos"],
+
+	"capabilityProviders": [
+		{
+			"capability": "PHOTO.UPLOAD",
+			"id": "com.palm.smugmug.photos",
+			"implementation": "palm://com.palm.service.photos",
+			"onEnabled": "palm://com.palm.service.photos/onEnabled",
+			"onDelete": "palm://com.palm.service.photos/onDelete",
+			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
+			"__comment": "Makes the SmugMug account a photo source. implementation/hooks point at the stock Photos AGGREGATOR (com.palm.service.photos), which discovers PHOTO.UPLOAD accounts and (its service name derived from the templateId) calls com.palm.service.smugmug/listAlbums+listPhotos and downloads each photo from the URL listPhotos gives."
+		}
+	]
+}

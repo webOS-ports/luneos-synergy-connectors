@@ -5,6 +5,35 @@ source that browses your Flickr albums and pulls the images into the stock Photo
 Flickr is a **PHOTO source only** — there is no documents/files role, no QuickOffice, and
 no files app.
 
+## Status and limitations
+
+> **Not usable as shipped, and not in the LuneOS image.** The code is complete and unit-tested,
+> but it has never signed in to a real account: nobody holds a Flickr API key for it.
+
+- **An API key needs Flickr Pro.** Flickr's app registration says *"API key creation is
+  currently disabled for free accounts… available to all Flickr PRO subscribers"* (seen
+  2026-10-30). So whoever builds LuneOS with Flickr needs a Pro subscription, or a key from
+  someone who has one. Users who sign in need no Pro account: the key is the app's, theirs is
+  just a login. Nothing was found saying whether a key keeps working after a Pro subscription
+  ends.
+- **The key and secret ship in the image.** OAuth 1.0a has no public client: the consumer
+  secret signs every request, so it sits in `config.js` on every device and anyone can read it.
+  If it is abused, Flickr can revoke it and the account type stops working for everyone.
+- **The build cannot fill the key in yet.** `config.js` has `PUT_YOUR_FLICKR_API_KEY_HERE` /
+  `PUT_YOUR_FLICKR_API_SECRET_HERE`, not the `PLACEHOLDER_FLICKR_CLIENT_ID` /
+  `PLACEHOLDER_FLICKR_CLIENT_SECRET` that meta-luneos `cloud-synergy-connector.inc` replaces
+  (as cloud/smugmug's are); with `FLICKR_CLIENT_ID` set, the build only warns that it is unused.
+- **Read-only, photos only.** Browse and download; no upload, no videos (they are left out).
+- **The sign-in app logs its result** until #14 is merged: `flickrAuth.js` `finish()` writes the
+  whole result to the log, the access token and secret included. #14 makes it (and the other
+  sign-in apps) log only how the sign-in ended.
+- **The icons are placeholders** (plain squares).
+
+To make it work: get a key from a Pro account, register the callback below, switch
+`config.js` to the `PLACEHOLDER_FLICKR_*` names, put `FLICKR_CLIENT_ID` /
+`FLICKR_CLIENT_SECRET` in the builder's secrets, and add `synergy-cloud-flickr` back to the
+image (meta-luneos).
+
 ## Components
 
 | Path | What it is |
@@ -85,23 +114,20 @@ so the aggregator fetches these with **no auth header** (private photos included
 `service/com.palm.service.flickr/config.js`:
 
 - `CONSUMER_KEY` / `CONSUMER_SECRET` — **required.** Create an app at
-  <https://www.flickr.com/services/apps/create/> to get an API key + secret. `CONSUMER_KEY`
-  is also the REST `api_key`; `CONSUMER_SECRET` signs every request (OAuth 1.0a). Both are
-  placeholders in `config.js` and must be filled in.
+  <https://www.flickr.com/services/apps/create/> (a Flickr Pro account is needed, see above)
+  to get an API key + secret. `CONSUMER_KEY` is also the REST `api_key`; `CONSUMER_SECRET`
+  signs every request (OAuth 1.0a). Both are placeholders in `config.js` and must be filled in.
 - `CALLBACK_URL` = `http://localhost/flickr/oauth1callback` — configure the Flickr app's
   callback URL to this (Atlas intercepts navigation to it to capture `oauth_verifier`).
 - `CURL`, `CURL_CAINFO` — not used by the service (node's `fetch` does the HTTPS); the
   on-device harness's TLS check (`tests/suites/cloud.py`) still uses them.
 
-## Integration (handled separately)
+## Integration
 
-Making the account appear as a Photos album needs the **shared** photos-integration work
-(a separate integrator owns these — this connector does **not** modify them):
-
-1. `photos-integration/` `Utils.js` patch — add a `case "com.palm.flickr"` →
-   `com.palm.service.flickr` to the aggregator's hardcoded `templateId → serviceName` switch.
-2. `photos-integration/` `Sync-Manager.js` patch — the curl-based image downloader (already
-   in place for Dropbox; reused unchanged — the Flickr `src_big` URLs are ordinary https).
+On LuneOS the Photos service (`com.palm.service.photos`) derives the service name from the
+template id (`com.palm.flickr` → `com.palm.service.flickr`) and downloads `src_big` itself, so
+nothing in it is specific to Flickr. (On legacy webOS this took the `Utils.js` and
+`Sync-Manager.js` patches of the photos integration.)
 
 ## Deploy (device)
 

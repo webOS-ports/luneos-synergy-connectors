@@ -1,0 +1,11 @@
+{
+    "com.palm.service.smugmug": ["accountsservice.operation", "activity.operation", "systemsettings.query", "time.query"],
+    "com.palm.service.accounts": ["synergy-smugmug.operation"],
+    "com.palm.app.accounts": ["synergy-smugmug.operation"],
+    "com.palm.app.accounts-*": ["synergy-smugmug.operation"],
+    "com.palm.app.smugmug-auth-*": ["synergy-smugmug.operation"],
+    "com.palm.app.smugmug-auth": ["synergy-smugmug.operation"],
+    "org.webosports.app.photos-*": ["synergy-smugmug.operation"],
+    "org.webosports.app.photos": ["synergy-smugmug.operation"],
+    "com.palm.service.photos": ["synergy-smugmug.operation"]
+}
