@@ -70,7 +70,9 @@ enyo.kind({
 		this.inherited(arguments);
 		this.done = false;
 		this.params = enyo.windowParams || {};
-		this.log("smugmug-auth: launch params " + enyo.json.stringify(this.params));
+		// The params can carry an existing account: log only what the launch is for.
+		this.log("smugmug-auth: launched for " + ((this.params.template && this.params.template.templateId) || "(no template)") +
+			(this.params.account ? ", an existing account" : ""));
 	},
 
 	setStatus: function (t) { this.$.status.setContent(t); },
