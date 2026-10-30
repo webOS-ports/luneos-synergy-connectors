@@ -1,0 +1,19 @@
+{
+    "appId": "com.palm.service.photoprism",
+    "allowedNames": [
+        "com.palm.service.photoprism"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "com.palm.service.photoprism",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}
