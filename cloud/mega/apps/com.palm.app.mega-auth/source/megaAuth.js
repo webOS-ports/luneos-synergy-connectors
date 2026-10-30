@@ -69,7 +69,8 @@ enyo.kind({
 		if (this.params.account && this.params.account.username) {
 			this.$.emailField.setValue(this.params.account.username);
 		}
-		this.log("mega-auth: launch params " + enyo.json.stringify(this.params));
+		this.log("mega-auth: launched for " + ((this.params.template && this.params.template.templateId) || "(no template)") +
+			(this.params.account ? ", an existing account" : ""));
 	},
 
 	signInTap: function () {
@@ -98,7 +99,7 @@ enyo.kind({
 		} else {
 			this.$.status.setContent("Sign-in failed. Please check your connection and try again.");
 		}
-		this.log("mega-auth: login failed " + enyo.json.stringify(inResponse));
+		this.log("mega-auth: login failed " + (inResponse && inResponse.errorCode));
 	},
 
 	// login succeeded -> return credentials to Accounts (tag with template on create).
@@ -123,7 +124,9 @@ enyo.kind({
 
 	finish: function (result) {
 		this.done = true;
-		this.log("mega-auth: sending result " + enyo.json.stringify(result));
+		// The result holds the credentials: log only how it ended.
+		this.log("mega-auth: sending result returnValue=" + (result && result.returnValue) +
+			(result && result.errorCode ? " errorCode=" + result.errorCode : ""));
 		this.$.xresult.sendResult(result);
 	}
 });
