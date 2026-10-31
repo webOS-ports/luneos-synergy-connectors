@@ -225,7 +225,6 @@ func TestT4PlayAfterTheSessionWasLostResumesTheTrack(t *testing.T) {
 	}
 
 	s.mu.Lock()
-	s.limit, s.limitedTill = 1, time.Time{}
 	s.calls = map[string]int{}
 	s.afterNotFound = func() { s.listed = true; s.limit = 1; s.calls["x"] = 2 } // the look gets a 429
 	s.mu.Unlock()
@@ -241,6 +240,43 @@ func TestT4PlayAfterTheSessionWasLostResumesTheTrack(t *testing.T) {
 	}
 	if h.restarts != 0 {
 		t.Fatalf("%d restarts: librespot came back by itself", h.restarts)
+	}
+}
+
+func TestACommandWaitsOutAShortLimit(t *testing.T) {
+	s, _ := useT4(t)
+	s.mu.Lock()
+	s.limit = 1
+	s.calls["x"] = 5
+	s.mu.Unlock()
+	if w := post(handlePlayerPlay, "/player/play", ``); w.Code != http.StatusOK {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestLoadIsRememberedBeforeLibrespotSaysSo(t *testing.T) {
+	// the session can go between the load and librespot's first event
+	s, _ := useT4(t)
+	s.mu.Lock()
+	s.silent = true
+	s.mu.Unlock()
+	if w := post(handlePlayerLoad, "/player/load", `{"uri":"`+t4Track+`","position_ms":7000}`); w.Code != http.StatusOK {
+		t.Fatalf("%d", w.Code)
+	}
+	librespotResume.forgot()
+	if uri, pos, ok := librespotResume.pending(); !ok || uri != t4Track || pos != 7000 {
+		t.Fatalf("%q at %d, %v", uri, pos, ok)
+	}
+}
+
+func TestASeekOnAPlayingTrackIsSent(t *testing.T) {
+	s, _ := useT4(t)
+	t4Playing(t)
+	if w := post(handlePlayerSeek, "/player/seek", `{"position_ms":5000}`); w.Code != http.StatusOK {
+		t.Fatalf("%d", w.Code)
+	}
+	if n := s.count("PUT /me/player/seek"); n != 1 {
+		t.Fatalf("%d seeks sent", n)
 	}
 }
 
