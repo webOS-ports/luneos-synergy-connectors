@@ -96,7 +96,7 @@ func clientFromToken(tok *oauth2.Token) *spotify.Client {
 	base := oauthConfig().TokenSource(context.Background(), tok)
 	src := oauth2.ReuseTokenSource(tok, &savingTokenSource{src: base, last: tok.AccessToken})
 	currentTokenSource = src
-	return spotify.New(oauth2.NewClient(context.Background(), src))
+	return spotify.New(webHTTPClient(src))
 }
 
 // restoreSession reloads a token at startup. It prefers a webOS Accounts

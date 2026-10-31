@@ -230,6 +230,8 @@ func runLibrespot(bin, tok string) (time.Duration, error) {
 	} else {
 		close(consumed)
 	}
+	// a new librespot has no track
+	librespotResume.forgot()
 	started := time.Now()
 	librespotMu.Lock()
 	librespotCur, librespotSince, librespotSoon = cmd, started, false

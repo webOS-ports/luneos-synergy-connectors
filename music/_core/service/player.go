@@ -57,6 +57,9 @@ func playerErr(w http.ResponseWriter, err error) {
 		httpErr(w, http.StatusConflict, "no librespot device; is it running/logged in?")
 	case errors.Is(err, errNoWebSession):
 		httpErr(w, http.StatusUnauthorized, "no session; POST /session first")
+	case isRateLimited(err):
+		w.Header().Set("Retry-After", retryAfterSeconds(webRate.remaining()))
+		httpErr(w, http.StatusTooManyRequests, err.Error())
 	default:
 		httpErr(w, http.StatusBadGateway, err.Error())
 	}
@@ -97,6 +100,7 @@ func handlePlayerLoad(w http.ResponseWriter, r *http.Request) {
 		playerErr(w, err)
 		return
 	}
+	librespotResume.loaded(body.URI, body.PositionMs)
 	librespotCommands.answered("/player/load")
 	// report duration so the UI can show the seek bar immediately
 	dur := 0
@@ -116,7 +120,7 @@ func handlePlayerPlay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := commandOnDevice(r.Context(), "play", func(ctx context.Context, opt *spotify.PlayOptions) error {
-		return c.PlayOpt(ctx, opt)
+		return playOrResume(ctx, c, opt, true)
 	}); err != nil {
 		playerErr(w, err)
 		return
@@ -131,6 +135,7 @@ func handlePlayerPlay(w http.ResponseWriter, r *http.Request) {
 func handlePlayerPause(w http.ResponseWriter, r *http.Request) {
 	noteAppPlayer("")
 	gen, held := librespotHold.hold()
+	librespotResume.freeze()
 	c, err := webAPI{}.client()
 	if err == nil {
 		opt := deviceOpt()
@@ -205,6 +210,10 @@ func handlePlayerSeek(w http.ResponseWriter, r *http.Request) {
 		PositionMs int `json:"position_ms"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	if librespotResume.seek(body.PositionMs) {
+		writeJSON(w, map[string]bool{"ok": true})
+		return
+	}
 	if err := commandOnDevice(r.Context(), "seek", func(ctx context.Context, opt *spotify.PlayOptions) error {
 		return c.SeekOpt(ctx, body.PositionMs, opt)
 	}); err != nil {
@@ -244,9 +253,23 @@ func handlePlayerStatus(w http.ResponseWriter, r *http.Request) {
 	if c == nil {
 		return
 	}
-	st, err := c.PlayerCurrentlyPlaying(r.Context())
+	st, err := playerStatus.get(r.Context(), func(ctx context.Context) (*spotify.CurrentlyPlaying, error) {
+		return c.PlayerCurrentlyPlaying(ctx)
+	})
+	uri, position, lost := librespotResume.report()
 	if err != nil {
-		httpErr(w, http.StatusBadGateway, err.Error())
+		// no network, or the rate limit: what librespot's events say. An error here
+		// is a report the Music app drops, and it plays on in its own mind.
+		if pid, _ := currentLibrespot(); pid == 0 && !lost {
+			playerErr(w, err)
+			return
+		}
+		playing := librespotPlaying.Load() && !lost
+		state := "idle"
+		if uri != "" {
+			state = "playing"
+		}
+		writeJSON(w, map[string]interface{}{"is_playing": playing, "position_ms": position, "uri": uri, "state": state})
 		return
 	}
 	// librespot's reported progress runs ~gstBufferLatencyMs ahead of the audible
@@ -258,7 +281,8 @@ func handlePlayerStatus(w http.ResponseWriter, r *http.Request) {
 		pos = 0
 	}
 	out := map[string]interface{}{
-		"is_playing":  st.Playing,
+		// whatever Spotify thinks, a librespot that lost its track plays nothing
+		"is_playing":  st.Playing && !lost,
 		"position_ms": pos,
 	}
 	if st.Item != nil {

@@ -280,6 +280,8 @@ exit 3
 	t.Cleanup(func() { librespotLogf, librespotHeal, sess.librespotName = oldLogf, oldHeal, oldName })
 
 	librespotPlaying.Store(true)
+	resetT4State(t)
+	librespotResume.loaded(t4Track, 1000)
 	ran, err := runLibrespot(bin, shortToken)
 	if ran < 0 || err == nil || !strings.Contains(err.Error(), "exit status 3") {
 		t.Fatalf("ran %v, err %v", ran, err)
@@ -298,6 +300,9 @@ exit 3
 	}
 	if librespotPlaying.Load() {
 		t.Fatal("still playing after its end")
+	}
+	if _, _, ok := librespotResume.pending(); !ok {
+		t.Fatal("a new librespot taken to have the track")
 	}
 	if strings.Contains(got, shortToken) || strings.Contains(got, "--access-token") {
 		t.Fatalf("token on the command line or in the log:\n%s", got)

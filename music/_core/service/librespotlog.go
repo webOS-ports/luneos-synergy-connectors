@@ -170,6 +170,14 @@ func (o *librespotOutput) line(raw string) {
 	if level != "TRACE" && level != "DEBUG" {
 		noteLibrespotActivity(now)
 	}
+	if important {
+		for _, l := range librespotSessionGone {
+			if strings.Contains(raw, l) {
+				librespotResume.forgot()
+				break
+			}
+		}
+	}
 	if important && o.onLoss != nil {
 		for _, l := range librespotLossLines {
 			if strings.Contains(raw, l) {

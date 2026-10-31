@@ -184,8 +184,17 @@ func (h *librespotHealer) heal(ctx context.Context, why string, forUser bool) er
 	return run.err
 }
 
-func (h *librespotHealer) doHeal(ctx context.Context, why string, forUser bool) error {
+// lookPatiently is a look that waits out a rate limit it can wait for.
+func (h *librespotHealer) lookPatiently(ctx context.Context) (bool, error) {
 	ok, err := h.look(ctx)
+	if isRateLimited(err) && waitRateLimit(ctx, h.sleep, h.wait) {
+		return h.look(ctx)
+	}
+	return ok, err
+}
+
+func (h *librespotHealer) doHeal(ctx context.Context, why string, forUser bool) error {
+	ok, err := h.lookPatiently(ctx)
 	if err != nil {
 		return err // no network, no session: a restart cannot help
 	}
@@ -196,7 +205,7 @@ func (h *librespotHealer) doHeal(ctx context.Context, why string, forUser bool) 
 	if err := h.sleep(ctx, h.poll); err != nil {
 		return err
 	}
-	if ok, err = h.look(ctx); err != nil {
+	if ok, err = h.lookPatiently(ctx); err != nil {
 		return err
 	}
 	if ok {
@@ -366,6 +375,9 @@ func commandOnDevice(ctx context.Context, what string, send func(ctx context.Con
 		}
 	}
 	err := send(ctx, opt)
+	if isRateLimited(err) && waitRateLimit(ctx, sleepCtx, commandLimitWait) {
+		err = send(ctx, opt)
+	}
 	if err == nil || h == nil || !isDeviceGone(err) {
 		return err
 	}

@@ -243,7 +243,7 @@ func (a webAPI) play(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return c.PlayOpt(ctx, deviceOpt())
+	return playOrResume(ctx, c, deviceOpt(), false)
 }
 
 func (a webAPI) next(ctx context.Context) error {
@@ -303,6 +303,7 @@ func (c *librespotControl) call(what string, f func(context.Context) error) erro
 
 func (c *librespotControl) pause() {
 	gen, held := c.hold.hold()
+	librespotResume.freeze()
 	go func() {
 		if c.call("pause", c.api.pause) == nil && held {
 			c.watchRemoteResume(gen)

@@ -370,6 +370,7 @@ func useWebAPI(t *testing.T, f *fakeConnect, deviceID string) (*fakeWebAPI, *fak
 	h := newTestHealer(t, f, clk, time.Hour)
 	h.list = webAPIDevices
 	h.setDevice = func(id string) { setDeviceID(spotify.ID(id)); f.setDevice(id) }
+	resetT4State(t)
 	oldHeal, oldName, oldWatch := librespotHeal, sess.librespotName, librespotCommands
 	librespotHeal = h
 	// the not-acted-on watch is tested on its own
