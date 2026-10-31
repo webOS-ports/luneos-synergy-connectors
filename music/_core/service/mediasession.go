@@ -547,6 +547,7 @@ func startMediaSession() {
 		// opened read-write, so it only ends if reading fails; read on after that
 		for {
 			readLibrespotEvents(events, func(ev map[string]string) {
+				noteLibrespotEvent(ev)
 				s.post(func() { s.onLibrespotEvent(ev) })
 			})
 			time.Sleep(time.Second)

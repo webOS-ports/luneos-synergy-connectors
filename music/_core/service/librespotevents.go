@@ -22,6 +22,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // librespotEventArg is the argument that makes this binary forward one event.
@@ -158,5 +159,21 @@ func readLibrespotEvents(r *os.File, deliver func(map[string]string)) {
 	}
 	if err := lines.Err(); err != nil {
 		log.Printf("librespot events: %v", err)
+	}
+}
+
+// noteLibrespotEvent: librespot did something (librespotlog.go). Its session
+// events are logged; session_disconnected is librespot becoming inactive -
+// another device took the play over, or it shut down (connect/src/spirc.rs
+// handle_disconnect) - and not, by itself, a lost connection.
+func noteLibrespotEvent(ev map[string]string) {
+	noteLibrespotActivity(time.Now())
+	switch e := ev["PLAYER_EVENT"]; e {
+	case "session_connected", "session_disconnected", "session_client_changed":
+		log.Printf("librespot event: %s", e)
+	case "playing":
+		librespotPlaying.Store(true)
+	case "paused", "stopped", "end_of_track", "unavailable":
+		librespotPlaying.Store(false)
 	}
 }

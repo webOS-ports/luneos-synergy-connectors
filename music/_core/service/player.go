@@ -38,6 +38,30 @@ func selectLibrespotDevice() {
 	log.Printf("librespot device %q not found among %d devices; is librespot running?", name, len(devices))
 }
 
+func setDeviceID(id spotify.ID) {
+	sess.mu.Lock()
+	sess.deviceID = id
+	sess.mu.Unlock()
+}
+
+func deviceIDString() string {
+	sess.mu.RLock()
+	defer sess.mu.RUnlock()
+	return string(sess.deviceID)
+}
+
+// playerErr answers a /player/* command that failed.
+func playerErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errDeviceMissing):
+		httpErr(w, http.StatusConflict, "no librespot device; is it running/logged in?")
+	case errors.Is(err, errNoWebSession):
+		httpErr(w, http.StatusUnauthorized, "no session; POST /session first")
+	default:
+		httpErr(w, http.StatusBadGateway, err.Error())
+	}
+}
+
 func deviceOpt() *spotify.PlayOptions {
 	sess.mu.RLock()
 	id := sess.deviceID
@@ -61,22 +85,19 @@ func handlePlayerLoad(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	noteAppPlayer(body.URI)
 
-	opt := deviceOpt()
-	if opt == nil {
-		httpErr(w, http.StatusConflict, "no librespot device; is it running/logged in?")
-		return
-	}
 	librespotHold.release()
-	uri := spotify.URI(body.URI)
-	opt.URIs = []spotify.URI{uri}
-	if body.PositionMs > 0 {
-		pos := spotify.Numeric(body.PositionMs)
-		opt.PositionMs = pos
-	}
-	if err := c.PlayOpt(r.Context(), opt); err != nil {
-		httpErr(w, http.StatusBadGateway, err.Error())
+	err := commandOnDevice(r.Context(), "load", func(ctx context.Context, opt *spotify.PlayOptions) error {
+		opt.URIs = []spotify.URI{spotify.URI(body.URI)}
+		if body.PositionMs > 0 {
+			opt.PositionMs = spotify.Numeric(body.PositionMs)
+		}
+		return c.PlayOpt(ctx, opt)
+	})
+	if err != nil {
+		playerErr(w, err)
 		return
 	}
+	librespotCommands.answered("/player/load")
 	// report duration so the UI can show the seek bar immediately
 	dur := 0
 	if id := strings.TrimPrefix(body.URI, "spotify:track:"); id != body.URI {
@@ -94,10 +115,13 @@ func handlePlayerPlay(w http.ResponseWriter, r *http.Request) {
 	if c == nil {
 		return
 	}
-	if err := c.PlayOpt(r.Context(), deviceOpt()); err != nil {
-		httpErr(w, http.StatusBadGateway, err.Error())
+	if err := commandOnDevice(r.Context(), "play", func(ctx context.Context, opt *spotify.PlayOptions) error {
+		return c.PlayOpt(ctx, opt)
+	}); err != nil {
+		playerErr(w, err)
 		return
 	}
+	librespotCommands.answered("/player/play")
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
@@ -109,12 +133,21 @@ func handlePlayerPause(w http.ResponseWriter, r *http.Request) {
 	gen, held := librespotHold.hold()
 	c, err := webAPI{}.client()
 	if err == nil {
-		err = c.PauseOpt(r.Context(), deviceOpt())
+		opt := deviceOpt()
+		err = c.PauseOpt(r.Context(), opt)
+		// not healed here, where the hold has silenced librespot already: looked
+		// at in the background
+		if h := librespotHeal; h != nil && (opt == nil || isDeviceGone(err)) {
+			go h.check("pause without librespot's device")
+		}
 	}
 	switch {
 	case err == nil:
 		if held {
 			go librespotCtl.watchRemoteResume(gen)
+		} else {
+			// held, librespot's player waits on its pipe and says nothing
+			librespotCommands.answered("/player/pause")
 		}
 		writeJSON(w, map[string]bool{"ok": true})
 	case held:
@@ -134,10 +167,13 @@ func handlePlayerNext(w http.ResponseWriter, r *http.Request) {
 	if c == nil {
 		return
 	}
-	if err := c.NextOpt(r.Context(), deviceOpt()); err != nil {
-		httpErr(w, http.StatusBadGateway, err.Error())
+	if err := commandOnDevice(r.Context(), "next", func(ctx context.Context, opt *spotify.PlayOptions) error {
+		return c.NextOpt(ctx, opt)
+	}); err != nil {
+		playerErr(w, err)
 		return
 	}
+	librespotCommands.answered("/player/next")
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
@@ -148,10 +184,13 @@ func handlePlayerPrev(w http.ResponseWriter, r *http.Request) {
 	if c == nil {
 		return
 	}
-	if err := c.PreviousOpt(r.Context(), deviceOpt()); err != nil {
-		httpErr(w, http.StatusBadGateway, err.Error())
+	if err := commandOnDevice(r.Context(), "previous", func(ctx context.Context, opt *spotify.PlayOptions) error {
+		return c.PreviousOpt(ctx, opt)
+	}); err != nil {
+		playerErr(w, err)
 		return
 	}
+	librespotCommands.answered("/player/previous")
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
@@ -166,10 +205,13 @@ func handlePlayerSeek(w http.ResponseWriter, r *http.Request) {
 		PositionMs int `json:"position_ms"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	if err := c.SeekOpt(r.Context(), body.PositionMs, deviceOpt()); err != nil {
-		httpErr(w, http.StatusBadGateway, err.Error())
+	if err := commandOnDevice(r.Context(), "seek", func(ctx context.Context, opt *spotify.PlayOptions) error {
+		return c.SeekOpt(ctx, body.PositionMs, opt)
+	}); err != nil {
+		playerErr(w, err)
 		return
 	}
+	librespotCommands.answered("/player/seek")
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
@@ -184,8 +226,11 @@ func handlePlayerVolume(w http.ResponseWriter, r *http.Request) {
 		Volume int `json:"volume"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	if err := c.VolumeOpt(r.Context(), body.Volume, deviceOpt()); err != nil {
-		httpErr(w, http.StatusBadGateway, err.Error())
+	// not watched for librespot acting on it: the same volume again changes nothing
+	if err := commandOnDevice(r.Context(), "volume", func(ctx context.Context, opt *spotify.PlayOptions) error {
+		return c.VolumeOpt(ctx, body.Volume, opt)
+	}); err != nil {
+		playerErr(w, err)
 		return
 	}
 	writeJSON(w, map[string]bool{"ok": true})
