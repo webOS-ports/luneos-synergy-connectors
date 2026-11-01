@@ -122,10 +122,14 @@ func main() {
 	clientIDFile := flag.String("client-id-file", "", "file to read the client id from if -client-id is empty (default: "+strings.Join(configPaths("spotify-client-id"), ", then ")+")")
 	redirect := flag.String("redirect", "http://127.0.0.1:8730/auth/callback", "OAuth redirect URL (must be registered on the Spotify app)")
 	tokenFile := flag.String("token-file", tokenPath, "where to persist the OAuth token (survives restarts)")
+	verbose := flag.Bool("librespot-verbose", false, "run librespot with --verbose (its log at trace level; LIBRESPOT_VERBOSE=1 or RUST_LOG=... in the environment do the same)")
 	flag.Parse()
+	librespotVerbose = *verbose
 	tokenPath = *tokenFile
 	syncSecrets() // before anything reads a token file (secrets.go)
 	sess.librespotName = *librespotName
+	librespotHeal = newLibrespotHealer()
+	go librespotHeal.watch(nil)
 	cfg.addr = *addr
 	cfg.clientID = *clientID
 	cfg.redirectURL = *redirect
