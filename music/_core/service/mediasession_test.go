@@ -90,17 +90,37 @@ func (b *fakeBus) lastStatus() string {
 	return ""
 }
 
+// fakeControl lets go of a hold as the real one does; with pauseHolds a pause takes
+// one, as it does when librespot has a pipeline.
 type fakeControl struct {
-	calls    []string
-	held     bool
-	playDone func(ok bool)
+	calls      []string
+	held       bool
+	pauseHolds bool
+	playDone   func(ok bool)
 }
 
-func (c *fakeControl) pause()                  { c.calls = append(c.calls, "pause") }
-func (c *fakeControl) play(done func(ok bool)) { c.calls = append(c.calls, "play"); c.playDone = done }
-func (c *fakeControl) next()                   { c.calls = append(c.calls, "next") }
-func (c *fakeControl) previous()               { c.calls = append(c.calls, "previous") }
-func (c *fakeControl) holding() bool           { return c.held }
+func (c *fakeControl) pause() {
+	c.calls = append(c.calls, "pause")
+	c.held = c.held || c.pauseHolds
+}
+
+func (c *fakeControl) play(done func(ok bool)) {
+	c.calls = append(c.calls, "play")
+	c.held = false
+	c.playDone = done
+}
+
+func (c *fakeControl) next() {
+	c.calls = append(c.calls, "next")
+	c.held = false
+}
+
+func (c *fakeControl) previous() {
+	c.calls = append(c.calls, "previous")
+	c.held = false
+}
+
+func (c *fakeControl) holding() bool { return c.held }
 
 type sessionTest struct {
 	t   *testing.T
@@ -375,7 +395,7 @@ func TestSessionPausedTrackRegisters(t *testing.T) {
 	}
 }
 
-func TestSessionPlayingWhileHeldIsIgnored(t *testing.T) {
+func TestSessionPlayingEventWhileHeld(t *testing.T) {
 	st := newSessionTest(t)
 	st.playing("spotify:track:1")
 	st.registered()
@@ -385,10 +405,286 @@ func TestSessionPlayingWhileHeldIsIgnored(t *testing.T) {
 	if st.bus.lastStatus() != playStatePaused {
 		t.Fatalf("a playing event from before the hold made it %s", st.bus.lastStatus())
 	}
+	// what it said is kept: let go, librespot plays, and may not say so again
 	st.ctl.held = false
-	st.event("PLAYER_EVENT", "playing", "TRACK_ID", "x")
+	st.advance(time.Second)
 	if st.bus.lastStatus() != playStatePlaying {
 		t.Fatalf("after the hold, playing is %s", st.bus.lastStatus())
+	}
+}
+
+// heldTrack is the placeholder of the tests of a hold.
+const heldTrack = "spotify:track:0000000000000000000000"
+
+// appPauses is the Music app's /player/pause on a track it plays: the output is
+// held, and librespot, stopped on its pipe, says nothing.
+func (st *sessionTest) appPauses() {
+	st.s.onAppRequest("")
+	st.ctl.held = true
+}
+
+// appPolls is the Music app's heartbeat for d.
+func (st *sessionTest) appPolls(d time.Duration) {
+	for end := st.now.Add(d); st.now.Before(end); {
+		st.now = st.now.Add(time.Second)
+		st.s.onAppRequest("")
+	}
+}
+
+// appCloses: the app says no more, and the session takes over by itself.
+func (st *sessionTest) appCloses() {
+	st.t.Helper()
+	st.advance(appHeartbeat)
+}
+
+// neverPlaying fails if mediacontroller was told the session plays.
+func (st *sessionTest) neverPlaying() {
+	st.t.Helper()
+	for _, c := range st.bus.sent {
+		if c.method == "activateMediaSession" || c.payload["playStatus"] == playStatePlaying {
+			st.t.Fatalf("told mediacontroller %s %v over a held output: %v", c.method, c.payload["playStatus"], st.bus.methods())
+		}
+	}
+}
+
+// callComes is what audiod does for a call: it asks for the status, and only a
+// session saying it plays gets the pause and, afterwards, the play.
+func (st *sessionTest) callComes() {
+	st.t.Helper()
+	if st.s.status() != playStatePlaying {
+		return
+	}
+	st.key("pause")
+	st.key("play")
+}
+
+func TestSessionTakesOverAMusicAppPauseAsPaused(t *testing.T) {
+	st := newSessionTest(t)
+	st.s.onAppRequest(heldTrack)
+	st.playing(heldTrack)
+	st.appPolls(3 * time.Second)
+	st.appPauses()
+	st.appPolls(10 * time.Minute)
+	if len(st.bus.registrations()) != 0 {
+		t.Fatal("took a session while the app has librespot")
+	}
+	st.appCloses()
+	st.registered()
+	if st.bus.lastStatus() != playStatePaused {
+		t.Fatalf("took over a held output as %q", st.bus.lastStatus())
+	}
+	// minutes pass, then a call and its end: nothing to pause, nothing to play
+	st.advance(3 * time.Minute)
+	st.callComes()
+	st.advance(2 * time.Minute)
+	st.neverPlaying()
+	if len(st.ctl.calls) != 0 {
+		t.Fatalf("a call did %v to a paused session", st.ctl.calls)
+	}
+
+	// the app comes back, loads, pauses, goes: paused again
+	st.bus.sent = nil
+	st.s.onAppRequest(heldTrack)
+	st.ctl.held = false
+	st.appPauses()
+	st.appCloses()
+	st.neverPlaying()
+	if st.bus.lastStatus() != playStatePaused {
+		t.Fatalf("second pause taken over as %q", st.bus.lastStatus())
+	}
+}
+
+func TestSessionTakesOverAPausedEventAsPaused(t *testing.T) {
+	// nothing to hold, or librespot heard of the pause in time: no hold, an event
+	st := newSessionTest(t)
+	st.s.onAppRequest(heldTrack)
+	st.playing(heldTrack)
+	st.s.onAppRequest("")
+	st.event("PLAYER_EVENT", "paused", "TRACK_ID", "x")
+	st.appCloses()
+	st.registered()
+	st.neverPlaying()
+	if st.bus.lastStatus() != playStatePaused {
+		t.Fatalf("status %q", st.bus.lastStatus())
+	}
+}
+
+func TestSessionPlayingTrackTakesOverAndResumesAfterACall(t *testing.T) {
+	st := newSessionTest(t)
+	st.ctl.pauseHolds = true
+	st.s.onAppRequest(heldTrack)
+	st.playing(heldTrack)
+	st.appPolls(3 * time.Second)
+	st.appCloses()
+	st.registered()
+	if got := st.bus.methods(); !reflect.DeepEqual(got, []string{"activateMediaSession", "setMediaPlayStatus", "setMediaMetaData"}) || st.bus.lastStatus() != playStatePlaying {
+		t.Fatalf("a playing track taken over: %v (%s)", got, st.bus.lastStatus())
+	}
+	st.bus.sent = nil
+	st.key("pause")
+	if !st.ctl.held || st.bus.lastStatus() != playStatePaused {
+		t.Fatalf("the call's pause: held %v, %q", st.ctl.held, st.bus.lastStatus())
+	}
+	st.advance(time.Minute)
+	if got := st.bus.methods(); !reflect.DeepEqual(got, []string{"setMediaPlayStatus"}) {
+		t.Fatalf("during the call sent %v: a paused session stays active, for the play after it", got)
+	}
+	st.key("play")
+	if st.bus.lastStatus() != playStatePlaying || st.ctl.held {
+		t.Fatalf("after the call: held %v, %q", st.ctl.held, st.bus.lastStatus())
+	}
+	if !reflect.DeepEqual(st.ctl.calls, []string{"pause", "play"}) {
+		t.Fatalf("did %v", st.ctl.calls)
+	}
+}
+
+func TestSessionHoldOfTheAppWhileItsOwn(t *testing.T) {
+	// the session has librespot (another controller's track) and the app pauses
+	st := newSessionTest(t)
+	st.s.onAppRequest(heldTrack)
+	st.playing("spotify:track:1")
+	st.registered()
+	if st.bus.lastStatus() != playStatePlaying {
+		t.Fatalf("status %q", st.bus.lastStatus())
+	}
+	st.bus.sent = nil
+	st.ctl.held = true
+	st.advance(time.Second) // the session's tick
+	if got := st.bus.methods(); !reflect.DeepEqual(got, []string{"setMediaPlayStatus"}) || st.bus.lastStatus() != playStatePaused {
+		t.Fatalf("a hold while PLAYING: %v (%s), want PAUSED by the next tick, still active", got, st.bus.lastStatus())
+	}
+}
+
+// heldAfterTheApp is a session that took over a hold of the Music app.
+func heldAfterTheApp(t *testing.T) *sessionTest {
+	t.Helper()
+	st := newSessionTest(t)
+	st.s.onAppRequest(heldTrack)
+	st.playing(heldTrack)
+	st.appPauses()
+	st.appCloses()
+	st.registered()
+	if st.bus.lastStatus() != playStatePaused {
+		t.Fatalf("status %q", st.bus.lastStatus())
+	}
+	return st
+}
+
+// wakes is what librespot does when let go of with the pause and a play queued.
+func (st *sessionTest) wakes() {
+	st.event("PLAYER_EVENT", "paused", "TRACK_ID", "x")
+	st.event("PLAYER_EVENT", "playing", "TRACK_ID", "x")
+}
+
+func TestSessionPlaysAgainAfterAHold(t *testing.T) {
+	letGo := map[string]func(st *sessionTest){
+		// /player/play, next and previous let go, and count as the app's call
+		"the app":      func(st *sessionTest) { st.s.onAppRequest(""); st.ctl.held = false },
+		"key play":     func(st *sessionTest) { st.key("play") },
+		"key next":     func(st *sessionTest) { st.key("next") },
+		"key previous": func(st *sessionTest) { st.key("previous") },
+		"Connect":      func(st *sessionTest) { st.ctl.held = false }, // watchRemoteResume
+	}
+	for name, release := range letGo {
+		t.Run(name, func(t *testing.T) {
+			st := heldAfterTheApp(t)
+			release(st)
+			st.wakes()
+			st.appCloses()
+			if st.bus.lastStatus() != playStatePlaying {
+				t.Fatalf("status %q", st.bus.lastStatus())
+			}
+			if m := st.bus.methods(); m[len(m)-1] == "deactivateMediaSession" {
+				t.Fatalf("sent %v", m)
+			}
+		})
+	}
+}
+
+func TestSessionHoldLetGoLibrespotStaysPaused(t *testing.T) {
+	// a next on a paused Connect session: librespot acts on the pause it had
+	// queued, and stays there
+	st := heldAfterTheApp(t)
+	st.key("next")
+	st.event("PLAYER_EVENT", "paused", "TRACK_ID", "x")
+	st.advance(time.Second)
+	if st.bus.lastStatus() != playStatePaused {
+		t.Fatalf("status %q", st.bus.lastStatus())
+	}
+}
+
+func TestSessionHoldLetGoWithoutAWordFromLibrespot(t *testing.T) {
+	// no network: the pause never reached librespot, which plays on when let go,
+	// and has nothing to say. It sounds, so a call must find it PLAYING.
+	cases := map[string]func(st *sessionTest){
+		"the app's hold": func(st *sessionTest) { st.appPauses(); st.appCloses(); st.registered() },
+		"the session's":  func(st *sessionTest) { st.appCloses(); st.registered(); st.key("pause") },
+	}
+	for name, hold := range cases {
+		t.Run(name, func(t *testing.T) {
+			st := newSessionTest(t)
+			st.ctl.pauseHolds = true
+			st.s.onAppRequest(heldTrack)
+			st.playing(heldTrack)
+			hold(st)
+			if st.bus.lastStatus() != playStatePaused {
+				t.Fatalf("held: status %q", st.bus.lastStatus())
+			}
+			st.ctl.held = false
+			st.advance(time.Second)
+			if st.bus.lastStatus() != playStatePlaying {
+				t.Fatalf("let go: status %q", st.bus.lastStatus())
+			}
+		})
+	}
+}
+
+func TestSessionPauseWithNothingToHold(t *testing.T) {
+	// no pipeline: nothing held, so the key itself says paused
+	st := newSessionTest(t)
+	st.playing(heldTrack)
+	st.registered()
+	st.key("pause")
+	if st.s.playing || st.bus.lastStatus() != playStatePaused {
+		t.Fatalf("playing %v, %q", st.s.playing, st.bus.lastStatus())
+	}
+}
+
+func TestSessionPlayPauseOnAHold(t *testing.T) {
+	st := heldAfterTheApp(t)
+	st.key("playPause")
+	if !reflect.DeepEqual(st.ctl.calls, []string{"play"}) {
+		t.Fatalf("playPause on a held output did %v", st.ctl.calls)
+	}
+}
+
+func TestSessionSeesThePauseOfPlayerPause(t *testing.T) {
+	// the real hold and /player/pause, without the Web API
+	if librespotCtl.hold != librespotHold {
+		t.Fatal("the session's controls do not see the hold /player/pause takes")
+	}
+	p := useHold(t, 100)
+	st := newSessionTest(t)
+	st.s.ctl = &librespotControl{hold: librespotHold, api: &fakeAPI{}, timeout: time.Second, poll: time.Hour}
+	mediaSession = st.s
+	t.Cleanup(func() { mediaSession = nil })
+	st.s.onAppRequest(heldTrack)
+	st.playing(heldTrack)
+	if code, body := pausePlayer(t); code != 200 || body != `{"held":true,"ok":true}` {
+		t.Fatalf("%d %s", code, body)
+	}
+	st.pump(1)
+	st.appCloses()
+	st.registered()
+	st.neverPlaying()
+	if st.bus.lastStatus() != playStatePaused {
+		t.Fatalf("status %q", st.bus.lastStatus())
+	}
+	// gone, the hold is over; librespot replaced what was held and said so
+	p.remove(200)
+	st.wakes()
+	if st.bus.lastStatus() != playStatePlaying {
+		t.Fatalf("status %q", st.bus.lastStatus())
 	}
 }
 

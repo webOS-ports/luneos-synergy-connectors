@@ -10,11 +10,17 @@ package main
 // first holds librespot's output still: the gst-launch librespot pipes its sound
 // into is stopped (SIGSTOP). Its PulseAudio stream runs dry and is silent, and
 // librespot, its pipe full, waits at the track's position, so nothing is lost.
+// Its player thread waits in that write, and that thread is what takes commands
+// and sends events: Connect (spirc) still takes the pause from Spotify, but
+// librespot acts on it, and says "paused", only when the hold is let go. So
+// nothing that wants to know whether librespot sounds can go by its events alone
+// while it is held (holding; the media session, mediasession.go).
 // The hold is let go (SIGCONT) by a play, a next or a previous, from the session
 // or the Music app; and, once the Web API has the pause, by a resume from another
 // Connect controller, which the Web API shows (watchRemoteResume). When librespot
-// itself pauses - it kills the stopped gst-launch and starts another on play -
-// the hold has nothing left to hold and ends.
+// does pause - after the release, or before its pipe was full - it kills
+// gst-launch and starts another on play, and the hold has nothing left to hold
+// and ends.
 //
 // SIGKILL ends a stopped process, so librespot can always replace its pipeline.
 
