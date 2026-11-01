@@ -111,6 +111,11 @@ type config struct {
 var cfg = &config{}
 
 func main() {
+	// librespot's --onevent program (librespotevents.go): forward, and nothing else
+	if len(os.Args) == 2 && os.Args[1] == librespotEventArg {
+		forwardLibrespotEvent(os.Getenv, librespotEventFIFO)
+		return
+	}
 	addr := flag.String("addr", "127.0.0.1:8730", "listen address (localhost only)")
 	librespotName := flag.String("librespot-name", "webOS", "Connect device name to target for playback")
 	clientID := flag.String("client-id", "", "Spotify app client id (for the in-backend OAuth PKCE flow)")
@@ -168,6 +173,7 @@ func main() {
 		registerProvider(&appleProvider{})
 	}
 
+	startMediaSession()     // before librespot starts (mediasession.go)
 	restoreLibrespotToken() // before restoreSession, which starts librespot
 	restoreSession()        // reload a persisted token, if any, so login survives restarts
 	serveLibrespotOAuth()   // end of librespot's sign-in (librespotauth.go)

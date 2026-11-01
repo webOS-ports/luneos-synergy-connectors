@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -58,12 +59,14 @@ func handlePlayerLoad(w http.ResponseWriter, r *http.Request) {
 		PositionMs int    `json:"position_ms"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	noteAppPlayer(body.URI)
 
 	opt := deviceOpt()
 	if opt == nil {
 		httpErr(w, http.StatusConflict, "no librespot device; is it running/logged in?")
 		return
 	}
+	librespotHold.release()
 	uri := spotify.URI(body.URI)
 	opt.URIs = []spotify.URI{uri}
 	if body.PositionMs > 0 {
@@ -85,6 +88,8 @@ func handlePlayerLoad(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePlayerPlay(w http.ResponseWriter, r *http.Request) {
+	noteAppPlayer("")
+	librespotHold.release()
 	c := currentClient(w)
 	if c == nil {
 		return
@@ -96,19 +101,35 @@ func handlePlayerPlay(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
+// POST /player/pause. librespot's output is held still first (librespotcontrol.go),
+// so that it is silent at once, and even when the Web API cannot pause it: the
+// reply is then {ok, held}.
 func handlePlayerPause(w http.ResponseWriter, r *http.Request) {
-	c := currentClient(w)
-	if c == nil {
-		return
+	noteAppPlayer("")
+	gen, held := librespotHold.hold()
+	c, err := webAPI{}.client()
+	if err == nil {
+		err = c.PauseOpt(r.Context(), deviceOpt())
 	}
-	if err := c.PauseOpt(r.Context(), deviceOpt()); err != nil {
+	switch {
+	case err == nil:
+		if held {
+			go librespotCtl.watchRemoteResume(gen)
+		}
+		writeJSON(w, map[string]bool{"ok": true})
+	case held:
+		log.Printf("player/pause: %v; librespot's output held", err)
+		writeJSON(w, map[string]bool{"ok": true, "held": true})
+	case errors.Is(err, errNoWebSession):
+		httpErr(w, http.StatusUnauthorized, "no session; POST /session first")
+	default:
 		httpErr(w, http.StatusBadGateway, err.Error())
-		return
 	}
-	writeJSON(w, map[string]bool{"ok": true})
 }
 
 func handlePlayerNext(w http.ResponseWriter, r *http.Request) {
+	noteAppPlayer("")
+	librespotHold.release()
 	c := currentClient(w)
 	if c == nil {
 		return
@@ -121,6 +142,8 @@ func handlePlayerNext(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePlayerPrev(w http.ResponseWriter, r *http.Request) {
+	noteAppPlayer("")
+	librespotHold.release()
 	c := currentClient(w)
 	if c == nil {
 		return
@@ -134,6 +157,7 @@ func handlePlayerPrev(w http.ResponseWriter, r *http.Request) {
 
 // POST /player/seek {position_ms}
 func handlePlayerSeek(w http.ResponseWriter, r *http.Request) {
+	noteAppPlayer("")
 	c := currentClient(w)
 	if c == nil {
 		return
@@ -151,6 +175,7 @@ func handlePlayerSeek(w http.ResponseWriter, r *http.Request) {
 
 // POST /player/volume {volume} 0..100
 func handlePlayerVolume(w http.ResponseWriter, r *http.Request) {
+	noteAppPlayer("")
 	c := currentClient(w)
 	if c == nil {
 		return
@@ -168,6 +193,8 @@ func handlePlayerVolume(w http.ResponseWriter, r *http.Request) {
 
 // GET /player/status -> {is_playing, position_ms, duration_ms, uri, state}
 func handlePlayerStatus(w http.ResponseWriter, r *http.Request) {
+	// the Music app polls this every second while it has a Spotify track
+	noteAppPlayer("")
 	c := currentClient(w)
 	if c == nil {
 		return

@@ -63,3 +63,23 @@ Probe without a session (should be HTTP 401 "no session"):
 ```bash
 curl 'http://127.0.0.1:8730/search?q=daft+punk&type=track'
 ```
+
+## Media session (com.webos.service.mediacontroller)
+
+librespot is a media session of mediacontroller (`mediasession.go`), so it is
+paused when another player starts, paused for a call and resumed after it by
+audiod, and takes a headset's and the dashboard's play/pause/next/previous. It
+reports its play status and the track's metadata from librespot's own events:
+librespot runs `spotify-webos-service -librespot-event` for each (`--onevent`),
+which writes it into the FIFO `/media/cryptofs/spotify-webos/librespot-events`
+(`librespotevents.go`). The bus is reached through `luna-send -a
+org.webosports.app.music.service`, which needs `mediacontroller.query` in that
+id's client permissions (the luneos-synergy-music recipe).
+
+While the Music app drives librespot itself (`/player/*` in the last 5 s and the
+track it loaded), its own session covers the sound and this one stands aside.
+
+A pause - a key, or `/player/pause` - holds librespot's output still at once
+(SIGSTOP of its gst-launch) besides pausing it through the Web API, so it is
+silent without a network too (`librespotcontrol.go`); play, next and previous
+let it go.

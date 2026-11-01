@@ -105,17 +105,24 @@ func librespotLoop() {
 			"--initial-volume", "100",
 			"--volume-ctrl", "linear",
 		}
+		// its player events, for the media session (librespotevents.go)
+		if onevent := librespotOnEvent(); onevent != "" {
+			args = append(args, "--onevent", onevent)
+		}
 		if tok != "" { // first login needs a token; afterwards --system-cache creds suffice
 			args = append(args, "--access-token", tok)
 		}
 		cmd := exec.Command(librespotBin, args...)
-		if lf, err := os.OpenFile(librespotLog, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+		lf, err := os.OpenFile(librespotLog, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err == nil {
 			cmd.Stdout, cmd.Stderr = lf, lf
-			defer lf.Close()
 		}
 		log.Printf("librespot: starting (token=%v)", tok != "")
 		if err := cmd.Start(); err != nil {
 			log.Printf("librespot: start failed: %v", err)
+			if lf != nil {
+				lf.Close()
+			}
 			time.Sleep(10 * time.Second)
 			continue
 		}
@@ -125,9 +132,17 @@ func librespotLoop() {
 		// once it registers, (re)select it as the playback device
 		go func() { time.Sleep(6 * time.Second); selectLibrespotDevice() }()
 		_ = cmd.Wait()
+		if lf != nil {
+			lf.Close()
+		}
 		librespotMu.Lock()
 		librespotCur = nil
 		librespotMu.Unlock()
+		// what it held, it held as this librespot; the next one starts afresh
+		librespotHold.release()
+		if mediaSession != nil {
+			mediaSession.post(mediaSession.onLibrespotExit)
+		}
 		log.Printf("librespot: exited; restarting in 5s")
 		time.Sleep(5 * time.Second)
 	}
@@ -144,6 +159,16 @@ func restartLibrespot() {
 	}
 	startLibrespot()
 	go func() { time.Sleep(6 * time.Second); selectLibrespotDevice() }()
+}
+
+// currentLibrespotPid is the running librespot's pid, or 0.
+func currentLibrespotPid() int {
+	librespotMu.Lock()
+	defer librespotMu.Unlock()
+	if librespotCur == nil || librespotCur.Process == nil {
+		return 0
+	}
+	return librespotCur.Process.Pid
 }
 
 func fileExists(p string) bool {
