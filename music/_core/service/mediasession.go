@@ -21,7 +21,8 @@ package main
 //     librespot has stopped or the Music app has it.
 //   - told PLAYING / PAUSED / STOPPED and the track's title, artists, album,
 //     duration and number, from librespot's own events (librespotevents.go),
-//     which come with or without a network.
+//     which come with or without a network. PLAYING only while its output is not
+//     held (below).
 //   - its keys: "play" and "pause" are play and pause, never a toggle, as the
 //     Music app takes them; "next" and "previous" skip. Each goes to librespot
 //     through spotifyControl (librespotcontrol.go), which pauses even without
@@ -32,6 +33,16 @@ package main
 // and nothing resumes it but the user), audiod sends one when a call starts and
 // "play" when it is over (a transient loss - paused, then resumed), and only to a
 // session it saw playing.
+//
+// That is why the session may not say PLAYING over a held output. A hold stops
+// librespot's player thread on its full pipe, so librespot says nothing about a
+// pause until the hold is let go (librespotcontrol.go): after the Music app's
+// /player/pause its last word stays "playing". A session taking over then said
+// PLAYING over silence, audiod paused it for the next call, and sounded it after
+// that. So playing is what librespot said, and sounding is that without a hold,
+// whoever took it; the hold is looked at each time, and each second in run, so a
+// hold let go without a word from librespot - it never heard of the pause - is
+// PLAYING again by itself, and one it did hear of is ended by its own events.
 //
 // The Music app's own session covers what it plays through librespot: it sends
 // /player/load, polls /player/status every second while a Spotify track is loaded,
@@ -91,7 +102,8 @@ type mcBus interface {
 }
 
 // spotifyControl drives librespot for the session's keys. None of them blocks.
-// holding reports whether librespot's output is held still by a pause.
+// holding reports whether librespot's output is held still by a pause, the
+// session's or the Music app's.
 type spotifyControl interface {
 	pause()
 	// play calls done, on its own goroutine, with whether librespot plays now
@@ -114,7 +126,7 @@ type spotifySession struct {
 	// a session id of this run's own, different for every registration
 	newMediaID func() string
 
-	// librespot, from its events
+	// librespot, from its events. playing says nothing of a hold: see sounding.
 	lsRunning bool
 	hasTrack  bool
 	playing   bool
@@ -193,11 +205,6 @@ func (s *spotifySession) onLibrespotEvent(ev map[string]string) {
 		s.hasTrack = true
 		s.track = lsTrack{uri: ev["URI"], meta: trackMetaData(ev)}
 	case "playing":
-		// Held still by a pause, librespot cannot be playing: this was sent
-		// before the hold took, and the queue it waited in is behind it.
-		if s.ctl.holding() {
-			break
-		}
 		s.hasTrack = true
 		s.playing = true
 		s.seq++
@@ -315,7 +322,7 @@ func (s *spotifySession) onKey(key string) {
 	}
 	if key == "playPause" {
 		key = "pause"
-		if !s.playing {
+		if !s.sounding() {
 			key = "play"
 		}
 	}
@@ -331,8 +338,10 @@ func (s *spotifySession) onKey(key string) {
 			}
 		})
 	case "pause", "stop":
-		s.playing = false
 		s.ctl.pause()
+		// Held, librespot has not paused yet and may never hear of it: the hold
+		// is the pause, and a release leaves librespot as it was.
+		s.playing = s.playing && s.ctl.holding()
 	case "next":
 		s.ctl.next()
 	case "previous":
@@ -364,12 +373,15 @@ func (s *spotifySession) owned() bool {
 	return s.appURI != "" && s.track.uri != "" && s.appURI != s.track.uri
 }
 
+// sounding: librespot plays, and its output is not held still.
+func (s *spotifySession) sounding() bool { return s.playing && !s.ctl.holding() }
+
 // status is what the session tells mediacontroller.
 func (s *spotifySession) status() string {
 	switch {
 	case !s.lsRunning || !s.hasTrack || !s.owned():
 		return playStateStopped
-	case s.playing:
+	case s.sounding():
 		return playStatePlaying
 	default:
 		return playStatePaused

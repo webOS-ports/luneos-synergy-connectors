@@ -45,6 +45,21 @@ func TestPlayerPauseHoldsWithoutTheWebAPI(t *testing.T) {
 	}
 }
 
+func TestPlayerCommandsLetGoOfAHold(t *testing.T) {
+	for name, handler := range map[string]http.HandlerFunc{
+		"/player/play": handlePlayerPlay, "/player/next": handlePlayerNext, "/player/previous": handlePlayerPrev,
+	} {
+		t.Run(name, func(t *testing.T) {
+			useHold(t, 100)
+			pausePlayer(t)
+			handler(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, name, nil))
+			if librespotHold.holding() {
+				t.Fatal("left the output held")
+			}
+		})
+	}
+}
+
 func TestPlayerPauseWithNothingToHold(t *testing.T) {
 	useHold(t, 0)
 	if code, _ := pausePlayer(t); code != http.StatusUnauthorized {
