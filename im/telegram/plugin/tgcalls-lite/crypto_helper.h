@@ -23,10 +23,15 @@ struct AesKeyIv {
 // msgKey is a 16-byte value (see EncryptedConnection's own packet layout, not yet ported here).
 // x is 0 or 8, selecting which of the two directions' derivation this is for (matches tgcalls'
 // own PrepareAesKeyIv(key, msgKey, x) call sites -- outgoing vs incoming use the opposite x).
-AesKeyIv prepare_aes_key_iv(const uint8_t *key, const uint8_t *msgKey, int x);
+// Returns false if OpenSSL fails.
+bool prepare_aes_key_iv(const uint8_t *key, const uint8_t *msgKey, int x, AesKeyIv &result);
 
-// AES-256-CTR in place is NOT assumed; writes to `to` (may equal `from` for in-place use).
-void aes_process_ctr(const uint8_t *from, size_t len, uint8_t *to, AesKeyIv &&keyIv);
+// AES-256-CTR; writes to `to` (may equal `from` for in-place use). Returns false if OpenSSL fails.
+bool aes_process_ctr(const uint8_t *from, size_t len, uint8_t *to, const AesKeyIv &keyIv);
+
+// out = SHA-256(a || b). Returns false if OpenSSL fails.
+bool concat_sha256(const uint8_t *a, size_t a_len, const uint8_t *b, size_t b_len,
+                   std::array<uint8_t, 32> &out);
 
 } // namespace tgcalls_lite
 

@@ -24,7 +24,7 @@ std::vector<uint8_t> concat_key_salt(const std::array<uint8_t, 16> &key, const s
 } // namespace
 
 MediaSession::MediaSession(GMainContext *ctx, bool isOutgoing)
-	: _ctx(ctx), _isOutgoing(isOutgoing) {
+	: _isOutgoing(isOutgoing) {
 	_ice = std::make_unique<IceSession>(ctx, /*controlling=*/isOutgoing);
 	// See header comment: caller (isOutgoing) = DTLS server (passive), callee = DTLS client
 	// (active). DtlsTransport's isClient constructor arg is the inverse of isOutgoing here.

@@ -70,7 +70,6 @@ private:
 	void handleIceData(const uint8_t *data, size_t len);
 	void setState(MediaSessionState s);
 
-	GMainContext *_ctx;
 	bool _isOutgoing;
 	std::unique_ptr<IceSession> _ice;
 	std::unique_ptr<DtlsTransport> _dtls;

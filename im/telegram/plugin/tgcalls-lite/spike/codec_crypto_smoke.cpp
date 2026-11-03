@@ -3,6 +3,7 @@
 // either into the real engine.
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include "../signaling_message.h"
 #include "../crypto_helper.h"
 #include "../encrypted_connection.h"
@@ -123,16 +124,37 @@ static void test_crypto_roundtrip() {
 	size_t len = strlen(plaintext);
 	std::vector<uint8_t> ciphertext(len), decrypted(len);
 
-	auto keyIv1 = prepare_aes_key_iv(key, msgKey, 0);
-	aes_process_ctr((const uint8_t *)plaintext, len, ciphertext.data(), std::move(keyIv1));
+	AesKeyIv keyIv1;
+	CHECK(prepare_aes_key_iv(key, msgKey, 0, keyIv1), "key/IV derivation succeeds");
+	CHECK(aes_process_ctr((const uint8_t *)plaintext, len, ciphertext.data(), keyIv1), "AES-CTR succeeds");
 
 	CHECK(memcmp(ciphertext.data(), plaintext, len) != 0, "ciphertext differs from plaintext");
 
-	auto keyIv2 = prepare_aes_key_iv(key, msgKey, 0);
-	aes_process_ctr(ciphertext.data(), len, decrypted.data(), std::move(keyIv2));
+	AesKeyIv keyIv2;
+	CHECK(prepare_aes_key_iv(key, msgKey, 0, keyIv2), "key/IV derivation succeeds");
+	CHECK(aes_process_ctr(ciphertext.data(), len, decrypted.data(), keyIv2), "AES-CTR succeeds");
 
 	CHECK(memcmp(decrypted.data(), plaintext, len) == 0, "AES-CTR roundtrip recovers plaintext");
 	fprintf(stderr, "crypto roundtrip: %s\n", memcmp(decrypted.data(), plaintext, len) == 0 ? "OK" : "MISMATCH");
+}
+
+// Known answer, computed independently with Python's hashlib and cryptography (AES-256-CTR) from
+// tgcalls' formula: the outgoing side's first packet, seq 1, key[i] = i * 3 + 11.
+static void test_encrypted_connection_known_answer() {
+	uint8_t key[256];
+	for (int i = 0; i < 256; i++) key[i] = (uint8_t)(i * 3 + 11);
+	static const uint8_t expected[] = {
+		0x37,0x73,0xe6,0x25,0x0a,0x74,0x26,0x05,0x32,0xaa,0x6d,0x84,0xbc,0x01,0x67,0x3c,
+		0xf9,0x4b,0x3c,0x69,0x3b,0xcc,0xb3,0x9d,0xd3,0xbe,0x43,0x74,0xe9,0xff,0xb8,0x56,
+	};
+	const char *text = "known answer";
+	EncryptedConnection caller(key, true);
+	auto ct = caller.encrypt(std::vector<uint8_t>(text, text + strlen(text)));
+	CHECK(ct.size() == sizeof(expected) && memcmp(ct.data(), expected, sizeof(expected)) == 0,
+	      "first outgoing packet matches the independent reference");
+	EncryptedConnection callee(key, false);
+	auto pt = callee.decrypt(std::vector<uint8_t>(expected, expected + sizeof(expected)));
+	CHECK(pt && std::string(pt->begin(), pt->end()) == text, "reference packet decrypts");
 }
 
 static void test_encrypted_connection() {
@@ -197,6 +219,7 @@ int main() {
 	test_negotiate_channels();
 	test_media_state();
 	test_crypto_roundtrip();
+	test_encrypted_connection_known_answer();
 	test_encrypted_connection();
 
 	if (failures == 0) {

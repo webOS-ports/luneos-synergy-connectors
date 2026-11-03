@@ -90,7 +90,6 @@ private:
 	EncryptedConnection _enc;
 	MediaSession _media;
 	AudioPipeline _audio;
-	bool _isOutgoing;
 	bool _isVideo;
 	bool _sentInitialSetup = false;
 	bool _sentNegotiateChannels = false;

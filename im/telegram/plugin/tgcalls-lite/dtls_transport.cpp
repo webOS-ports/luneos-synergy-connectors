@@ -157,13 +157,19 @@ void DtlsTransport::driveHandshake() {
 		if (onHandshakeComplete) onHandshakeComplete();
 		return;
 	}
-	pumpOutgoing();
-
+	// Read the result before pumpOutgoing(): with re-entrant wiring, sending can feed the peer's
+	// answer back into this object and finish the handshake, after which SSL_get_error() on this
+	// old rc reports an error with nothing in the queue.
 	int err = SSL_get_error(_ssl, rc);
+	unsigned long errCode = ERR_get_error();
+	pumpOutgoing();
+	if (_handshakeDone)
+		return;
+
 	if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
 		if (onHandshakeFailed) {
 			char errbuf[256];
-			ERR_error_string_n(ERR_get_error(), errbuf, sizeof(errbuf));
+			ERR_error_string_n(errCode, errbuf, sizeof(errbuf));
 			onHandshakeFailed(errbuf);
 		}
 	}

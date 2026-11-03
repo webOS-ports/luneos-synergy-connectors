@@ -1,7 +1,6 @@
 #include "encrypted_connection.h"
 #include "crypto_helper.h"
 
-#include <openssl/sha.h>
 #include <cstring>
 #include <algorithm>
 
@@ -21,17 +20,6 @@ void write_seq_be(uint8_t *out, uint32_t seq) {
 
 uint32_t read_seq_be(const uint8_t *in) {
 	return ((uint32_t)in[0] << 24) | ((uint32_t)in[1] << 16) | ((uint32_t)in[2] << 8) | (uint32_t)in[3];
-}
-
-std::array<uint8_t, SHA256_DIGEST_LENGTH> concat_sha256(const uint8_t *a, size_t a_len,
-                                                          const uint8_t *b, size_t b_len) {
-	std::array<uint8_t, SHA256_DIGEST_LENGTH> result;
-	SHA256_CTX ctx;
-	SHA256_Init(&ctx);
-	SHA256_Update(&ctx, a, a_len);
-	SHA256_Update(&ctx, b, b_len);
-	SHA256_Final(result.data(), &ctx);
-	return result;
 }
 
 bool const_time_is_different(const uint8_t *a, const uint8_t *b, size_t size) {
@@ -57,13 +45,17 @@ std::vector<uint8_t> EncryptedConnection::encrypt(const std::vector<uint8_t> &pl
 
 	const int x = (_isOutgoing ? 0 : 8) + 128;
 
-	const auto msgKeyLarge = concat_sha256(_key.data() + 88 + x, 32, buffer.data(), buffer.size());
+	std::array<uint8_t, 32> msgKeyLarge;
+	if (!concat_sha256(_key.data() + 88 + x, 32, buffer.data(), buffer.size(), msgKeyLarge))
+		return {};
 
 	std::vector<uint8_t> result(16 + buffer.size());
 	memcpy(result.data(), msgKeyLarge.data() + 8, 16);
 
-	auto aesKeyIv = prepare_aes_key_iv(_key.data(), result.data(), x);
-	aes_process_ctr(buffer.data(), buffer.size(), result.data() + 16, std::move(aesKeyIv));
+	AesKeyIv aesKeyIv;
+	if (!prepare_aes_key_iv(_key.data(), result.data(), x, aesKeyIv)
+	    || !aes_process_ctr(buffer.data(), buffer.size(), result.data() + 16, aesKeyIv))
+		return {};
 
 	return result;
 }
@@ -79,12 +71,13 @@ std::optional<std::vector<uint8_t>> EncryptedConnection::decrypt(const std::vect
 	const uint8_t *encryptedData = msgKey + 16;
 	size_t dataSize = ciphertext.size() - 16;
 
-	auto aesKeyIv = prepare_aes_key_iv(_key.data(), msgKey, x);
-
+	AesKeyIv aesKeyIv;
 	std::vector<uint8_t> decryptionBuffer(dataSize);
-	aes_process_ctr(encryptedData, dataSize, decryptionBuffer.data(), std::move(aesKeyIv));
-
-	const auto msgKeyLarge = concat_sha256(_key.data() + 88 + x, 32, decryptionBuffer.data(), decryptionBuffer.size());
+	std::array<uint8_t, 32> msgKeyLarge;
+	if (!prepare_aes_key_iv(_key.data(), msgKey, x, aesKeyIv)
+	    || !aes_process_ctr(encryptedData, dataSize, decryptionBuffer.data(), aesKeyIv)
+	    || !concat_sha256(_key.data() + 88 + x, 32, decryptionBuffer.data(), decryptionBuffer.size(), msgKeyLarge))
+		return std::nullopt;
 	if (const_time_is_different(msgKeyLarge.data() + 8, msgKey, 16)) {
 		return std::nullopt; // integrity check failed -- wrong key, corrupted, or not really tgcalls data
 	}

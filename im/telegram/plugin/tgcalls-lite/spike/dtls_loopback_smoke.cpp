@@ -28,8 +28,9 @@ int main() {
 	bool clientDone = false, serverDone = false;
 	client.onHandshakeComplete = [&]() { fprintf(stderr, "spike: client handshake complete\n"); clientDone = true; };
 	server.onHandshakeComplete = [&]() { fprintf(stderr, "spike: server handshake complete\n"); serverDone = true; };
-	client.onHandshakeFailed = [&](const std::string &e) { fprintf(stderr, "spike: client handshake FAILED: %s\n", e.c_str()); };
-	server.onHandshakeFailed = [&](const std::string &e) { fprintf(stderr, "spike: server handshake FAILED: %s\n", e.c_str()); };
+	int handshakeFailures = 0;
+	client.onHandshakeFailed = [&](const std::string &e) { fprintf(stderr, "spike: client handshake FAILED: %s\n", e.c_str()); handshakeFailures++; };
+	server.onHandshakeFailed = [&](const std::string &e) { fprintf(stderr, "spike: server handshake FAILED: %s\n", e.c_str()); handshakeFailures++; };
 
 	std::string clientFp = client.getLocalFingerprint();
 	std::string serverFp = server.getLocalFingerprint();
@@ -53,6 +54,7 @@ int main() {
 
 	CHECK(clientDone, "client handshake completed");
 	CHECK(serverDone, "server handshake completed");
+	CHECK(handshakeFailures == 0, "no handshake failure reported");
 
 	if (clientDone && serverDone) {
 		CHECK(client.verifyPeerFingerprint(serverFp), "client verifies server's real fingerprint");

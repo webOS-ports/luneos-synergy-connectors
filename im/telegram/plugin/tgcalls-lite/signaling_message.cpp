@@ -355,7 +355,12 @@ bool parse_media_content(JsonObject *obj, MediaContent *out) {
 			JsonObject *extObj = json_array_get_object_element(arr, i);
 			if (!extObj) continue;
 			RtpExtension ext;
-			if (json_object_has_member(extObj, "id")) ext.id = json_object_get_int_member(extObj, "id");
+			if (json_object_has_member(extObj, "id")) {
+				// RTP header extension ids are 1 to 255 (RFC 8285); anything else is not one.
+				const gint64 id = json_object_get_int_member(extObj, "id");
+				if (id < 1 || id > 255) continue;
+				ext.id = (int)id;
+			}
 			if (json_object_has_member(extObj, "uri")) ext.uri = json_object_get_string_member(extObj, "uri");
 			out->rtpExtensions.push_back(std::move(ext));
 		}

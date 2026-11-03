@@ -4,8 +4,6 @@
 
 #include <cstdio>
 #include <cstring>
-#include <cstdlib>
-#include <ctime>
 
 namespace tgcalls_lite {
 
@@ -36,9 +34,9 @@ void build_rtp_header(uint8_t *hdr, uint8_t payloadType, uint16_t seq, uint32_t 
 }
 
 uint32_t random_ssrc() {
-	// Not cryptographically random -- SSRC collision avoidance doesn't need that, just needs to
-	// differ from whatever the peer picks (astronomically likely with a 32-bit space either way).
-	return ((uint32_t)rand() << 16) ^ (uint32_t)rand();
+	// An SSRC only has to differ from the peer's; it need not be secret. GLib seeds this
+	// generator from /dev/urandom, so two calls in the same second do not repeat it.
+	return g_random_int();
 }
 
 MediaContent build_audio_content(uint32_t ssrc) {
@@ -80,9 +78,7 @@ MediaContent build_video_content(uint32_t ssrc) {
 } // namespace
 
 CallEngine::CallEngine(GMainContext *ctx, const uint8_t *key256, bool isOutgoing, bool isVideo)
-	: _enc(key256, isOutgoing), _media(ctx, isOutgoing), _isOutgoing(isOutgoing), _isVideo(isVideo) {
-	static bool seeded = false;
-	if (!seeded) { srand((unsigned)time(nullptr)); seeded = true; }
+	: _enc(key256, isOutgoing), _media(ctx, isOutgoing), _isVideo(isVideo) {
 	_localAudioSsrc = random_ssrc();
 	_localVideoSsrc = random_ssrc();
 
@@ -238,6 +234,10 @@ void CallEngine::sendNegotiateChannels() {
 void CallEngine::emitEncrypted(const SignalingMessage &msg) {
 	auto bytes = signaling_message_serialize(msg);
 	auto encrypted = _enc.encrypt(bytes);
+	if (encrypted.empty()) {
+		g_warning("tgcalls-lite: could not encrypt a signaling message");
+		return;
+	}
 	if (onOutgoingSignalingData) onOutgoingSignalingData(encrypted);
 }
 
