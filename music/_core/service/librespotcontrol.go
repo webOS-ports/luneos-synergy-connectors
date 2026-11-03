@@ -22,13 +22,24 @@ package main
 // gst-launch and starts another on play, and the hold has nothing left to hold
 // and ends.
 //
+// A hold must not last once Spotify has the pause, though. The stopped
+// gst-launch keeps its PulseAudio stream open and running dry, which keeps
+// PulseAudio mixing and the audio hardware awake (~10% of a MindPhone core, for
+// as long as nobody presses play), and the watch asks the Web API every few
+// seconds. So once the Web API says paused, the hold settles: the stream is
+// muted, the hold let go, and librespot, its pipe free, takes the pause, kills
+// gst-launch with its stream, and the second of sound still in the pipeline is
+// never heard. A librespot that plays on regardless is held again and unmuted.
+//
 // SIGKILL ends a stopped process, so librespot can always replace its pipeline.
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -55,12 +66,13 @@ type outputHold struct {
 	mu           sync.Mutex
 	procRoot     string
 	signal       func(pid int, sig syscall.Signal) error
+	mute         func(pid int, on bool) error // the PulseAudio stream of pid
 	librespotPid func() int
 	held         []heldProc
 	gen          int // bumped by every hold and release
 }
 
-var librespotHold = &outputHold{procRoot: "/proc", signal: syscall.Kill, librespotPid: currentLibrespotPid}
+var librespotHold = &outputHold{procRoot: "/proc", signal: syscall.Kill, mute: pulseMute, librespotPid: currentLibrespotPid}
 
 // hold stops librespot's pipeline. It returns the hold's generation, and whether
 // anything is held: nothing is when librespot has no pipeline, i.e. is not
@@ -141,6 +153,35 @@ func (h *outputHold) holding() bool {
 	}
 	h.held = alive
 	return len(h.held) > 0
+}
+
+// heldIf is what the hold of generation gen holds, if it is still that hold.
+func (h *outputHold) heldIf(gen int) ([]heldProc, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if gen != h.gen {
+		return nil, false
+	}
+	return append([]heldProc(nil), h.held...), true
+}
+
+// alive is the part of procs still running.
+func (h *outputHold) alive(procs []heldProc) []heldProc {
+	var live []heldProc
+	for _, p := range procs {
+		if procStart(h.procRoot, p.pid) == p.start {
+			live = append(live, p)
+		}
+	}
+	return live
+}
+
+func (h *outputHold) unmute(procs []heldProc) {
+	for _, p := range h.alive(procs) {
+		if err := h.mute(p.pid, false); err != nil {
+			log.Printf("librespot: cannot unmute its output (pid %d): %v", p.pid, err)
+		}
+	}
 }
 
 func (h *outputHold) generation() int {
@@ -288,13 +329,14 @@ type librespotControl struct {
 	api     spotifyAPI
 	timeout time.Duration // for one Web API call
 	poll    time.Duration // between two looks for a resume elsewhere
+	settle  time.Duration // for librespot to take a pause once let go
 }
 
 // librespotCtl is the daemon's controls, the session's and /player/pause's.
 var librespotCtl = newLibrespotControl()
 
 func newLibrespotControl() *librespotControl {
-	return &librespotControl{hold: librespotHold, api: webAPI{}, timeout: 5 * time.Second, poll: 4 * time.Second}
+	return &librespotControl{hold: librespotHold, api: webAPI{}, timeout: 5 * time.Second, poll: 4 * time.Second, settle: 5 * time.Second}
 }
 
 func (c *librespotControl) call(what string, f func(context.Context) error) error {
@@ -341,12 +383,13 @@ func (c *librespotControl) previous() {
 
 func (c *librespotControl) holding() bool { return c.hold.holding() }
 
-// watchRemoteResume lets the hold of generation gen go when Spotify says it
-// plays again: another Connect controller resumed librespot, or moved the play
-// to another device, and librespot, held still, could act on neither. Right after the pause the Web API can still say playing,
-// so a resume counts only after it has said paused once.
+// watchRemoteResume ends the hold of generation gen once Spotify says paused
+// (settlePause), and lets it go when Spotify says it plays again: another Connect
+// controller resumed librespot, or moved the play to another device, and
+// librespot, held still, could act on neither. Right after the pause the Web API
+// can still say playing, so a resume counts only after it has said paused once.
 func (c *librespotControl) watchRemoteResume(gen int) {
-	sawPaused := false
+	sawPaused, settleTried := false, false
 	for {
 		time.Sleep(c.poll)
 		if c.hold.generation() != gen || !c.hold.holding() {
@@ -360,6 +403,13 @@ func (c *librespotControl) watchRemoteResume(gen int) {
 		}
 		if !playing {
 			sawPaused = true
+			if !settleTried {
+				settleTried = true
+				var settled bool
+				if gen, settled = c.settlePause(gen); settled {
+					return
+				}
+			}
 			continue
 		}
 		if !sawPaused {
@@ -370,4 +420,102 @@ func (c *librespotControl) watchRemoteResume(gen int) {
 		}
 		return
 	}
+}
+
+// settlePause lets librespot take the pause Spotify has, without a sound: the
+// held pipeline is muted and let go, and librespot ends it. It says whether that
+// happened, and the generation of the hold to watch from then on: a librespot
+// that plays on is held again, unmuted, under a new one.
+func (c *librespotControl) settlePause(gen int) (int, bool) {
+	h := c.hold
+	procs, ok := h.heldIf(gen)
+	if !ok || len(procs) == 0 || h.mute == nil {
+		return gen, false
+	}
+	var muted []heldProc
+	for _, p := range procs {
+		if err := h.mute(p.pid, true); err != nil {
+			// unheard is the hold's whole point: without a mute it stays
+			log.Printf("librespot: cannot mute its output (pid %d), so it stays held: %v", p.pid, err)
+			h.unmute(muted)
+			return gen, false
+		}
+		muted = append(muted, p)
+	}
+	if !h.releaseIf(gen) {
+		// a play, next or previous let it go meanwhile, to be heard
+		h.unmute(muted)
+		return gen, false
+	}
+	for end := time.Now().Add(c.settle); time.Now().Before(end); time.Sleep(c.settle / 50) {
+		if len(h.alive(procs)) == 0 {
+			log.Printf("librespot: paused, its output closed")
+			return gen, true
+		}
+	}
+	if len(h.alive(procs)) == 0 {
+		return gen, true
+	}
+	if h.generation() != gen+1 {
+		// a command after the release: what the pipeline does now is its doing
+		h.unmute(muted)
+		return gen, true
+	}
+	// librespot plays on: silence it the way the pause did, and keep watching
+	ngen, _ := h.hold()
+	h.unmute(muted)
+	log.Printf("librespot: did not take the pause; its output held again")
+	return ngen, false
+}
+
+// pulseMute mutes, or unmutes, the PulseAudio streams process pid plays.
+func pulseMute(pid int, on bool) error {
+	out, err := pactl("list", "sink-inputs")
+	if err != nil {
+		return err
+	}
+	ids := sinkInputsOf(out, pid)
+	if len(ids) == 0 {
+		return errors.New("no PulseAudio stream")
+	}
+	flag := "0"
+	if on {
+		flag = "1"
+	}
+	for _, id := range ids {
+		if _, err := pactl("set-sink-input-mute", id, flag); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func pactl(args ...string) (string, error) {
+	cmd := exec.Command("pactl", args...)
+	// pactl's labels, which sinkInputsOf reads, in English whatever the locale
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("pactl %s: %w", args[0], err)
+	}
+	return string(out), nil
+}
+
+// sinkInputsOf picks, from "pactl list sink-inputs", the streams of process pid.
+func sinkInputsOf(list string, pid int) []string {
+	var ids []string
+	cur := ""
+	want := `application.process.id = "` + strconv.Itoa(pid) + `"`
+	for _, line := range strings.Split(list, "\n") {
+		line = strings.TrimSpace(line)
+		if id, ok := strings.CutPrefix(line, "Sink Input #"); ok {
+			cur = id
+			continue
+		}
+		if cur != "" && line == want {
+			ids = append(ids, cur)
+			cur = "" // once per stream
+		}
+	}
+	return ids
 }
