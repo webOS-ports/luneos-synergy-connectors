@@ -16,10 +16,13 @@ import (
 // A /proc of the test's own: librespot (pid 100), its gst-launch and an --onevent
 // program, the stream player's gst-launch (another parent), and a zombie.
 type fakeProc struct {
-	t    *testing.T
-	root string
-	mu   sync.Mutex
-	sigs []string
+	t       *testing.T
+	root    string
+	mu      sync.Mutex
+	sigs    []string
+	mutes   []string
+	muteErr error
+	onCont  func(pid int) // what a process does when let go
 }
 
 func newFakeProc(t *testing.T) *fakeProc {
@@ -52,7 +55,33 @@ func (p *fakeProc) signal(pid int, sig syscall.Signal) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.sigs = append(p.sigs, fmt.Sprintf("%d:%v", pid, sig))
+	onCont := p.onCont
+	p.mu.Unlock()
+	if sig == syscall.SIGCONT && onCont != nil {
+		onCont(pid)
+	}
+	p.mu.Lock()
 	return nil
+}
+
+func (p *fakeProc) mute(pid int, on bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.muteErr != nil {
+		return p.muteErr
+	}
+	what := "unmute"
+	if on {
+		what = "mute"
+	}
+	p.mutes = append(p.mutes, fmt.Sprintf("%d:%s", pid, what))
+	return nil
+}
+
+func (p *fakeProc) muted() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.mutes...)
 }
 
 func (p *fakeProc) signals() []string {
@@ -62,7 +91,7 @@ func (p *fakeProc) signals() []string {
 }
 
 func (p *fakeProc) hold(librespot int) *outputHold {
-	return &outputHold{procRoot: p.root, signal: p.signal, librespotPid: func() int { return librespot }}
+	return &outputHold{procRoot: p.root, signal: p.signal, mute: p.mute, librespotPid: func() int { return librespot }}
 }
 
 var (
@@ -229,19 +258,23 @@ func TestControlPauseHoldsAndResumesFromElsewhere(t *testing.T) {
 	p := newFakeProc(t)
 	// the Web API still says playing right after the pause, then paused, then
 	// playing again: resumed from another controller
+	// (this librespot does not take the pause when let go: it is held again)
 	api := &fakeAPI{states: []bool{true, false, false, true}}
-	c := &librespotControl{hold: p.hold(100), api: api, timeout: time.Second, poll: time.Millisecond}
+	c := &librespotControl{hold: p.hold(100), api: api, timeout: time.Second, poll: time.Millisecond, settle: 20 * time.Millisecond}
 	c.pause()
 	if !c.holding() {
 		t.Fatal("pause did not hold the output at once")
 	}
-	waitFor(t, "the hold let go for the resume", func() bool { return !c.holding() })
+	waitFor(t, "the hold let go for the resume", func() bool { return len(api.called()) == 5 && !c.holding() })
 	got := api.called()
 	if !reflect.DeepEqual(got, []string{"pause", "state", "state", "state", "state"}) {
 		t.Errorf("Web API calls %v", got)
 	}
-	if s := p.signals(); !reflect.DeepEqual(s, []string{"200:" + stop, "200:" + cont}) {
+	if s := p.signals(); !reflect.DeepEqual(s, []string{"200:" + stop, "200:" + cont, "200:" + stop, "200:" + cont}) {
 		t.Errorf("signals %v", s)
+	}
+	if m := p.muted(); !reflect.DeepEqual(m, []string{"200:mute", "200:unmute"}) {
+		t.Errorf("mutes %v", m)
 	}
 }
 
@@ -308,5 +341,91 @@ func TestControlWatchStopsWhenReleased(t *testing.T) {
 	}
 	if !c.holding() {
 		t.Fatal("the watch let a newer hold go")
+	}
+}
+
+// librespot takes the pause once let go: it kills its gst-launch.
+func TestControlPauseSettlesOnceSpotifyHasIt(t *testing.T) {
+	p := newFakeProc(t)
+	p.onCont = func(pid int) { p.remove(pid) }
+	api := &fakeAPI{states: []bool{true, false, false, false}}
+	c := &librespotControl{hold: p.hold(100), api: api, timeout: time.Second, poll: time.Millisecond, settle: time.Second}
+	c.pause()
+	waitFor(t, "the pause settled", func() bool { return !c.holding() })
+	time.Sleep(20 * time.Millisecond)
+	if got := api.called(); !reflect.DeepEqual(got, []string{"pause", "state", "state"}) {
+		t.Errorf("Web API calls %v: the watch goes on after the pause settled", got)
+	}
+	if s := p.signals(); !reflect.DeepEqual(s, []string{"200:" + stop, "200:" + cont}) {
+		t.Errorf("signals %v", s)
+	}
+	// muted before it was let go, and gone with its stream: nothing to unmute
+	if m := p.muted(); !reflect.DeepEqual(m, []string{"200:mute"}) {
+		t.Errorf("mutes %v", m)
+	}
+}
+
+// Without a mute the hold is the only silence there is, so it stays.
+func TestControlPauseStaysHeldWithoutAMute(t *testing.T) {
+	p := newFakeProc(t)
+	p.muteErr = errors.New("no pactl")
+	api := &fakeAPI{states: []bool{false, false, false}}
+	c := &librespotControl{hold: p.hold(100), api: api, timeout: time.Second, poll: time.Millisecond, settle: time.Second}
+	c.pause()
+	waitFor(t, "the watch saw paused", func() bool { return len(api.called()) >= 3 })
+	if !c.holding() {
+		t.Fatal("a hold that could not be muted was let go")
+	}
+	if s := p.signals(); !reflect.DeepEqual(s, []string{"200:" + stop}) {
+		t.Errorf("signals %v", s)
+	}
+}
+
+// A play between the mute and the release is to be heard: unmuted, not settled.
+func TestSettlePauseLosesToAPlay(t *testing.T) {
+	p := newFakeProc(t)
+	h := p.hold(100)
+	c := &librespotControl{hold: h, api: &fakeAPI{}, timeout: time.Second, settle: time.Second}
+	gen, _ := h.hold()
+	h.mute = func(pid int, on bool) error {
+		if on {
+			h.release() // the play, right after the mute
+		}
+		return p.mute(pid, on)
+	}
+	if _, settled := c.settlePause(gen); settled {
+		t.Fatal("settled a pause that a play had overtaken")
+	}
+	if m := p.muted(); !reflect.DeepEqual(m, []string{"200:mute", "200:unmute"}) {
+		t.Errorf("mutes %v: the played stream stays muted", m)
+	}
+}
+
+func TestSinkInputsOf(t *testing.T) {
+	// pactl lists a stream's client properties after its own, so the pid comes twice
+	list := `Sink Input #0
+	Driver: module-remap-sink.c
+	Properties:
+		media.role = "filter"
+Sink Input #135
+	Driver: protocol-native.c
+	Properties:
+		media.role = "music"
+		application.process.id = "11867"
+		application.process.binary = "gst-launch-1.0"
+		module-stream-restore.id = "sink-input-by-media-role:music"
+		application.process.id = "11867"
+Sink Input #140
+	Properties:
+		application.process.id = "118670"
+Sink Input #141
+	Properties:
+		application.process.id = "11867"
+`
+	if got := sinkInputsOf(list, 11867); !reflect.DeepEqual(got, []string{"135", "141"}) {
+		t.Errorf("streams %v", got)
+	}
+	if got := sinkInputsOf(list, 1); got != nil {
+		t.Errorf("streams of a process with none: %v", got)
 	}
 }
