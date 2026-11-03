@@ -1,0 +1,208 @@
+/*global enyo */
+/*
+ * VideoAuth - customUI validator for the video account types (org.webosports.video.*), which
+ * org.webosports.service.videos serves to Videos. What it asks for depends on the template:
+ *
+ *   jellyfin  server address, user name, password
+ *   peertube  an instance: typed, or picked from the healthy, non-NSFW instances the directory
+ *             (instances.joinpeertube.org) lists, searchable by name
+ *   upnp      nothing: one tap adds the media servers on the local network
+ *
+ * Every kind calls org.webosports.service.videos/login with the templateId and what was typed; the
+ * service checks it against the server and answers the account (username, alias, credentials),
+ * which goes back to Accounts through CrossAppResult. Nothing typed here is logged.
+ */
+// enyo 0.10 sets content as HTML: escape what a server or the directory sent.
+function esc(s) {
+	return String(s === undefined || s === null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+enyo.kind({
+	name: "VideoAuth",
+	kind: enyo.VFlexBox,
+	className: "enyo-bg",
+
+	kinds: {
+		jellyfin: {
+			fields: ["server", "username", "password"],
+			text: "Watch your Jellyfin server's films and series in Videos. Enter the address you open Jellyfin at " +
+				"(for example jellyfin.example.org or 192.168.1.10:8096) and your Jellyfin user.",
+			button: "Sign In"
+		},
+		peertube: {
+			fields: ["server"],
+			instances: true,
+			text: "Watch a PeerTube instance's public videos in Videos. Pick an instance below or type its address.",
+			button: "Add"
+		},
+		upnp: {
+			fields: [],
+			text: "Videos will show every UPnP/DLNA media server on this network (MiniDLNA, a NAS, Plex or Jellyfin " +
+				"with DLNA on, ...). There is nothing to sign in to.",
+			button: "Add"
+		}
+	},
+
+	components: [
+		{ kind: "Toolbar", className: "enyo-toolbar-light accounts-header", pack: "center", components: [
+			{ name: "headerIcon", kind: "Image", style: "width:32px; height:32px; vertical-align:middle; margin-right:6px;" },
+			{ kind: "Control", name: "title", content: "Video Account" }
+		]},
+		{ className: "accounts-header-shadow" },
+		{ name: "svc", kind: "PalmService", service: "palm://org.webosports.service.videos/", onFailure: "svcFailure" },
+		{ name: "dir", kind: "PalmService", service: "palm://org.webosports.service.videos/", method: "searchPeerTubeInstances",
+			onSuccess: "gotInstances", onFailure: "noInstances" },
+		{ kind: "Scroller", flex: 1, components: [
+			{ className: "box-center", components: [
+				{ name: "bodyText", className: "accounts-body-text videoauth-note" },
+				{ name: "serverGroup", kind: "RowGroup", caption: "SERVER", className: "accounts-group", showing: false, components: [
+					{ kind: "Input", name: "server", spellcheck: false, autocorrect: false, autoWordComplete: false,
+						autoCapitalize: "lowercase", hint: "Address" }
+				]},
+				{ name: "usernameGroup", kind: "RowGroup", caption: "USER NAME", className: "accounts-group", showing: false, components: [
+					{ kind: "Input", name: "username", spellcheck: false, autocorrect: false, autoWordComplete: false,
+						autoCapitalize: "lowercase", hint: "User name" }
+				]},
+				{ name: "passwordGroup", kind: "RowGroup", caption: "PASSWORD", className: "accounts-group", showing: false, components: [
+					{ kind: "PasswordInput", name: "password", autoWordComplete: false, hint: "Password (may be empty)" }
+				]},
+				{ name: "errorBox", showing: false, style: "padding:8px 16px;", components: [
+					{ name: "errorMessage", className: "enyo-text-error" }
+				]},
+				{ name: "primaryButton", kind: "ActivityButton", caption: "Sign In", className: "enyo-button-dark accounts-btn",
+					onclick: "primaryTap" },
+				{ name: "removeAccountButton", kind: "Accounts.RemoveAccount", className: "accounts-btn", showing: false,
+					style: "padding-top:6px;", onAccountsRemove_Done: "removeDone" },
+				{ name: "instanceGroup", kind: "RowGroup", caption: "PEERTUBE INSTANCES", className: "accounts-group", showing: false, components: [
+					{ kind: "Input", name: "instanceSearch", hint: "Search instances", spellcheck: false, autocorrect: false,
+						autoWordComplete: false, changeOnInput: true, onchange: "instanceSearchChanged" },
+					{ name: "instanceStatus", className: "videoauth-instance-info", style: "padding:6px 4px;" },
+					{ name: "instanceList", kind: "VirtualRepeater", onSetupRow: "setupInstance", components: [
+						{ kind: "Item", className: "videoauth-instance", onclick: "instanceTap", components: [
+							{ name: "instanceName", className: "videoauth-instance-name" },
+							{ name: "instanceInfo", className: "videoauth-instance-info" }
+						]}
+					]}
+				]}
+			]}
+		]},
+		{ kind: "Toolbar", className: "enyo-toolbar-light", components: [
+			{ kind: "Button", caption: "Cancel", className: "accounts-toolbar-btn", onclick: "cancel" }
+		]},
+		{ kind: "CrossAppResult" }
+	],
+
+	create: function () {
+		this.inherited(arguments);
+		this.done = false;
+		this.instances = [];
+		var p = enyo.windowParams || {};
+		this.template = p.template || null;
+		this.templateId = (this.template && this.template.templateId) || p.templateId || "org.webosports.video.upnp";
+		this.kindId = this.templateId.split(".").pop();
+		var k = this.kinds[this.kindId] || this.kinds.upnp;
+		this.k = k;
+		this.$.title.setContent((this.template && this.template.loc_name) || "Video Account");
+		this.$.headerIcon.setSrc("images/connectors/" + (this.kinds[this.kindId] ? this.kindId : "upnp") + ".png");
+		this.$.bodyText.setContent(k.text);
+		this.$.primaryButton.setCaption(k.button);
+		this.$.serverGroup.setShowing(k.fields.indexOf("server") >= 0);
+		this.$.usernameGroup.setShowing(k.fields.indexOf("username") >= 0);
+		this.$.passwordGroup.setShowing(k.fields.indexOf("password") >= 0);
+		if (this.kindId === "peertube") { this.$.server.setHint("peertube.example.org"); }
+		if (this.kindId === "jellyfin") { this.$.server.setHint("jellyfin.example.org or 192.168.1.10:8096"); }
+		var account = p.account;
+		if (account && (account._id || account.id)) {
+			try { this.$.removeAccountButton.init(account); this.$.removeAccountButton.show(); } catch (e) { this.log("videoauth: no remove button: " + e); }
+		}
+		if (k.instances) {
+			this.$.instanceGroup.show();
+			this.loadInstances("");
+		}
+	},
+
+	// --- PeerTube instances ---
+	loadInstances: function (query) {
+		this.$.instanceStatus.setContent("Looking for instances…");
+		this.$.dir.call({ query: query || "" });
+	},
+	instanceSearchChanged: function () {
+		if (this.searchTimer) { window.clearTimeout(this.searchTimer); }
+		var q = this.$.instanceSearch.getValue();
+		this.searchTimer = window.setTimeout(enyo.bind(this, function () { this.loadInstances(q); }), 500);
+	},
+	gotInstances: function (inSender, r) {
+		this.instances = (r && r.instances) || [];
+		this.$.instanceStatus.setContent(this.instances.length ? "" : "No instances found. You can still type an address above.");
+		this.$.instanceList.render();
+	},
+	noInstances: function () {
+		this.instances = [];
+		this.$.instanceStatus.setContent("The instance list cannot be reached now. You can still type an address above.");
+		this.$.instanceList.render();
+	},
+	setupInstance: function (inSender, i) {
+		var it = this.instances[i];
+		if (!it) { return false; }
+		this.$.instanceName.setContent(esc(it.name) + " – " + esc(it.host));
+		this.$.instanceInfo.setContent(esc((it.description || "") + (it.videos ? " (" + it.videos + " videos)" : "")));
+		return true;
+	},
+	instanceTap: function (inSender, inEvent) {
+		var it = this.instances[inEvent.rowIndex];
+		if (it) { this.$.server.setValue(it.host); this.primaryTap(); }
+	},
+
+	// --- sign-in ---
+	primaryTap: function () {
+		if (this.done || this.busy) { return; }
+		var trim = function (s) { return (s || "").replace(/^\s+|\s+$/g, ""); };
+		var payload = { templateId: this.templateId };
+		var f = this.k.fields;
+		if (f.indexOf("server") >= 0) { payload.server = trim(this.$.server.getValue()); }
+		if (f.indexOf("username") >= 0) { payload.username = trim(this.$.username.getValue()); }
+		if (f.indexOf("password") >= 0) { payload.password = this.$.password.getValue() || ""; }
+		if ((f.indexOf("server") >= 0 && !payload.server) || (f.indexOf("username") >= 0 && !payload.username)) {
+			this.showError(f.indexOf("username") >= 0 ? "Enter the server's address and your user name." : "Enter the address.");
+			return;
+		}
+		this.showError("");
+		this.busy = true;
+		this.$.primaryButton.setActive(true);
+		this.$.primaryButton.setDisabled(true);
+		this.$.svc.call(payload, { method: "login", onSuccess: "loginSuccess", onFailure: "loginFailure" });
+	},
+	loginSuccess: function (inSender, r) {
+		this.busy = false;
+		this.finish({ returnValue: true, templateId: this.templateId, template: this.template,
+			username: r.username, alias: r.alias, config: r.config || {}, credentials: r.credentials });
+	},
+	// The service's errorText says what is wrong; it holds no password.
+	loginFailure: function (inSender, r) {
+		this.busy = false;
+		this.$.primaryButton.setActive(false);
+		this.$.primaryButton.setDisabled(false);
+		this.showError((r && r.errorText) || "Could not connect. Check the address and the network.");
+		this.log("videoauth: login failed " + (r && r.errorCode));
+	},
+	svcFailure: function () {
+		this.busy = false;
+		this.$.primaryButton.setActive(false);
+		this.$.primaryButton.setDisabled(false);
+		this.showError("The video service does not answer.");
+	},
+	showError: function (s) {
+		this.$.errorMessage.setContent(s ? esc(s) : "");
+		this.$.errorBox.setShowing(!!s);
+	},
+
+	removeDone: function () { this.$.crossAppResult.sendResult({ returnValue: false }); },
+	cancel: function () { this.finish({ returnValue: false }); },
+	finish: function (result) {
+		if (this.done) { return; }
+		this.done = true;
+		// The result holds credentials: log only how it ended.
+		this.log("videoauth: result returnValue=" + (result && result.returnValue));
+		try { this.$.crossAppResult.sendResult(result); } catch (e) { this.log("videoauth: sendResult threw " + e); }
+	}
+});

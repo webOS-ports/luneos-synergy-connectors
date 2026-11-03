@@ -1,0 +1,10 @@
+{
+    "org.webosports.service.videos": ["accountsservice.operation", "networkconnection.query"],
+    "com.palm.service.accounts": ["synergy-video.operation"],
+    "com.palm.app.accounts": ["synergy-video.operation"],
+    "com.palm.app.accounts-*": ["synergy-video.operation"],
+    "org.webosports.app.videoauth": ["synergy-video.operation"],
+    "org.webosports.app.videoauth-*": ["synergy-video.operation"],
+    "org.webosports.app.videoplayer": ["synergy-video.operation"],
+    "org.webosports.app.videoplayer-*": ["synergy-video.operation"]
+}

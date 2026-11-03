@@ -1,0 +1,8 @@
+{
+    "allowedNames": [
+        "org.webosports.service.videos"
+    ],
+    "synergy-video.operation": [
+        "dev"
+    ]
+}

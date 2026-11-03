@@ -1,0 +1,5 @@
+{
+    "synergy-video.operation": [
+        "org.webosports.service.videos/*"
+    ]
+}

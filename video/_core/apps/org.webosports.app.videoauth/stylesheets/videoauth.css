@@ -1,0 +1,17 @@
+/* The video sign-in form. Header, groups and buttons are the shared accounts-* classes. */
+.videoauth-note {
+	padding: 10px 16px;
+	line-height: 1.4;
+	font-size: 15px;
+}
+.videoauth-instance {
+	padding: 8px 4px;
+	border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+}
+.videoauth-instance-name {
+	font-weight: bold;
+}
+.videoauth-instance-info {
+	font-size: 13px;
+	opacity: 0.7;
+}

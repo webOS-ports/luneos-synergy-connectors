@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:BrowseResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><Result>&lt;DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/"&gt;
+&lt;item id="2$15$0$1$0" parentID="2$15$0$1" restricted="1" refID="64$0$1$0"&gt;&lt;dc:title&gt;Night Train (2024)&lt;/dc:title&gt;&lt;upnp:class&gt;object.item.videoItem&lt;/upnp:class&gt;&lt;dc:date&gt;2026-11-03T20:27:42&lt;/dc:date&gt;&lt;res size="4030139" duration="0:01:30.023" bitrate="44767" sampleFrequency="44100" nrAudioChannels="1" resolution="640x360" protocolInfo="http-get:*:video/x-matroska:*"&gt;http://192.168.50.20:8200/MediaItems/26.mkv&lt;/res&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;</Result>
+<NumberReturned>1</NumberReturned>
+<TotalMatches>1</TotalMatches>
+<UpdateID>0</UpdateID></u:BrowseResponse></s:Body></s:Envelope>
