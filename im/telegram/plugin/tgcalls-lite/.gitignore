@@ -1,0 +1,5 @@
+*.o
+*.a
+spike/*
+!spike/*.c
+!spike/*.cpp
