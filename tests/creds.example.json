@@ -15,6 +15,7 @@
   "webdav":   {"credentials": {"common": {"flavor": "nextcloud", "server": "https://cloud.example.org/remote.php/dav/files/you/", "username": "you", "accessToken": "SECRET (an app password)"}}},
   "immich":   {"credentials": {"common": {"server": "https://photos.example.org", "apiKey": "IMMICH-API-KEY"}}},
   "photoprism": {"credentials": {"common": {"server": "https://photos.example.org", "token": "SECRET (an app password)", "username": "you"}}},
+  "pigallery2": {"credentials": {"common": {"server": "https://gallery.example.org", "username": "you", "password": "SECRET", "open": false}}},
 
   "qobuz":    {"email": "you@example.org", "password": "SECRET"},
   "deezer":   {"arl": "SECRET"},
