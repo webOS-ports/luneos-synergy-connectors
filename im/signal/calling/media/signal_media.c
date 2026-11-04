@@ -143,6 +143,7 @@ typedef struct {
     gint        st_dec;         /* decoded frames */
     gint        st_pli;         /* keyframe requests sent */
     gint        st_last_pt;     /* last "other" payload type seen */
+    guint16     rx_fec_skipped; /* receive thread only: ULPFEC packets taken out of the VP8 stream */
 } SmVideo;
 
 static SmVideo g_v;
@@ -630,8 +631,8 @@ static void sm_drop_elements(GstElement **els, int n)
             gst_object_unref(gst_object_ref_sink(els[i]));
 }
 
-/* One received packet that srtpdec decrypted: TRUE to keep it in the audio chain. VP8 goes to the
- * video branch, the far side's rtp-data messages are read here, everything else (RTX, RED, FEC,
+/* One received packet that srtpdec decrypted: TRUE to keep it in the audio chain. VP8, bare or
+ * inside RED (how WebRTC sends it), goes to the video branch, the far side's rtp-data messages are read here, everything else (RTX, RED, FEC,
  * which we never negotiate away) is dropped instead of reaching the Opus depayloader. Runs on the
  * receive streaming thread. */
 static gboolean sm_rx_route(GstBuffer *buf)
@@ -645,9 +646,45 @@ static gboolean sm_rx_route(GstBuffer *buf)
         gst_buffer_unmap(buf, &m);
         return FALSE;
     }
+    /* WebRTC wraps its video in RED (and sends ULPFEC that way too): take out the VP8 inside. */
+    GstBuffer *vp8 = NULL;
+    if (r.pt == SV_PT_RED) {
+        guint8 inner = 0;
+        GstBuffer *out = gst_buffer_new_allocate(NULL, m.size, NULL);
+        GstMapInfo om;
+        gsize n = 0;
+        if (out && gst_buffer_map(out, &om, GST_MAP_WRITE)) {
+            n = sv_red_unwrap(m.data, m.size, om.data, om.size, &inner);
+            gst_buffer_unmap(out, &om);
+        }
+        if (n > 0 && inner == SV_PT_VP8) {
+            gst_buffer_set_size(out, n);
+            vp8 = out;
+            /* The FEC packets dropped below took sequence numbers of the same stream: close those
+             * gaps, or the jitter buffer reports them lost and the depayloader waits for a
+             * keyframe each time. */
+            if (g_v.rx_fec_skipped && gst_buffer_map(out, &om, GST_MAP_WRITE)) {
+                guint16 seq = (guint16)(((guint)om.data[2] << 8 | om.data[3]) - g_v.rx_fec_skipped);
+                om.data[2] = (guint8)(seq >> 8);
+                om.data[3] = (guint8)seq;
+                gst_buffer_unmap(out, &om);
+            }
+        } else if (out) {
+            gst_buffer_unref(out);
+            if (n > 0 && inner == SV_PT_ULPFEC)
+                g_v.rx_fec_skipped++;
+        }
+        if (!vp8) {
+            g_atomic_int_inc(&g_v.st_other);
+            g_atomic_int_set(&g_v.st_last_pt, n > 0 ? inner : r.pt);
+        }
+    } else if (r.pt == SV_PT_VP8) {
+        vp8 = gst_buffer_ref(buf);
+    }
+
     if (r.pt == SV_PT_OPUS) {
         keep = TRUE;
-    } else if (r.pt == SV_PT_VP8) {
+    } else if (vp8) {
         const guint8 *cvo = NULL;
         size_t cvo_len = 0;
         if (sv_rtp_find_ext(m.data, m.size, &r, SV_EXT_CVO, &cvo, &cvo_len) == 0 && cvo_len >= 1) {
@@ -658,9 +695,12 @@ static gboolean sm_rx_route(GstBuffer *buf)
             }
         }
         g_atomic_int_inc(&g_v.st_vp8);
-        if (g_v.rx_src &&
-            gst_app_src_push_buffer(GST_APP_SRC(g_v.rx_src), gst_buffer_ref(buf)) != GST_FLOW_OK)
+        if (!g_v.rx_src)
+            gst_buffer_unref(vp8);
+        else if (gst_app_src_push_buffer(GST_APP_SRC(g_v.rx_src), vp8) != GST_FLOW_OK)  /* takes vp8 */
             g_atomic_int_inc(&g_v.st_push_fail);
+    } else if (r.pt == SV_PT_RED) {
+        /* ULPFEC or a malformed RED packet: counted above, dropped */
     } else if (r.pt != SV_PT_DATA) {
         g_atomic_int_inc(&g_v.st_other);
         g_atomic_int_set(&g_v.st_last_pt, r.pt);

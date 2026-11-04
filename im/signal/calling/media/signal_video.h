@@ -26,6 +26,8 @@ extern "C" {
 #define SV_PT_DATA       101
 #define SV_PT_VP8        108
 #define SV_PT_VP8_RTX    118
+#define SV_PT_RED        120     /* RFC 2198 RED around VP8 or ULPFEC (RingRTC constants.h RED_PT) */
+#define SV_PT_ULPFEC     122
 #define SV_EXT_CVO       4
 #define SV_SSRC_DATA     0x0000000Du
 #define SV_VIDEO_CLOCK   90000
@@ -63,6 +65,14 @@ int sv_rtp_find_ext(const uint8_t *p, size_t n, const SvRtp *rtp, unsigned id,
  * overlap. */
 size_t sv_rtp_add_ext(const uint8_t *in, size_t n, unsigned id, const uint8_t *data, size_t dlen,
                       uint8_t *out, size_t cap);
+
+/* Copy RED packet in[0..n) (RFC 2198) to out as the packet of its primary block: the same RTP
+ * header and extensions with the primary block's payload type, followed by that block's payload,
+ * without the redundant blocks and without RTP padding (the P bit is cleared). WebRTC sends its
+ * video, and its ULPFEC, this way. Returns the new length and puts the inner payload type in
+ * *inner_pt, or 0 when in is not RTP, the RED headers are malformed or out (cap bytes) is too
+ * small. in and out may not overlap. */
+size_t sv_red_unwrap(const uint8_t *in, size_t n, uint8_t *out, size_t cap, uint8_t *inner_pt);
 
 /* The CVO byte |0 0 0 0 C F R1 R0|: R1R0 is how far the picture has to be turned CLOCKWISE, in
  * quarter turns, to be upright (webrtc rtp_cvo.h, VideoRotation "enum for clockwise rotation").

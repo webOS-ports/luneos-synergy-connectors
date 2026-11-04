@@ -198,6 +198,56 @@ static void test_rtcp(void)
     CHECK(sv_rtcp_wants_keyframe(rtp, 12, 1003) == -1);
 }
 
+static void test_red(void)
+{
+    uint8_t in[64], out[64], pt = 0;
+    SvRtp r;
+    const uint8_t *d = NULL;
+    size_t dl = 0;
+
+    /* What WebRTC sends: RED with only the primary block (VP8), marker and CVO kept. */
+    rtp_header(in, SV_PT_RED, 1, 1003);
+    in[0] |= 0x10;
+    memcpy(in + 12, "\xbe\xde\x00\x01\x40\x01\x00\x00", 8);
+    in[20] = SV_PT_VP8;
+    memcpy(in + 21, "VP8DATA", 7);
+    size_t m = sv_red_unwrap(in, 28, out, sizeof out, &pt);
+    CHECK(m == 27 && pt == SV_PT_VP8);
+    CHECK(sv_rtp_parse(out, m, &r) == 0 && r.pt == SV_PT_VP8 && r.marker && r.ssrc == 1003 && r.seq == 0x1234);
+    CHECK(memcmp(out + r.header_len, "VP8DATA", 7) == 0);
+    CHECK(sv_rtp_find_ext(out, m, &r, SV_EXT_CVO, &d, &dl) == 0 && d[0] == 1);
+
+    /* ULPFEC inside RED: reported, so the caller drops it. */
+    rtp_header(in, SV_PT_RED, 0, 1003);
+    in[12] = SV_PT_ULPFEC;
+    memcpy(in + 13, "FEC", 3);
+    CHECK(sv_red_unwrap(in, 16, out, sizeof out, &pt) == 15 && pt == SV_PT_ULPFEC && !(out[1] & 0x80));
+
+    /* A redundant block (3 bytes) before the primary, and 2 bytes of RTP padding. */
+    rtp_header(in, SV_PT_RED, 0, 1003);
+    in[0] |= 0x20;
+    memcpy(in + 12, "\xec\x00\x10\x03" "\x6c" "OLD" "NEW" "\x00\x02", 13);
+    m = sv_red_unwrap(in, 25, out, sizeof out, &pt);
+    CHECK(m == 15 && pt == SV_PT_VP8 && !(out[0] & 0x20) && memcmp(out + 12, "NEW", 3) == 0);
+
+    /* Malformed: no primary header, a block longer than the packet, bad padding, short out. */
+    rtp_header(in, SV_PT_RED, 0, 1003);
+    CHECK(sv_red_unwrap(in, 12, out, sizeof out, &pt) == 0);
+    memcpy(in + 12, "\xec\x00\x10\x09\x6c" "AB", 7);
+    CHECK(sv_red_unwrap(in, 19, out, sizeof out, &pt) == 0);
+    memcpy(in + 12, "\xec\x00\x10", 3);
+    CHECK(sv_red_unwrap(in, 15, out, sizeof out, &pt) == 0);
+    in[0] |= 0x20;
+    memcpy(in + 12, "\x6c" "AB" "\x09", 4);
+    CHECK(sv_red_unwrap(in, 16, out, sizeof out, &pt) == 0);
+    in[15] = 0;
+    CHECK(sv_red_unwrap(in, 16, out, sizeof out, &pt) == 0);
+    in[0] &= (uint8_t)~0x20;
+    CHECK(sv_red_unwrap(in, 16, out, 14, &pt) == 0);
+    CHECK(sv_red_unwrap(in, 16, out, 15, &pt) == 15 && pt == SV_PT_VP8);
+    CHECK(sv_red_unwrap(in, 11, out, sizeof out, &pt) == 0);
+}
+
 static void test_data_msg(void)
 {
     SvDataMsg m, back;
@@ -276,6 +326,7 @@ int main(void)
     test_add_ext();
     test_cvo();
     test_rtcp();
+    test_red();
     test_data_msg();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);

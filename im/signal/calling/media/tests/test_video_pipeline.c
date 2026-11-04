@@ -17,6 +17,8 @@
 #define SIGNAL_MEDIA_NO_MAIN
 #include "../signal_media.c"
 
+#include <gst/app/gstappsink.h>
+
 static int failures;
 #define CHECK(c) do { if (!(c)) { failures++; g_printerr("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
 
@@ -145,6 +147,27 @@ static GstPadProbeReturn count_shm(GstPad *pad, GstPadProbeInfo *info, gpointer 
  * packet is lost on the way. TRUE to keep b; *out is b, or b with the CVO added. */
 static gint pli_before_loss = -1;
 
+/* b (RTP, consumed) as WebRTC sends video: in RED, with the payload type in a primary block
+ * header (RFC 2198) in front of the payload. */
+static GstBuffer *red_wrap(GstBuffer *b)
+{
+    GstMapInfo m;
+    SvRtp r;
+    if (!gst_buffer_map(b, &m, GST_MAP_READ)) return b;
+    if (sv_rtp_parse(m.data, m.size, &r) != 0) { gst_buffer_unmap(b, &m); return b; }
+    GstBuffer *o = gst_buffer_new_allocate(NULL, m.size + 1, NULL);
+    GstMapInfo om;
+    gst_buffer_map(o, &om, GST_MAP_WRITE);
+    memcpy(om.data, m.data, r.header_len);
+    om.data[1] = (guint8)((m.data[1] & 0x80) | SV_PT_RED);
+    om.data[r.header_len] = r.pt;
+    memcpy(om.data + r.header_len + 1, m.data + r.header_len, m.size - r.header_len);
+    gst_buffer_unmap(o, &om);
+    gst_buffer_unmap(b, &m);
+    gst_buffer_unref(b);
+    return o;
+}
+
 static gboolean far_side_packet(GstBuffer *b, GstBuffer **out)
 {
     GstMapInfo m;
@@ -152,14 +175,17 @@ static gboolean far_side_packet(GstBuffer *b, GstBuffer **out)
     if (!gst_buffer_map(b, &m, GST_MAP_READ)) return TRUE;
     gboolean marker = m.size > 1 && (m.data[1] & 0x80);
     gst_buffer_unmap(b, &m);
-    if (!marker) return TRUE;
-    if (g_atomic_int_add(&far_marker_pkts, 1) == 2) {
+    if (marker && g_atomic_int_add(&far_marker_pkts, 1) == 2) {
         pli_before_loss = g_atomic_int_get(&g_v.pli_wanted);
         g_atomic_int_inc(&far_dropped);
         return FALSE;
     }
-    g_atomic_int_set(&g_v.tx_cvo, 1);          /* sm_tx_add_cvo stands in for the far side's sender */
-    *out = sm_tx_add_cvo(gst_buffer_ref(b));
+    GstBuffer *nb = gst_buffer_ref(b);
+    if (marker) {
+        g_atomic_int_set(&g_v.tx_cvo, 1);      /* sm_tx_add_cvo stands in for the far side's sender */
+        nb = sm_tx_add_cvo(nb);
+    }
+    *out = red_wrap(nb);
     return TRUE;
 }
 
@@ -169,7 +195,8 @@ static GstPadProbeReturn far_side_probe(GstPad *pad, GstPadProbeInfo *info, gpoi
     if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
         GstBuffer *b = GST_PAD_PROBE_INFO_BUFFER(info), *nb;
         if (!far_side_packet(b, &nb)) return GST_PAD_PROBE_DROP;
-        if (nb != b) { gst_buffer_unref(b); GST_PAD_PROBE_INFO_DATA(info) = nb; }
+        gst_buffer_unref(b);
+        GST_PAD_PROBE_INFO_DATA(info) = nb;
         return GST_PAD_PROBE_OK;
     }
     GstBufferList *in = GST_PAD_PROBE_INFO_BUFFER_LIST(info);
@@ -177,7 +204,7 @@ static GstPadProbeReturn far_side_probe(GstPad *pad, GstPadProbeInfo *info, gpoi
     for (guint i = 0; i < gst_buffer_list_length(in); i++) {
         GstBuffer *b = gst_buffer_list_get(in, i), *nb;
         if (!far_side_packet(b, &nb)) continue;
-        gst_buffer_list_add(outl, nb == b ? gst_buffer_ref(b) : nb);
+        gst_buffer_list_add(outl, nb);
     }
     gst_buffer_list_unref(in);
     GST_PAD_PROBE_INFO_DATA(info) = outl;
@@ -437,6 +464,86 @@ static void test_pli_rate(void)
 
 /* ------------------------------------------------------------------ tx ---------------------- */
 
+/* The next packet the video branch got, its payload type, sequence number and first payload
+ * byte; FALSE if none came within a second. */
+static gboolean next_video(GstElement *sink, guint8 *pt, guint16 *seq, guint8 *first)
+{
+    GstSample *s = gst_app_sink_try_pull_sample(GST_APP_SINK(sink), GST_SECOND);
+    if (!s) return FALSE;
+    GstMapInfo m;
+    SvRtp r;
+    GstBuffer *b = gst_sample_get_buffer(s);
+    gboolean ok = gst_buffer_map(b, &m, GST_MAP_READ);
+    if (ok) {
+        ok = sv_rtp_parse(m.data, m.size, &r) == 0 && m.size > r.header_len;
+        if (ok) { *pt = r.pt; *seq = r.seq; *first = m.data[r.header_len]; }
+        gst_buffer_unmap(b, &m);
+    }
+    gst_sample_unref(s);
+    return ok;
+}
+
+/* sm_rx_route on its own: bare VP8 and VP8 in RED reach the video branch as VP8, ULPFEC in RED
+ * and RTX go nowhere, and the sequence numbers the FEC packets took are closed up. */
+static void test_rx_route(void)
+{
+    memset(&g_sm, 0, sizeof g_sm);
+    sm_video_reset();
+    GstElement *p = gst_pipeline_new("route");
+    GstElement *src = el("appsrc", NULL), *sink = el("appsink", NULL);
+    GstCaps *rc = gst_caps_new_simple("application/x-rtp", NULL, NULL);
+    g_object_set(src, "caps", rc, "format", GST_FORMAT_TIME, NULL);
+    gst_caps_unref(rc);
+    g_object_set(sink, "sync", FALSE, NULL);
+    gst_bin_add_many(GST_BIN(p), src, sink, NULL);
+    CHECK(gst_element_link(src, sink));
+    CHECK(gst_element_set_state(p, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE);
+    g_v.rx_src = src;
+
+    static const guint8 vp8[3] = { 0x10, 0xaa, 0xbb };
+    static const guint8 fec[4] = { SV_PT_ULPFEC, 1, 2, 3 };
+    guint8 red[4] = { SV_PT_VP8, 0x10, 0xaa, 0xbb };
+    guint8 pt = 0, first = 0;
+    guint16 seq = 0;
+    GstBuffer *b;
+
+    b = rtp_buffer(SV_PT_VP8, 1003, 10, vp8, sizeof vp8);
+    CHECK(!sm_rx_route(b));
+    gst_buffer_unref(b);
+    CHECK(next_video(sink, &pt, &seq, &first) && pt == SV_PT_VP8 && seq == 10 && first == 0x10);
+
+    b = rtp_buffer(SV_PT_RED, 1003, 11, red, sizeof red);
+    CHECK(!sm_rx_route(b));
+    gst_buffer_unref(b);
+    CHECK(next_video(sink, &pt, &seq, &first) && pt == SV_PT_VP8 && seq == 11 && first == 0x10);
+
+    /* FEC took 12 and 13: 14 goes on as 12, 15 as 13. */
+    b = rtp_buffer(SV_PT_RED, 1003, 12, fec, sizeof fec);
+    CHECK(!sm_rx_route(b));
+    gst_buffer_unref(b);
+    b = rtp_buffer(SV_PT_RED, 1003, 13, fec, sizeof fec);
+    CHECK(!sm_rx_route(b));
+    gst_buffer_unref(b);
+    b = rtp_buffer(SV_PT_VP8_RTX, 1013, 1, vp8, sizeof vp8);
+    CHECK(!sm_rx_route(b));
+    gst_buffer_unref(b);
+    b = rtp_buffer(SV_PT_RED, 1003, 14, red, sizeof red);
+    CHECK(!sm_rx_route(b));
+    gst_buffer_unref(b);
+    CHECK(next_video(sink, &pt, &seq, &first) && pt == SV_PT_VP8 && seq == 12);
+    b = rtp_buffer(SV_PT_RED, 1003, 15, red, sizeof red);
+    CHECK(!sm_rx_route(b));
+    gst_buffer_unref(b);
+    CHECK(next_video(sink, &pt, &seq, &first) && pt == SV_PT_VP8 && seq == 13);
+    CHECK(!next_video(sink, &pt, &seq, &first));         /* nothing else came through */
+    CHECK(g_atomic_int_get(&g_v.st_vp8) == 4 && g_atomic_int_get(&g_v.st_other) == 3);
+
+    g_v.rx_src = NULL;
+    gst_element_set_state(p, GST_STATE_NULL);
+    gst_object_unref(p);
+    g_print("rx route: VP8, RED, ULPFEC, RTX ok\n");
+}
+
 static GstPadProbeReturn run_probe(GstPadProbeInfo *info)
 {
     return sm_tx_video_probe(NULL, info, NULL);
@@ -608,6 +715,7 @@ int main(int argc, char **argv)
     test_sender_role(FALSE);
     test_sender_role(TRUE);
     test_pli_rate();
+    test_rx_route();
     test_tx_probe();
     test_tx_head(dir);
 

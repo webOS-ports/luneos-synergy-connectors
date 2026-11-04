@@ -166,6 +166,44 @@ int sv_rtcp_wants_keyframe(const uint8_t *p, size_t n, uint32_t media_ssrc)
     return 0;
 }
 
+size_t sv_red_unwrap(const uint8_t *in, size_t n, uint8_t *out, size_t cap, uint8_t *inner_pt)
+{
+    SvRtp r;
+    if (!in || !out || !inner_pt || sv_rtp_parse(in, n, &r) != 0)
+        return 0;
+    size_t end = n;
+    if (in[0] & 0x20) {                         /* padding: its count is the last byte */
+        size_t pad = in[n - 1];
+        if (pad == 0 || pad > n - r.header_len)
+            return 0;
+        end = n - pad;
+    }
+    /* Block headers: 4 bytes |1|PT|ts offset(14)|length(10)| for each redundant block, then
+     * the primary's single byte |0|PT|. The blocks' data follows in the same order. */
+    size_t i = r.header_len, skip = 0;
+    while (i < end && (in[i] & 0x80)) {
+        if (i + 4 > end)
+            return 0;
+        skip += ((size_t)(in[i + 2] & 0x03) << 8) | in[i + 3];
+        i += 4;
+    }
+    if (i >= end)
+        return 0;
+    uint8_t pt = in[i] & 0x7f;
+    i += 1 + skip;
+    if (i > end)
+        return 0;
+    size_t plen = end - i, total = r.header_len + plen;
+    if (total > cap)
+        return 0;
+    memcpy(out, in, r.header_len);
+    out[0] &= (uint8_t)~0x20;
+    out[1] = (uint8_t)((in[1] & 0x80) | pt);
+    memcpy(out + r.header_len, in + i, plen);
+    *inner_pt = pt;
+    return total;
+}
+
 size_t sv_rtcp_build_pli(uint32_t sender_ssrc, uint32_t media_ssrc, uint8_t out[12])
 {
     out[0] = 0x80 | 1;     /* V=2, FMT=1 (PLI) */
