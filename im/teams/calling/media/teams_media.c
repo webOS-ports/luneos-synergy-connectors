@@ -40,6 +40,8 @@
  *   out: UFRAG <our_ufrag>
  *        PWD <our_pwd>
  *        TXKEY <tx_master_b64>                                (our a=crypto inline key for the answer)
+ *        SSRC <n>                                             (our audio RTP SSRC, for the answer's
+ *                                                               a=x-ssrc-range)
  *        CAND <candidate:... sdp line>                        (our local ICE candidate)
  *        AUDIOD <0|1>
  *        GATHERED                                             (local candidates complete)
@@ -93,6 +95,7 @@ typedef struct {
     GstBuffer    *rx_master;    /* peer's SRTP master (decrypt RX), 44B */
     GstBuffer    *tx_master;    /* our SRTP master (encrypt TX), 44B */
     int           pt;           /* opus payload type from the offer */
+    guint32       tx_ssrc;      /* our audio RTP SSRC: chosen here, so the answer can declare it */
 
     void (*cand_cb)(const char *sdp);
     void (*gathered_cb)(void);
@@ -107,7 +110,7 @@ typedef struct {
      * one-way audio shows which side loses it. Written by the streaming threads' pad probes. */
     struct {
         gint tx_pkts, tx_bytes, tx_ssrc, rx_pkts, mic_peak;
-        gint rr_reports, rr_ssrc, rr_frac, rr_cum_lost, rr_hseq;
+        gint rtcp_pkts, rr_reports, rr_ssrc, rr_frac, rr_cum_lost, rr_hseq;
     } stats;
     GSource      *stats_src;
 } TeamsMedia;
@@ -276,11 +279,15 @@ static GstPadProbeReturn tm_probe_tx(GstPad *pad, GstPadProbeInfo *info, gpointe
     return GST_PAD_PROBE_OK;
 }
 
+/* nicesrc pushes buffer lists: count their buffers. */
 static GstPadProbeReturn tm_probe_rx(GstPad *pad, GstPadProbeInfo *info, gpointer user)
 {
     TeamsMedia *tm = user;
-    (void)pad; (void)info;
-    g_atomic_int_inc(&tm->stats.rx_pkts);
+    (void)pad;
+    if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST)
+        g_atomic_int_add(&tm->stats.rx_pkts, (gint)gst_buffer_list_length(GST_PAD_PROBE_INFO_BUFFER_LIST(info)));
+    else
+        g_atomic_int_inc(&tm->stats.rx_pkts);
     return GST_PAD_PROBE_OK;
 }
 
@@ -304,14 +311,12 @@ static GstPadProbeReturn tm_probe_mic(GstPad *pad, GstPadProbeInfo *info, gpoint
 }
 
 /* The peer's RTCP reports: what it says it receives from us. */
-static GstPadProbeReturn tm_probe_rtcp(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+static void tm_read_rtcp(TeamsMedia *tm, GstBuffer *b)
 {
-    TeamsMedia *tm = user;
-    GstBuffer *b = GST_PAD_PROBE_INFO_BUFFER(info);
     GstMapInfo m;
     guint32 got = 0, hseq = 0; guint frac = 0; gint lost = 0;
-    (void)pad;
-    if (!b || !gst_buffer_map(b, &m, GST_MAP_READ)) return GST_PAD_PROBE_OK;
+    g_atomic_int_inc(&tm->stats.rtcp_pkts);
+    if (!b || !gst_buffer_map(b, &m, GST_MAP_READ)) return;
     if (tm_rtcp_find_report(m.data, m.size, (guint32)g_atomic_int_get(&tm->stats.tx_ssrc),
                             &got, &frac, &lost, &hseq)) {
         g_atomic_int_inc(&tm->stats.rr_reports);
@@ -321,6 +326,18 @@ static GstPadProbeReturn tm_probe_rtcp(GstPad *pad, GstPadProbeInfo *info, gpoin
         g_atomic_int_set(&tm->stats.rr_hseq, (gint)hseq);
     }
     gst_buffer_unmap(b, &m);
+}
+
+static GstPadProbeReturn tm_probe_rtcp(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    (void)pad;
+    if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+        GstBufferList *l = GST_PAD_PROBE_INFO_BUFFER_LIST(info);
+        for (guint i = 0; i < gst_buffer_list_length(l); i++) tm_read_rtcp(tm, gst_buffer_list_get(l, i));
+    } else {
+        tm_read_rtcp(tm, GST_PAD_PROBE_INFO_BUFFER(info));
+    }
     return GST_PAD_PROBE_OK;
 }
 
@@ -329,11 +346,11 @@ static gboolean tm_stats_tick(gpointer user)
     TeamsMedia *tm = user;
     gint mic = g_atomic_int_get(&tm->stats.mic_peak);
     g_atomic_int_set(&tm->stats.mic_peak, 0);
-    g_message("teams_media: stats tx=%d pkts/%d B ssrc=%u mic_peak=%d rx=%d pkts "
+    g_message("teams_media: stats tx=%d pkts/%d B ssrc=%u mic_peak=%d rx=%d pkts rtcp_in=%d "
               "peer_reports_about_us=%d (last: ssrc=%u lost=%d frac=%d/256 hseq=%u)",
               g_atomic_int_get(&tm->stats.tx_pkts), g_atomic_int_get(&tm->stats.tx_bytes),
               (guint)g_atomic_int_get(&tm->stats.tx_ssrc), mic, g_atomic_int_get(&tm->stats.rx_pkts),
-              g_atomic_int_get(&tm->stats.rr_reports), (guint)g_atomic_int_get(&tm->stats.rr_ssrc),
+              g_atomic_int_get(&tm->stats.rtcp_pkts), g_atomic_int_get(&tm->stats.rr_reports), (guint)g_atomic_int_get(&tm->stats.rr_ssrc),
               g_atomic_int_get(&tm->stats.rr_cum_lost), g_atomic_int_get(&tm->stats.rr_frac),
               (guint)g_atomic_int_get(&tm->stats.rr_hseq));
     return G_SOURCE_CONTINUE;
@@ -586,7 +603,7 @@ static gboolean build_pipeline(TeamsMedia *tm)
       g_object_set(tcap, "caps", c, NULL); gst_caps_unref(c); }
     g_object_set(oenc, "bitrate", 32000, NULL);
     gst_util_set_object_arg(G_OBJECT(oenc), "audio-type", "voice");
-    g_object_set(pay,  "pt", tm->pt, NULL);
+    g_object_set(pay,  "pt", tm->pt, "ssrc", tm->tx_ssrc, NULL);
     configure_srtpenc(senc, tm->tx_master);
 
     tm->rx_audio_caps = rxrtp;
@@ -621,9 +638,9 @@ static gboolean build_pipeline(TeamsMedia *tm)
         g_printerr("teams_media: TX audio link failed\n"); return FALSE; }
 
     tm_add_probe(nsink, "sink", GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, tm_probe_tx, tm);
-    tm_add_probe(nsrc, "src", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_rx, tm);
+    tm_add_probe(nsrc, "src", GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, tm_probe_rx, tm);
     tm_add_probe(tcap, "src", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_mic, tm);
-    tm_add_probe(sdec, "rtcp_src", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_rtcp, tm);
+    tm_add_probe(sdec, "rtcp_src", GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, tm_probe_rtcp, tm);
     tm->stats_src = g_timeout_source_new_seconds(TM_STATS_SECONDS);
     g_source_set_callback(tm->stats_src, tm_stats_tick, tm, NULL);
     g_source_attach(tm->stats_src, tm->ctx);
@@ -685,6 +702,8 @@ static int tm_start(int is_caller, const char *rx_master_b64, const char *remote
     g_tm.cand_cb = cand_cb; g_tm.audiod_cb = audiod_cb;
     g_tm.gathered_cb = ipc_gathered;
     g_tm.pt = pt > 0 ? pt : TM_DEFAULT_PT;
+    /* Never 0, which is how a stats line says "none yet". */
+    do { g_tm.tx_ssrc = g_random_int(); } while (!g_tm.tx_ssrc);
 
     if (!is_caller) {
         g_tm.rx_master = master_buffer_from_b64(rx_master_b64);
@@ -874,6 +893,7 @@ static int run_ipc(int is_caller)
             emit("UFRAG %s\n", uf ? uf : "");
             emit("PWD %s\n",   pw ? pw : "");
             emit("TXKEY %s\n", txk ? txk : "");
+            emit("SSRC %u\n", g_tm.tx_ssrc);
             g_free(uf); g_free(pw); if (txk) { wipe(txk, strlen(txk)); g_free(txk); }
             started = 1;
             emit("READY\n");
