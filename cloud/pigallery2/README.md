@@ -12,12 +12,12 @@ Flickr carry it too); this connector has no upload method.
 
 ## Status and limitations
 
-> **Works against a real server; not yet run on a device, and not in the LuneOS image.** Checked
-> 2026-11-04 against PiGallery2 3.5.2 (the `bpatrik/pigallery2` Docker image), with sign-in and
-> with sign-in turned off: a wrong password, a gallery that wants a sign-in, nested folders, a
-> folder with only sub-folders, an empty one, a TIFF and a video; and through
-> com.palm.service.photos' sync (in-memory db8, its real download) to the albums' `parentId`s and
-> the files, originals byte for byte.
+> **Works on a device; not in the LuneOS image yet.** Checked 2026-11-04 against PiGallery2 3.5.2
+> (the `bpatrik/pigallery2` Docker image), with sign-in and with sign-in turned off: a wrong
+> password, a gallery that wants a sign-in, nested folders, a folder with only sub-folders, an
+> empty one, a TIFF and a video; through com.palm.service.photos' sync (in-memory db8, its real
+> download) to the albums' `parentId`s and the files, originals byte for byte; and on a Pixel 3a
+> (sargo): signed in from Accounts, synced (58 folders, four deep) and browsed in Photos.
 
 - **Sub-albums need the photos service and the Photos app that know them**: `parentAid` in
   listAlbums is new in com.palm.service.photos (app-services), and the Photos app shows an
@@ -30,6 +30,9 @@ Flickr carry it too); this connector has no upload method.
   downloads only, follows no redirect with it and keeps it nowhere. **Over plain `http://` the
   password and the session cross the network in the clear**: fine on a home LAN, not across
   the internet. Use https there.
+- **Showing WebP needs Qt's WebP image plugin** (`qtimageformats-plugins`): HEIC, AVIF, TIFF,
+  SVG and the like come over as PiGallery2's WebP thumbnails, and an image without that plugin
+  shows them blank.
 - **Self-signed certificates are refused** (node's own TLS checks); a server behind one needs a
   certificate the device trusts, or plain http on the LAN.
 - **HEIC, AVIF, TIFF, RAW, SVG and other non-web formats come over as PiGallery2's 1080 px
@@ -39,6 +42,15 @@ Flickr carry it too); this connector has no upload method.
   uploaded. A folder with no photos in it or below it is no album.
 - **At most 500 folders** are read, 4 at a time; the rest are left out (and logged).
 - **Only folders**: PiGallery2's saved-search albums, faces and sharing links are not used.
+
+## Screenshots
+
+| | | | |
+|:---:|:---:|:---:|:---:|
+| ![Add an account](docs/add-account.jpg) | ![Sign-in](docs/sign-in.jpg) | ![The account](docs/account.jpg) | ![Folders in Photos](docs/holidays.jpg) |
+| Add an account | The sign-in | The account (the others blurred) | A folder's folders in Photos |
+
+Taken on a Pixel 3a against a test gallery.
 
 ## Components
 
