@@ -305,3 +305,93 @@ test("listSources shows the playlist with live and search, and no progress", asy
 	assert.match(s.icon, /m3u-48x48\.png$/);
 	t.stop();
 });
+
+// --- Free TV and the lists of others ----------------------------------------------------------
+
+const FTV_NL = "#EXTM3U\n#EXTINF:-1 tvg-name=\"NPO 1\" group-title=\"Netherlands\",NPO 1\nhttps://ftv.example/npo1.m3u8\n" +
+	"#EXTINF:-1 group-title=\"Netherlands\",NPO News Ⓨ\nhttps://www.youtube.com/watch?v=abc\n" +
+	"#EXTINF:-1 group-title=\"Netherlands\",Short Ⓨ\nhttps://youtu.be/abc\n";
+const ftvRoutes = (seen) => routes().concat([
+	["GET", /^https:\/\/raw\.githubusercontent\.com\/Free-TV\/IPTV\/master\/playlists\/playlist_netherlands\.m3u8$/, () => { seen.push("nl"); return { body: FTV_NL }; }],
+	["GET", /^https:\/\/raw\.githubusercontent\.com\/Free-TV\/IPTV\/master\/playlist\.m3u8$/, () => { seen.push("all"); return { body: FTV_NL }; }],
+	["GET", /^https:\/\/raw\.githubusercontent\.com\/Free-TV\/IPTV\/master\/playlists\/playlist_greece\.m3u8$/, () => ({ body: "#EXTM3U\n#EXTINF:-1,Y\nhttps://www.youtube.com/watch?v=x\n" })],
+]);
+
+test("YouTube pages are left out; several groups in one (iptv-org's \"A;B\") are each a group", () => {
+	const { entries, skipped } = T.parse(FTV_NL + "#EXTINF:-1 group-title=\"Kids;Entertainment; Kids\",Both\nhttps://a.example/b.m3u8\n" +
+		"#EXTINF:-1,Nocookie\nhttps://www.youtube-nocookie.com/embed/x\n", "https://ftv.example/");
+	assert.deepStrictEqual(entries.map((e) => [e.title, e.groups]), [["NPO 1", ["Netherlands"]], ["Both", ["Kids", "Entertainment"]]]);
+	assert.strictEqual(entries[1].group, "Kids");
+	assert.strictEqual(skipped, 3);
+	assert.deepStrictEqual(T.groupsOf(entries), ["Netherlands", "Kids", "Entertainment"]);
+	assert.deepStrictEqual(T.parse("#EXTINF:-1 group-title=\";\",X\nhttps://a.example/x\n", "https://a.example/").entries[0].groups, []);
+});
+
+test("a channel in two groups is in both sections and found by either", async () => {
+	const list = "#EXTM3U\n#EXTINF:-1 group-title=\"Kids;Music\",Sing\nhttps://a.example/s.m3u8\n#EXTINF:-1 group-title=\"News\",Late\nhttps://a.example/n.m3u8\n";
+	const t = start({ rts: routes({ list: () => ({ body: list }) }) });
+	const sections = (await t.call("listSections", { sourceId: "acc-m3" })).sections.map((s) => s.id);
+	assert.deepStrictEqual(sections, ["all", "g:Kids", "g:Music", "g:News"]);
+	for (const g of ["g:Kids", "g:Music"]) {
+		assert.deepStrictEqual((await t.call("listItems", { sourceId: "acc-m3", sectionId: g, limit: 9 })).items.map((i) => i.title), ["Sing"], g);
+	}
+	assert.deepStrictEqual((await t.call("search", { sourceId: "acc-m3", query: "music" })).items.map((i) => i.title), ["Sing"]);
+	t.stop();
+});
+
+test("m3uCatalogs: Free TV's countries by name, the topics, then all; anyone may ask", async () => {
+	const t = start();
+	const r = await t.call("m3uCatalogs", {}, { appId: "com.example.other 1" });
+	assert.strictEqual(r.returnValue, true, JSON.stringify(r));
+	const c = r.catalogs;
+	assert.strictEqual(c.length, T.FREE_TV.length + 1);
+	const countries = c.filter((x) => x.region);
+	const names = countries.map((x) => x.name);
+	assert.deepStrictEqual(names, names.slice().sort((a, b) => a.localeCompare(b, "en")));
+	assert.deepStrictEqual(c.slice(0, countries.length), countries, "countries first");
+	assert.deepStrictEqual(c[c.length - 1], { id: "freetv:all", name: "All countries", region: "", topic: false });
+	assert.ok(c.filter((x) => x.topic).length >= 5);
+	assert.deepStrictEqual(c.find((x) => x.region === "NL"), { id: "freetv:netherlands", name: "Netherlands", region: "NL", topic: false });
+	assert.strictEqual(c.find((x) => x.region === "GB").name, "United Kingdom");
+	assert.strictEqual(new Set(c.map((x) => x.region).filter(Boolean)).size, countries.length, "one list per region");
+	for (const x of c) {
+		assert.ok(/^([A-Z]{2})?$/.test(x.region), x.id);
+		assert.ok(T.catalogOf(x.id), x.id);
+	}
+	assert.deepStrictEqual(r.source, { name: "Free-TV", link: "https://github.com/Free-TV/IPTV" });
+	t.stop();
+});
+
+test("login with a Free TV list: its address from the table, named by the country", async () => {
+	const seen = [];
+	const t = start({ rts: ftvRoutes(seen) });
+	const r = await t.call("login", { templateId: "org.webosports.video.m3u", catalog: "freetv:netherlands" }, AUTH);
+	assert.strictEqual(r.returnValue, true, JSON.stringify(r));
+	assert.deepStrictEqual([r.username, r.alias], ["Free TV · Netherlands", "Free TV – Netherlands"]);
+	assert.deepStrictEqual(r.credentials, { common: { url: "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlists/playlist_netherlands.m3u8",
+		name: "", catalog: "freetv:netherlands" } });
+	const all = await t.call("login", { templateId: "org.webosports.video.m3u", catalog: "freetv:all", name: "Everything" }, AUTH);
+	assert.deepStrictEqual([all.alias, all.credentials.common.url, all.credentials.common.name],
+		["Everything", "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlist.m3u8", "Everything"]);
+	assert.deepStrictEqual(seen, ["nl", "all"]);
+	for (const bad of ["freetv:atlantis", "freetv:../../etc", "https://evil.example/x.m3u", "", "freetv:"]) {
+		const n = t.requests.length;
+		const b = await t.call("login", { templateId: "org.webosports.video.m3u", catalog: bad, url: "https://flat.example/flat.m3u" }, AUTH);
+		assert.deepStrictEqual([b.returnValue, b.errorCode], [false, "BAD_ARGS"], bad);
+		assert.strictEqual(t.requests.length, n, bad + ": nothing fetched");
+	}
+	const yt = await t.call("login", { templateId: "org.webosports.video.m3u", catalog: "freetv:greece" }, AUTH);
+	assert.deepStrictEqual([yt.errorCode, yt.errorText], ["BAD_ARGS", "The playlist has no web streams that Videos can play."]);
+	t.stop();
+});
+
+test("a Free TV account browses as any list, without the YouTube links", async () => {
+	const t = start({ rts: ftvRoutes([]), accounts: [{ _id: "acc-ft", templateId: "org.webosports.video.m3u", username: "Free TV · Netherlands", alias: "Free TV – Netherlands" }],
+		creds: { "acc-ft": { url: "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlists/playlist_netherlands.m3u8", name: "", catalog: "freetv:netherlands" } } });
+	const s = (await t.call("listSources", {})).sources[0];
+	assert.deepStrictEqual([s.name, s.label, s.provider], ["Free TV – Netherlands", "Free TV – Netherlands", "m3u"]);
+	assert.deepStrictEqual((await t.call("listSections", { sourceId: "acc-ft" })).sections.map((x) => x.title), ["All Channels"]);
+	const items = (await t.call("listItems", { sourceId: "acc-ft", sectionId: "all", limit: 9 })).items;
+	assert.deepStrictEqual(items.map((i) => [i.kind, i.title]), [["live", "NPO 1"]]);
+	t.stop();
+});

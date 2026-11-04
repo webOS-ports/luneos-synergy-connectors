@@ -10,8 +10,9 @@
  *   plex      a code from plex.tv (plexPin), entered at plex.tv/link on any device; the app asks
  *             login until the code is linked or runs out. Or, for a server that lets the network
  *             in without signing in, its address and, if wanted, a token.
- *   m3u       a playlist's web address (an IPTV service's list holds its password: shown as typed,
- *             never logged) and, if wanted, a name for it
+ *   m3u       Free TV: one of Free-TV/IPTV's lists (m3uCatalogs), the phone's country picked to
+ *             begin with; or "My own playlist": its web address (an IPTV service's list holds its
+ *             password: shown as typed, never logged) and, if wanted, a name for it
  *
  * Every kind calls org.webosports.service.videos/login with the templateId and what was typed; the
  * service checks it against the server and answers the account (username, alias, credentials),
@@ -48,8 +49,10 @@ enyo.kind({
 		},
 		m3u: {
 			fields: ["url", "name"],
-			text: "Watch the channels of an M3U playlist in Videos: the list an IPTV service gives you, or any " +
-				"playlist of streams on the web. Enter its address as the service gives it.",
+			catalogs: true,
+			text: "Watch TV channels in Videos: the free channels of a country from Free TV, or your own M3U " +
+				"playlist - the list an IPTV service gives you, or any playlist of streams on the web.",
+			ownText: "Enter the playlist's address as the service gives it.",
 			button: "Add"
 		},
 		plex: {
@@ -70,6 +73,10 @@ enyo.kind({
 		]},
 		{ className: "accounts-header-shadow" },
 		{ name: "svc", kind: "PalmService", service: "palm://org.webosports.service.videos/", onFailure: "svcFailure" },
+		{ name: "catalogs", kind: "PalmService", service: "palm://org.webosports.service.videos/", method: "m3uCatalogs",
+			onSuccess: "gotCatalogs", onFailure: "noCatalogs" },
+		{ name: "prefs", kind: "PalmService", service: "palm://com.palm.systemservice/", method: "getPreferences",
+			onSuccess: "gotRegion", onFailure: "noRegion" },
 		{ name: "dir", kind: "PalmService", service: "palm://org.webosports.service.videos/", method: "searchPeerTubeInstances",
 			onSuccess: "gotInstances", onFailure: "noInstances" },
 		{ kind: "Scroller", flex: 1, components: [
@@ -79,6 +86,11 @@ enyo.kind({
 					{ kind: "Input", name: "server", spellcheck: false, autocorrect: false, autoWordComplete: false,
 						autoCapitalize: "lowercase", hint: "Address" }
 				]},
+				{ name: "catalogGroup", kind: "RowGroup", caption: "CHANNELS", className: "accounts-group", showing: false, components: [
+					{ kind: "ListSelector", name: "catalogPicker", value: "own", onChange: "catalogChanged",
+						items: [{ caption: "My own playlist", value: "own" }] }
+				]},
+				{ name: "catalogNote", showing: false, className: "videoauth-note", content: "" },
 				{ name: "urlGroup", kind: "RowGroup", caption: "PLAYLIST ADDRESS", className: "accounts-group", showing: false, components: [
 					{ kind: "Input", name: "url", spellcheck: false, autocorrect: false, autoWordComplete: false,
 						autoCapitalize: "none", hint: "http://iptv.example.com/playlist.m3u" }
@@ -160,6 +172,61 @@ enyo.kind({
 			this.$.instanceGroup.show();
 			this.loadInstances("");
 		}
+		if (k.catalogs) {
+			// The address fields until the lists and the phone's country are in.
+			this.catalogList = null;
+			this.region = undefined;
+			this.$.catalogGroup.show();
+			this.$.catalogs.call({});
+			this.$.prefs.call({ keys: ["region", "locale"] });
+		}
+	},
+
+	// --- M3U: Free TV's lists, or the user's own ---
+	gotCatalogs: function (inSender, r) {
+		this.catalogList = (r && r.catalogs) || [];
+		this.catalogSource = (r && r.source) || null;
+		this.showCatalogs();
+	},
+	noCatalogs: function () {
+		this.catalogList = [];
+		this.showCatalogs();
+	},
+	// The region the phone is set to ("nl"), else the locale's country.
+	gotRegion: function (inSender, r) {
+		var c = (r && r.region && r.region.countryCode) || (r && r.locale && r.locale.countryCode) || "";
+		this.region = String(c).toUpperCase();
+		this.showCatalogs();
+	},
+	noRegion: function () {
+		this.region = "";
+		this.showCatalogs();
+	},
+	showCatalogs: function () {
+		if (this.catalogList === null || this.region === undefined) { return; }
+		var items = this.catalogList.map(function (c) { return { caption: "Free TV – " + c.name, value: c.id }; });
+		items.push({ caption: "My own playlist", value: "own" });
+		this.$.catalogPicker.setItems(items);
+		var mine = null, all = null;
+		for (var i = 0; i < this.catalogList.length; i++) {
+			var c = this.catalogList[i];
+			if (this.region && c.region === this.region) { mine = c.id; }
+			if (c.id === "freetv:all") { all = c.id; }
+		}
+		this.$.catalogPicker.setValue(mine || all || "own");
+		this.catalogChanged();
+	},
+	catalogChanged: function () {
+		var own = this.$.catalogPicker.getValue() === "own";
+		this.$.urlGroup.setShowing(own);
+		this.$.nameGroup.setShowing(own);
+		var src = this.catalogSource;
+		this.$.catalogNote.setContent(own ? esc(this.k.ownText)
+			: "Channels that are free to watch in their country, from the " + esc(src ? src.name : "Free-TV") +
+				" lists (" + esc(src ? src.link.replace(/^https?:\/\//, "") : "github.com/Free-TV/IPTV") + "). " +
+				"Some (marked \u24bc) play only in their own country.");
+		this.$.catalogNote.show();
+		this.showError("");
 	},
 
 	// --- PeerTube instances ---
@@ -279,6 +346,10 @@ enyo.kind({
 		var trim = function (s) { return (s || "").replace(/^\s+|\s+$/g, ""); };
 		var payload = { templateId: this.templateId };
 		var f = this.k.fields;
+		if (this.k.catalogs && this.$.catalogPicker.getValue() !== "own") {
+			payload.catalog = this.$.catalogPicker.getValue();
+			f = [];
+		}
 		if (f.indexOf("server") >= 0) { payload.server = trim(this.$.server.getValue()); }
 		if (f.indexOf("username") >= 0) { payload.username = trim(this.$.username.getValue()); }
 		if (f.indexOf("password") >= 0) { payload.password = this.$.password.getValue() || ""; }

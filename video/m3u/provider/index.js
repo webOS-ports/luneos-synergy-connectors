@@ -15,7 +15,14 @@
  * Only http and https entries are kept (Videos plays nothing else). #EXTVLCOPT and #KODIPROP lines
  * (a user agent, a referrer, DRM keys) are not followed: Videos sends no headers.
  *
- * Credentials (credentials.common): { url, name }. The playlist's address often holds the IPTV
+ * Free TV: the playlists of github.com/Free-TV/IPTV, which only takes channels that are free to
+ * everybody in their country (free-to-air, or public service paid by a licence fee), are offered
+ * ready made - one per country, a few by topic, and all of them in one list. m3uCatalogs lists
+ * them for the sign-in app; login with catalog "freetv:<id>" adds one.
+ *
+ * YouTube page links (Free-TV marks them Ⓨ) are left out: Videos plays streams, not web pages.
+ *
+ * Credentials (credentials.common): { url, name, catalog }. The playlist's address often holds the IPTV
  * service's user name and password (get.php?username=...&password=..., or in the path), so it is
  * kept as a credential, never shown in the account's name, and no error passes it on.
  */
@@ -35,6 +42,118 @@ const LIMITS = { chars: 48 * 1024 * 1024, entries: 100000 };
 // How long a fetched list is used before it is fetched again.
 const CACHE_MS = 15 * 60 * 1000;
 const ALL = "all";
+
+// Free-TV/IPTV's lists: [id (its playlists/playlist_<id>.m3u8), name, ISO region or "" for a
+// topic]. Lists that were empty, or held only YouTube links, on 2026-11-04 are left out.
+const FREE_TV_BASE = "https://raw.githubusercontent.com/Free-TV/IPTV/master/";
+const FREE_TV = [
+	["albania", "Albania", "AL"],
+	["andorra", "Andorra", "AD"],
+	["argentina", "Argentina", "AR"],
+	["armenia", "Armenia", "AM"],
+	["australia", "Australia", "AU"],
+	["austria", "Austria", "AT"],
+	["azerbaijan", "Azerbaijan", "AZ"],
+	["belarus", "Belarus", "BY"],
+	["belgium", "Belgium", "BE"],
+	["bosnia_and_herzegovina", "Bosnia and Herzegovina", "BA"],
+	["brazil", "Brazil", "BR"],
+	["bulgaria", "Bulgaria", "BG"],
+	["canada", "Canada", "CA"],
+	["chad", "Chad", "TD"],
+	["chile", "Chile", "CL"],
+	["china", "China", "CN"],
+	["costa_rica", "Costa Rica", "CR"],
+	["croatia", "Croatia", "HR"],
+	["cyprus", "Cyprus", "CY"],
+	["czech_republic", "Czech Republic", "CZ"],
+	["denmark", "Denmark", "DK"],
+	["dominican_republic", "Dominican Republic", "DO"],
+	["egypt", "Egypt", "EG"],
+	["estonia", "Estonia", "EE"],
+	["faroe_islands", "Faroe Islands", "FO"],
+	["finland", "Finland", "FI"],
+	["france", "France", "FR"],
+	["georgia", "Georgia", "GE"],
+	["germany", "Germany", "DE"],
+	["greece", "Greece", "GR"],
+	["hong_kong", "Hong Kong", "HK"],
+	["hungary", "Hungary", "HU"],
+	["iceland", "Iceland", "IS"],
+	["india", "India", "IN"],
+	["indonesia", "Indonesia", "ID"],
+	["iran", "Iran", "IR"],
+	["iraq", "Iraq", "IQ"],
+	["ireland", "Ireland", "IE"],
+	["israel", "Israel", "IL"],
+	["italy", "Italy", "IT"],
+	["japan", "Japan", "JP"],
+	["kazakhstan", "Kazakhstan", "KZ"],
+	["kenya", "Kenya", "KE"],
+	["korea", "South Korea", "KR"],
+	["kosovo", "Kosovo", "XK"],
+	["latvia", "Latvia", "LV"],
+	["lebanon", "Lebanon", "LB"],
+	["lithuania", "Lithuania", "LT"],
+	["luxembourg", "Luxembourg", "LU"],
+	["macau", "Macau", "MO"],
+	["malta", "Malta", "MT"],
+	["mexico", "Mexico", "MX"],
+	["moldova", "Moldova", "MD"],
+	["monaco", "Monaco", "MC"],
+	["mongolia", "Mongolia", "MN"],
+	["montenegro", "Montenegro", "ME"],
+	["netherlands", "Netherlands", "NL"],
+	["nigeria", "Nigeria", "NG"],
+	["north_korea", "North Korea", "KP"],
+	["north_macedonia", "North Macedonia", "MK"],
+	["norway", "Norway", "NO"],
+	["peru", "Peru", "PE"],
+	["poland", "Poland", "PL"],
+	["portugal", "Portugal", "PT"],
+	["qatar", "Qatar", "QA"],
+	["romania", "Romania", "RO"],
+	["russia", "Russia", "RU"],
+	["san_marino", "San Marino", "SM"],
+	["saudi_arabia", "Saudi Arabia", "SA"],
+	["serbia", "Serbia", "RS"],
+	["slovakia", "Slovakia", "SK"],
+	["slovenia", "Slovenia", "SI"],
+	["somalia", "Somalia", "SO"],
+	["spain", "Spain", "ES"],
+	["sweden", "Sweden", "SE"],
+	["switzerland", "Switzerland", "CH"],
+	["taiwan", "Taiwan", "TW"],
+	["trinidad", "Trinidad and Tobago", "TT"],
+	["turkey", "Turkey", "TR"],
+	["turkmenistan", "Turkmenistan", "TM"],
+	["uk", "United Kingdom", "GB"],
+	["ukraine", "Ukraine", "UA"],
+	["united_arab_emirates", "United Arab Emirates", "AE"],
+	["usa", "United States", "US"],
+	["venezuela", "Venezuela", "VE"],
+	["zz_documentaries_ar", "Documentaries (Arabic)", ""],
+	["zz_documentaries_en", "Documentaries (English)", ""],
+	["zz_movies", "Films", ""],
+	["zz_music_en", "Music", ""],
+	["zz_news_ar", "News (Arabic)", ""],
+	["zz_news_en", "News (English)", ""],
+	["zz_news_es", "News (Spanish)", ""],
+	["zz_vod_it", "On demand (Italian)", ""],
+];
+const FREE_TV_ALL = "all";
+
+// "freetv:<id>" -> { id, name, url }, or null.
+function catalogOf(id) {
+	const m = /^freetv:([a-z_]+)$/.exec(String(id || ""));
+	if (!m) { return null; }
+	if (m[1] === FREE_TV_ALL) { return { id: "freetv:" + FREE_TV_ALL, name: "All countries", url: FREE_TV_BASE + "playlist.m3u8" }; }
+	const row = FREE_TV.find((r) => r[0] === m[1]);
+	return row ? { id: "freetv:" + row[0], name: row[1], url: FREE_TV_BASE + "playlists/playlist_" + row[0] + ".m3u8" } : null;
+}
+
+// YouTube's pages are not streams.
+const isPage = (u) => /(^|\.)(youtube\.com|youtube-nocookie\.com|youtu\.be)$/i.test(u.hostname);
 
 // What was typed -> the playlist's address, or null.
 function playlistUrlOf(raw) {
@@ -96,12 +215,14 @@ function parse(text, baseUrl) {
 		if (line.startsWith("#EXTGRP:")) { group = line.slice(8).trim() || null; continue; }
 		if (line.startsWith("#")) { continue; }
 		const meta = info || { duration: -1, attrs: {}, title: "" };
-		const grp = C.text(meta.attrs["group-title"], 200) || C.text(group, 200) || null;
+		// iptv-org gives several categories as one group ("Entertainment;Kids"): each is a group.
+		const groups = (C.text(meta.attrs["group-title"], 200) || C.text(group, 200) || "")
+			.split(";").map((g) => g.trim()).filter((g, i, all) => g && all.indexOf(g) === i);
 		info = null;
 		group = null;
 		let u;
 		try { u = new URL(line, baseUrl); } catch (e) { skipped++; continue; }
-		if (u.protocol !== "http:" && u.protocol !== "https:") { skipped++; continue; }
+		if ((u.protocol !== "http:" && u.protocol !== "https:") || isPage(u)) { skipped++; continue; }
 		if (entries.length >= LIMITS.entries) { cut = true; break; }
 		const url = u.href;
 		const title = C.text(meta.title, 500) || C.text(meta.attrs["tvg-name"], 500) || fileTitle(u);
@@ -110,7 +231,7 @@ function parse(text, baseUrl) {
 		if (seen.has(id)) { continue; }
 		seen.add(id);
 		const logo = meta.attrs["tvg-logo"];
-		entries.push({ id, title, url, group: grp, logo: C.isLink(logo) ? logo : undefined,
+		entries.push({ id, title, url, group: groups[0] || null, groups, logo: C.isLink(logo) ? logo : undefined,
 			durationMs: meta.duration > 0 ? Math.round(meta.duration * 1000) : 0 });
 	}
 	return { entries, skipped, cut };
@@ -127,7 +248,9 @@ function groupsOf(entries) {
 	const out = [];
 	const seen = new Set();
 	for (const e of entries) {
-		if (e.group && !seen.has(e.group)) { seen.add(e.group); out.push(e.group); }
+		for (const g of e.groups) {
+			if (!seen.has(g)) { seen.add(g); out.push(g); }
+		}
 	}
 	return out;
 }
@@ -201,6 +324,14 @@ module.exports = {
 	needsToken: false,
 
 	async login(args, deps) {
+		if (args.catalog !== undefined) {
+			const cat = catalogOf(args.catalog);
+			if (!cat) { throw new CloudError("BAD_ARGS", "There is no such Free TV list."); }
+			await fetchList(deps.http, new URL(cat.url));
+			const alias = C.text(args.name, 100) || "Free TV – " + cat.name;
+			return { username: "Free TV · " + cat.name, alias,
+				credentials: { common: { url: cat.url, name: C.text(args.name, 100) || "", catalog: cat.id } } };
+		}
 		const url = playlistUrlOf(args.url);
 		if (!url) { throw new CloudError("MISSING_ARGS", "Enter the playlist's web address (http or https)."); }
 		if (url.username || url.password) {
@@ -230,7 +361,7 @@ module.exports = {
 			list = entries;
 		} else if (typeof sectionId === "string" && sectionId.startsWith("g:")) {
 			const g = sectionId.slice(2);
-			list = entries.filter((e) => e.group === g);
+			list = entries.filter((e) => e.groups.includes(g));
 		} else {
 			throw new CloudError(C.ERRORS.NOT_FOUND, "No such section.");
 		}
@@ -246,7 +377,7 @@ module.exports = {
 		const words = fold(query).split(/\s+/).filter(Boolean);
 		const { entries } = await listOf(ctx);
 		const hits = words.length === 0 ? [] : entries.filter((e) => {
-			const hay = fold(e.title + " " + (e.group || ""));
+			const hay = fold(e.title + " " + e.groups.join(" "));
 			return words.every((w) => hay.includes(w));
 		});
 		return pageOf(hits, cursor, limit);
@@ -258,6 +389,23 @@ module.exports = {
 		return { url: e.url, protocol: protocolOf(e.url), subtitles: [], session: null, drm: null };
 	},
 
+	extraMethods: {
+		// -> { catalogs: [{ id, name, region, topic }], source: { name, link } }: the Free TV lists
+		// for the sign-in app, countries by name, then the topics, then all of them.
+		m3uCatalogs: {
+			timeoutMs: 5000,
+			async handler() {
+				const rows = FREE_TV.map((r) => ({ id: "freetv:" + r[0], name: r[1], region: r[2], topic: r[2] === "" }));
+				const countries = rows.filter((r) => !r.topic).sort((a, b) => a.name.localeCompare(b.name, "en"));
+				return {
+					catalogs: countries.concat(rows.filter((r) => r.topic),
+						[{ id: "freetv:" + FREE_TV_ALL, name: "All countries", region: "", topic: false }]),
+					source: { name: "Free-TV", link: "https://github.com/Free-TV/IPTV" },
+				};
+			},
+		},
+	},
+
 	// For the tests.
-	_test: { LIMITS, playlistUrlOf, nameOf, parseExtinf, parse, protocolOf, groupsOf, toItem, fold, reset: () => cache.clear() },
+	_test: { LIMITS, FREE_TV, catalogOf, playlistUrlOf, nameOf, parseExtinf, parse, protocolOf, groupsOf, toItem, fold, reset: () => cache.clear() },
 };
