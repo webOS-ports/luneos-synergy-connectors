@@ -10,6 +10,8 @@
  *   plex      a code from plex.tv (plexPin), entered at plex.tv/link on any device; the app asks
  *             login until the code is linked or runs out. Or, for a server that lets the network
  *             in without signing in, its address and, if wanted, a token.
+ *   m3u       a playlist's web address (an IPTV service's list holds its password: shown as typed,
+ *             never logged) and, if wanted, a name for it
  *
  * Every kind calls org.webosports.service.videos/login with the templateId and what was typed; the
  * service checks it against the server and answers the account (username, alias, credentials),
@@ -44,6 +46,12 @@ enyo.kind({
 				"with DLNA on, ...). There is nothing to sign in to.",
 			button: "Add"
 		},
+		m3u: {
+			fields: ["url", "name"],
+			text: "Watch the channels of an M3U playlist in Videos: the list an IPTV service gives you, or any " +
+				"playlist of streams on the web. Enter its address as the service gives it.",
+			button: "Add"
+		},
 		plex: {
 			fields: [],
 			pin: true,
@@ -70,6 +78,13 @@ enyo.kind({
 				{ name: "serverGroup", kind: "RowGroup", caption: "SERVER", className: "accounts-group", showing: false, components: [
 					{ kind: "Input", name: "server", spellcheck: false, autocorrect: false, autoWordComplete: false,
 						autoCapitalize: "lowercase", hint: "Address" }
+				]},
+				{ name: "urlGroup", kind: "RowGroup", caption: "PLAYLIST ADDRESS", className: "accounts-group", showing: false, components: [
+					{ kind: "Input", name: "url", spellcheck: false, autocorrect: false, autoWordComplete: false,
+						autoCapitalize: "none", hint: "http://iptv.example.com/playlist.m3u" }
+				]},
+				{ name: "nameGroup", kind: "RowGroup", caption: "NAME (OPTIONAL)", className: "accounts-group", showing: false, components: [
+					{ kind: "Input", name: "listName", autoWordComplete: false, hint: "My TV" }
 				]},
 				{ name: "usernameGroup", kind: "RowGroup", caption: "USER NAME", className: "accounts-group", showing: false, components: [
 					{ kind: "Input", name: "username", spellcheck: false, autocorrect: false, autoWordComplete: false,
@@ -130,6 +145,8 @@ enyo.kind({
 		this.$.serverGroup.setShowing(k.fields.indexOf("server") >= 0);
 		this.$.usernameGroup.setShowing(k.fields.indexOf("username") >= 0);
 		this.$.passwordGroup.setShowing(k.fields.indexOf("password") >= 0);
+		this.$.urlGroup.setShowing(k.fields.indexOf("url") >= 0);
+		this.$.nameGroup.setShowing(k.fields.indexOf("name") >= 0);
 		if (this.kindId === "peertube") { this.$.server.setHint("peertube.example.org"); }
 		if (this.kindId === "jellyfin") { this.$.server.setHint("jellyfin.example.org or 192.168.1.10:8096"); }
 		if (this.kindId === "plex") { this.$.server.setHint("192.168.1.10 or plex.example.org:32400"); }
@@ -265,10 +282,16 @@ enyo.kind({
 		if (f.indexOf("server") >= 0) { payload.server = trim(this.$.server.getValue()); }
 		if (f.indexOf("username") >= 0) { payload.username = trim(this.$.username.getValue()); }
 		if (f.indexOf("password") >= 0) { payload.password = this.$.password.getValue() || ""; }
+		if (f.indexOf("url") >= 0) { payload.url = trim(this.$.url.getValue()); }
+		if (f.indexOf("name") >= 0) { payload.name = trim(this.$.listName.getValue()); }
 		if (this.addressMode) {
 			f = ["server"];
 			payload.server = trim(this.$.server.getValue());
 			payload.token = trim(this.$.token.getValue());
+		}
+		if (f.indexOf("url") >= 0 && !payload.url) {
+			this.showError("Enter the playlist's address.");
+			return;
 		}
 		if ((f.indexOf("server") >= 0 && !payload.server) || (f.indexOf("username") >= 0 && !payload.username)) {
 			this.showError(f.indexOf("username") >= 0 ? "Enter the server's address and your user name." : "Enter the address.");

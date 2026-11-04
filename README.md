@@ -8,7 +8,7 @@ and plugs a network or service into the stock apps.
 | `cloud/` | box, dropbox, flickr, google (Drive), hidrive, kdrive, koofr, mega, onedrive, pcloud, immich, photoprism, s3, smugmug, webdav (Nextcloud, ownCloud, any WebDAV server), yandex | Documents (DOCUMENTS) and Photos (PHOTO.UPLOAD) |
 | `im/` | discord, facebook (E2EE), googlechat, signal, teams, telegram, whatsapp | Messaging, through `imlibpurpleservice` and libpurple |
 | `music/` | apple, archive, deezer, jamendo, qobuz, soundcloud, spotify, tidal, youtube | Music, through the streaming daemon |
-| `video/` | jellyfin, peertube, plex, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Kodi, or Plex and Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
+| `video/` | jellyfin, m3u (IPTV and other playlists of web streams), peertube, plex, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Kodi, or Plex and Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
 
 ## Layout
 
@@ -78,9 +78,15 @@ Videos (org.webosports.app.videoplayer) lists every account with the capability
 Only Videos may browse (`allow`); `login`, `plexPin` and the instance list are open, as for the
 other sign-in apps. Every reply is cut to the shapes in `contract.js`; links are
 http(s) only, and a stream's link can carry the server's token (Jellyfin's
-`ApiKey`, Plex's `X-Plex-Token`) - the service never logs links or credentials. Errors: `AUTH_EXPIRED`,
+`ApiKey`, Plex's `X-Plex-Token`, an IPTV list's user name and password) - the service never logs links or credentials. Errors: `AUTH_EXPIRED`,
 `NOT_FOUND`, `SERVER_UNREACHABLE`, `SERVER_ERROR`, `NO_SOURCE`, `DRM_REQUIRED`,
 `GEO_BLOCKED`, besides _cloudcore's.
+
+An M3U account is one playlist at an http(s) address, kept as the account's credential since
+IPTV services put the user name and password in it; the account is named by the host and file
+name only. Its groups (`group-title`, `#EXTGRP`) are the sections, an entry with no length is a
+live channel, and only http(s) entries are kept. `#EXTVLCOPT` and `#KODIPROP` lines (headers, DRM
+keys) are not followed. The list is read again after 15 minutes.
 
 UPnP searches with SSDP from UDP port 41900 and keeps only servers on private,
 link-local or loopback addresses. The replies come from each server's own
