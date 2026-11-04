@@ -8,7 +8,7 @@
 
 PKG_CONFIG ?= pkg-config
 AR ?= ar
-PKGS = glib-2.0 nice libsrtp2 openssl json-glib-1.0 opus alsa
+PKGS = glib-2.0 nice libsrtp2 openssl json-glib-1.0 opus libpulse-simple
 
 PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKGS))
 PKG_LIBS := $(shell $(PKG_CONFIG) --libs $(PKGS))
@@ -29,9 +29,8 @@ OBJS = $(SRCS:.cpp=.o) h264_rtp.o
 # The tests that run anywhere: no ALSA device, no network beyond loopback.
 TESTS = spike/codec_crypto_smoke spike/negotiation_smoke spike/srtp_e2e_smoke spike/dtls_loopback_smoke \
         spike/ice_loopback_smoke spike/media_session_e2e_smoke spike/call_engine_e2e_smoke \
-        spike/nice_srtp_smoke
-# opus_codec_smoke opens real ALSA devices; it is built but not run by "make check".
-EXTRA_TESTS = spike/opus_codec_smoke
+        spike/nice_srtp_smoke spike/opus_codec_smoke
+EXTRA_TESTS =
 
 all: libtgcalls-lite.a
 

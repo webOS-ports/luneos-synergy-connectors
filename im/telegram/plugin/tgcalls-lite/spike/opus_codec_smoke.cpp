@@ -1,8 +1,7 @@
 // Phase 2 spike: exercise the exact Opus encode/decode parameters audio_pipeline.cpp uses
-// (48kHz, mono, 960-sample/20ms frames, OPUS_APPLICATION_VOIP) WITHOUT touching ALSA (no real
-// hardware to test against under qemu) -- proves the codec integration itself is correct
-// (frame sizing, buffer allocation, round-trip) so the only untested risk left in
-// audio_pipeline.cpp is the ALSA device behavior, which genuinely needs the real device.
+// (48kHz, mono, 960-sample/20ms frames, OPUS_APPLICATION_VOIP) without opening an audio device --
+// proves the codec integration itself is correct (frame sizing, buffer allocation, round-trip) so
+// the only untested part of audio_pipeline.cpp is the PulseAudio device side, which needs the device.
 #include <cstdio>
 #include <cstring>
 #include <cstdint>

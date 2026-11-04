@@ -23,6 +23,9 @@
 #include <vector>
 #include <memory>
 #include <functional>
+#include <string>
+#include <deque>
+#include <mutex>
 
 #include "encrypted_connection.h"
 #include "media_session.h"
@@ -52,15 +55,15 @@ public:
 	// NegotiateChannelsMessage via onOutgoingSignalingData automatically.
 	void start();
 
-	// Opens the ALSA "voipsource"/"voip" devices for real audio capture/playback. Deliberately
-	// SEPARATE from start(): these are the SAME device names libtgvoip's own AudioInputALSA/
-	// AudioOutputALSA use for every call today (see plugin/libtgvoip/os/linux/Audio{Input,Output}
-	// ALSA.cpp) -- calling this while that path is also active for the same call would have both
-	// competing for the same ALSA hardware (EBUSY or worse). Call this ONLY once tgcalls-lite is
-	// actually the active engine for a call (i.e. together with, not before, the real switch-over
-	// in getCallProtocol() -- see call.cpp's comment on why that hasn't happened yet). NOT called
-	// anywhere in call.cpp yet as of this writing -- deliberately left for that switch-over.
-	bool startAudio();
+	// Starts call audio through PulseAudio (see audio_pipeline.h); only once this engine carries
+	// the call, so no other engine holds the call devices. Returns false if audio could not start.
+	// Captured frames are encrypted and sent on this engine's GMainContext thread.
+	bool startAudio(const std::string &sink = "voipcall", const std::string &source = "webcall");
+
+	// One encoded Opus frame to send. May be called from any thread, but not concurrently with
+	// the destructor: frames are queued in order and sent from this engine's GMainContext, or
+	// dropped if the engine has been destroyed by then.
+	void postEncodedAudio(const uint8_t *opusPacket, int len);
 
 	// Feed bytes received via td_api::updateNewCallSignalingData here (still encrypted -- this
 	// class owns decrypting them).
@@ -78,6 +81,9 @@ public:
 	// call.cpp wires this to voipkit_video_receive_frame().
 	std::function<void(const uint8_t *accessUnit, unsigned int len)> onVideoAccessUnit;
 
+	// Fires with each received Opus payload, on the engine's thread, before it goes to playback.
+	std::function<void(const uint8_t *opusPacket, int len)> onAudioFrame;
+
 	// Drive periodically (e.g. every 500ms) for DTLS retransmission timers.
 	void tick();
 
@@ -87,6 +93,20 @@ private:
 	void handleParsedMessage(const SignalingMessage &msg);
 	void emitEncrypted(const SignalingMessage &msg);
 	void handleIncomingRtp(const uint8_t *packet, int len);
+	void sendAudioFrame(const uint8_t *opusPacket, int len);
+
+	// Encoded audio waiting to be sent, in capture order, shared with the drain posted to the
+	// context so that drain can tell whether this engine still exists.
+	struct AudioQueue {
+		CallEngine *engine = nullptr; // cleared, under mx, when the engine goes away
+		std::mutex mx;
+		std::deque<std::vector<uint8_t>> frames;
+		bool drainScheduled = false;
+	};
+	static constexpr size_t kMaxQueuedAudio = 25; // 500 ms; older frames are dropped
+	void drainAudio();
+	std::shared_ptr<AudioQueue> _audioQueue;
+	GMainContext *_ctx;
 
 	EncryptedConnection _enc;
 	MediaSession _media;

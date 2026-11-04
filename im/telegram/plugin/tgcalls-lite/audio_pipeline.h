@@ -1,30 +1,26 @@
-// audio_pipeline.h — real-time Opus audio capture/playback for tgcalls-lite calls, over the same
-// ALSA "voipsource"/"voip" devices libtgvoip's own AudioInputALSA/AudioOutputALSA already use
-// (see plugin/libtgvoip/os/linux/AudioInput{,Output}ALSA.cpp) -- same device names, same 48kHz
-// mono S16LE format, same 960-sample (20ms) frame size, same audiod phone-scenario dependency
-// (callLunaSetCallAudio(true) must already be active, exactly as it is for libtgvoip calls today).
-// This is a SEPARATE audio pipeline from libtgvoip's, not a shared one -- the two engines are
-// mutually exclusive per call (only one is ever active), but this file doesn't enforce that
-// itself; the caller (call.cpp) must not run both simultaneously.
+// audio_pipeline.h — Opus capture and playback for tgcalls-lite calls through PulseAudio.
 //
-// UNLIKE the ICE/DTLS-SRTP/signaling code in this directory, this file's correctness (ALSA device
-// behavior, buffer sizing under real scheduling, actual audio quality) can only be confirmed on
-// the real device -- qemu-arm has no real ALSA hardware to exercise. Structured as closely as
-// possible to the already-proven AudioInputALSA/AudioOutputALSA code specifically to minimize the
-// risk of getting device/format details wrong.
+// It uses the call devices libtgvoip uses on LuneOS (tdlib-purple 0015): playback to the sink
+// "voipcall", capture from the source "webcall". module-palm-policy routes them to the earpiece,
+// speaker or headset and the matching microphone once audiod has been told a VoIP call is up
+// (callLunaSetCallAudio(true)). Format: 48 kHz mono S16LE, 20 ms frames.
+//
+// Each direction runs a blocking pa_simple stream on its own thread. onEncodedFrame fires on the
+// capture thread; receiveEncodedFrame() may be called from any thread.
 #ifndef TGCALLS_LITE_AUDIO_PIPELINE_H
 #define TGCALLS_LITE_AUDIO_PIPELINE_H
 
 #include <cstdint>
 #include <vector>
 #include <deque>
+#include <string>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
 #include <functional>
 
-typedef struct _snd_pcm snd_pcm_t;
+typedef struct pa_simple pa_simple;
 typedef struct OpusEncoder OpusEncoder;
 typedef struct OpusDecoder OpusDecoder;
 
@@ -38,26 +34,24 @@ public:
 	AudioPipeline(const AudioPipeline &) = delete;
 	AudioPipeline &operator=(const AudioPipeline &) = delete;
 
-	// Opens ALSA capture+playback and starts both threads. Returns false (logs why) if either ALSA
-	// device or either Opus codec instance fails to open/create -- caller should treat that as "no
-	// audio for this call" rather than crash, same as AudioInputALSA/AudioOutputALSA's own `failed`
-	// flag philosophy.
-	bool start();
+	// Opens both streams and the Opus codecs and starts the threads. Returns false (and logs
+	// why) if any of them fails; the call then has no audio. An empty name means PulseAudio's
+	// default device.
+	bool start(const std::string &sink = "voipcall", const std::string &source = "webcall");
 	void stop();
 
-	// Fires once per captured+encoded 20ms frame, ready for RTP packetization + CallEngine::sendRtp.
+	// Fires once per captured and encoded 20 ms frame, on the capture thread.
 	std::function<void(const uint8_t *opusPacket, int len)> onEncodedFrame;
 
-	// Feed one received (already SRTP-decrypted, RTP-depacketized) Opus packet here for decode +
-	// playback. Queued, not decoded synchronously -- see the .cpp's playback thread.
+	// One received Opus packet, for decoding and playback on the playback thread.
 	void receiveEncodedFrame(const uint8_t *opusPacket, int len);
 
 private:
 	void captureThreadMain();
 	void playbackThreadMain();
 
-	snd_pcm_t *_captureHandle = nullptr;
-	snd_pcm_t *_playbackHandle = nullptr;
+	pa_simple *_capture = nullptr;
+	pa_simple *_playback = nullptr;
 	OpusEncoder *_encoder = nullptr;
 	OpusDecoder *_decoder = nullptr;
 
@@ -65,13 +59,11 @@ private:
 	std::thread _captureThread;
 	std::thread _playbackThread;
 
-	// Playback jitter queue: bounded so a lagging peer/network can't build unbounded latency.
-	// Oldest-drop on overflow (live audio wants low latency over completeness, same philosophy as
-	// skypekit.h's video frame handoff).
+	// Bounded so a late burst cannot build up latency: the oldest packet is dropped on overflow.
 	std::mutex _playbackMx;
 	std::condition_variable _playbackCv;
 	std::deque<std::vector<uint8_t>> _playbackQueue;
-	static constexpr size_t kMaxQueuedFrames = 10; // ~200ms at 20ms/frame
+	static constexpr size_t kMaxQueuedFrames = 10; // ~200 ms
 };
 
 } // namespace tgcalls_lite

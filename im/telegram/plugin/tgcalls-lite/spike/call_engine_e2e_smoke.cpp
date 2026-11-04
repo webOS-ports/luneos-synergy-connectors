@@ -5,13 +5,13 @@
 // side calls anything on the other's MediaSession/IceSession/DtlsTransport directly -- this proves
 // the ENTIRE tgcalls-lite stack (signaling codec incl. NegotiateChannels, encryption, ICE,
 // DTLS-SRTP, real H.264-over-RTP framing via h264_rtp.c) works together end to end, driven only
-// through the same narrow interface TDLib will actually expose. Deliberately NOT exercising
-// AudioPipeline::startAudio() here -- that opens real ALSA devices, which don't exist under
-// qemu-arm-static emulation (and, separately, must not run concurrently with libtgvoip's own ALSA
-// session in production either -- see call_engine.h's startAudio() comment).
+// through the same narrow interface TDLib will actually expose. startAudio() is not exercised: it
+// needs the device's PulseAudio call devices.
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 #include "../call_engine.h"
 #include "../encrypted_connection.h"
@@ -21,6 +21,7 @@
 using namespace tgcalls_lite;
 
 int main() {
+	alarm(120); // a hang fails the test (SIGALRM) instead of stalling "make check"
 	GMainContext *ctx = g_main_context_default();
 
 	// Same 256-byte call encryption key both sides would get from TDLib's callStateReady --
@@ -121,6 +122,46 @@ int main() {
 	if (calleeVideoBuf != accessUnit) {
 		fprintf(stderr, "FAIL: received access unit does not match what was sent (got %zu bytes, expected %zu)\n",
 		        calleeVideoBuf.size(), accessUnit.size());
+		return 1;
+	}
+
+	// Audio both ways, posted from other threads as the capture thread does. Frames carry their
+	// index so loss and corruption show.
+	constexpr int kFrames = 20; // fewer than the engine queues (25), so none is dropped
+	std::vector<std::vector<uint8_t>> gotAtCallee, gotAtCaller;
+	callee.onAudioFrame = [&](const uint8_t *p, int n) { gotAtCallee.emplace_back(p, p + n); };
+	caller.onAudioFrame = [&](const uint8_t *p, int n) { gotAtCaller.emplace_back(p, p + n); };
+	auto frame = [](int side, int i) {
+		std::vector<uint8_t> f(40 + (size_t)i);
+		for (size_t k = 0; k < f.size(); k++) f[k] = (uint8_t)(side * 100 + i + (int)k);
+		return f;
+	};
+	std::thread t1([&]() { for (int i = 0; i < kFrames; i++) { auto f = frame(1, i); caller.postEncodedAudio(f.data(), (int)f.size()); } });
+	std::thread t2([&]() { for (int i = 0; i < kFrames; i++) { auto f = frame(2, i); callee.postEncodedAudio(f.data(), (int)f.size()); } });
+	t1.join();
+	t2.join();
+	for (int i = 0; i < 4000 && (gotAtCallee.size() < (size_t)kFrames || gotAtCaller.size() < (size_t)kFrames); i++)
+		g_main_context_iteration(ctx, TRUE);
+	if (gotAtCallee.size() != (size_t)kFrames || gotAtCaller.size() != (size_t)kFrames) {
+		fprintf(stderr, "FAIL: audio frames received: callee %zu, caller %zu, expected %d each\n",
+		        gotAtCallee.size(), gotAtCaller.size(), kFrames);
+		return 1;
+	}
+	for (int i = 0; i < kFrames; i++) {
+		if (gotAtCallee[(size_t)i] != frame(1, i) || gotAtCaller[(size_t)i] != frame(2, i)) {
+			fprintf(stderr, "FAIL: audio frame %d differs from what was sent\n", i);
+			return 1;
+		}
+	}
+
+	// Overflow: 40 frames posted before the loop runs; the queue keeps the newest 25.
+	gotAtCallee.clear();
+	std::thread t3([&]() { for (int i = 0; i < 40; i++) { auto f = frame(3, i); caller.postEncodedAudio(f.data(), (int)f.size()); } });
+	t3.join();
+	for (int i = 0; i < 4000 && gotAtCallee.size() < 25; i++) g_main_context_iteration(ctx, TRUE);
+	for (int i = 0; i < 20; i++) g_main_context_iteration(ctx, FALSE);
+	if (gotAtCallee.size() != 25 || gotAtCallee.front() != frame(3, 15) || gotAtCallee.back() != frame(3, 39)) {
+		fprintf(stderr, "FAIL: overflow kept %zu frames, expected the newest 25 (15..39)\n", gotAtCallee.size());
 		return 1;
 	}
 

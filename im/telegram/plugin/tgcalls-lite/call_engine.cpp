@@ -91,7 +91,9 @@ uint32_t random_exchange_id() {
 } // namespace
 
 CallEngine::CallEngine(GMainContext *ctx, const uint8_t *key256, bool isOutgoing, bool isVideo)
-	: _enc(key256, isOutgoing), _media(ctx, isOutgoing), _isOutgoing(isOutgoing), _isVideo(isVideo) {
+	: _audioQueue(std::make_shared<AudioQueue>()), _ctx(ctx), _enc(key256, isOutgoing), _media(ctx, isOutgoing),
+	  _isOutgoing(isOutgoing), _isVideo(isVideo) {
+	_audioQueue->engine = this;
 	_localAudioSsrc = random_ssrc();
 	do {
 		_localVideoSsrc = random_ssrc();
@@ -116,20 +118,72 @@ CallEngine::CallEngine(GMainContext *ctx, const uint8_t *key256, bool isOutgoing
 	};
 	_media.onRtpReceived = [this](const uint8_t *payload, int len) { handleIncomingRtp(payload, len); };
 
-	_audio.onEncodedFrame = [this](const uint8_t *opusPacket, int len) {
-		const int pt = _negotiator->codecs().outgoingAudioPt;
-		if (pt < 0 || len <= 0) return; // the peer has not accepted our audio yet
-		uint8_t pkt[kRtpHeaderLen + 1500];
-		if ((size_t)len > sizeof(pkt) - kRtpHeaderLen) return; // implausibly large Opus packet, drop
-		build_rtp_header(pkt, (uint8_t)pt, _audioSeq++, _audioTimestamp, _localAudioSsrc, 1);
-		_audioTimestamp += kOpusTimestampPerFrame;
-		memcpy(pkt + kRtpHeaderLen, opusPacket, len);
-		int totalLen = (int)(kRtpHeaderLen + len);
-		_media.sendRtp(pkt, &totalLen);
-	};
+	_audio.onEncodedFrame = [this](const uint8_t *opusPacket, int len) { postEncodedAudio(opusPacket, len); };
+}
+
+void CallEngine::postEncodedAudio(const uint8_t *opusPacket, int len) {
+	// SRTP, ICE and the negotiated state are only touched on the engine's own thread. Frames go
+	// through one FIFO and one drain at a time: GLib does not dispatch separately posted sources
+	// of equal priority in posting order, and RTP needs capture order.
+	if (!opusPacket || len <= 0) return;
+	std::shared_ptr<AudioQueue> queue = _audioQueue;
+	{
+		std::lock_guard<std::mutex> lock(queue->mx);
+		if (!queue->engine) return;
+		while (queue->frames.size() >= kMaxQueuedAudio) queue->frames.pop_front();
+		queue->frames.emplace_back(opusPacket, opusPacket + len);
+		if (queue->drainScheduled) return;
+		queue->drainScheduled = true;
+	}
+	// An attached source, not g_main_context_invoke(): that runs the function right here, on the
+	// capture thread, whenever no thread owns the context at this moment.
+	auto *ref = new std::shared_ptr<AudioQueue>(std::move(queue));
+	GSource *source = g_idle_source_new();
+	g_source_set_priority(source, G_PRIORITY_HIGH);
+	g_source_set_callback(source,
+		[](gpointer data) -> gboolean {
+			auto &q = *static_cast<std::shared_ptr<AudioQueue> *>(data);
+			CallEngine *engine;
+			{
+				std::lock_guard<std::mutex> lock(q->mx);
+				engine = q->engine;
+				if (!engine) q->drainScheduled = false;
+			}
+			if (engine) engine->drainAudio();
+			return G_SOURCE_REMOVE;
+		},
+		ref, [](gpointer data) { delete static_cast<std::shared_ptr<AudioQueue> *>(data); });
+	g_source_attach(source, _ctx);
+	g_source_unref(source);
+}
+
+void CallEngine::drainAudio() {
+	std::deque<std::vector<uint8_t>> frames;
+	{
+		std::lock_guard<std::mutex> lock(_audioQueue->mx);
+		frames.swap(_audioQueue->frames);
+		_audioQueue->drainScheduled = false;
+	}
+	for (const auto &f : frames) sendAudioFrame(f.data(), (int)f.size());
+}
+
+void CallEngine::sendAudioFrame(const uint8_t *opusPacket, int len) {
+	const int pt = _negotiator->codecs().outgoingAudioPt;
+	if (pt < 0 || len <= 0) return; // the peer has not accepted our audio yet
+	uint8_t pkt[kRtpHeaderLen + 1500];
+	if ((size_t)len > sizeof(pkt) - kRtpHeaderLen) return; // implausibly large Opus packet, drop
+	build_rtp_header(pkt, (uint8_t)pt, _audioSeq++, _audioTimestamp, _localAudioSsrc, 1);
+	_audioTimestamp += kOpusTimestampPerFrame;
+	memcpy(pkt + kRtpHeaderLen, opusPacket, (size_t)len);
+	int totalLen = (int)(kRtpHeaderLen + (size_t)len);
+	_media.sendRtp(pkt, &totalLen);
 }
 
 CallEngine::~CallEngine() {
+	_audio.stop(); // joins the capture thread, the only internal caller of postEncodedAudio()
+	std::lock_guard<std::mutex> lock(_audioQueue->mx);
+	_audioQueue->engine = nullptr; // a drain still queued on the context then does nothing
+	_audioQueue->frames.clear();
 	if (_h264Depacketizer) {
 		auto *depkt = static_cast<h264_depacketizer *>(_h264Depacketizer);
 		h264_depacketizer_free(depkt);
@@ -145,9 +199,9 @@ void CallEngine::start() {
 	_media.start();
 }
 
-bool CallEngine::startAudio() {
-	if (!_audio.start()) {
-		fprintf(stderr, "tgcalls-lite: AudioPipeline::start() failed -- call will have no audio\n");
+bool CallEngine::startAudio(const std::string &sink, const std::string &source) {
+	if (!_audio.start(sink, source)) {
+		g_warning("tgcalls-lite: call audio could not start, the call has no audio");
 		return false;
 	}
 	return true;
@@ -266,7 +320,10 @@ void CallEngine::handleIncomingRtp(const uint8_t *packet, int len) {
 	const auto &codecs = _negotiator->codecs();
 
 	if (rtp.payloadType == codecs.incomingAudioPt) {
-		if (rtp.payloadLength > 0) _audio.receiveEncodedFrame(payload, (int)rtp.payloadLength);
+		if (rtp.payloadLength > 0) {
+			if (onAudioFrame) onAudioFrame(payload, (int)rtp.payloadLength);
+			_audio.receiveEncodedFrame(payload, (int)rtp.payloadLength);
+		}
 	} else if (rtp.payloadType == codecs.incomingVideoPt) {
 		auto *depkt = static_cast<h264_depacketizer *>(_h264Depacketizer);
 		const unsigned char *au = nullptr;

@@ -1,9 +1,9 @@
 #include "audio_pipeline.h"
 
-#include <alsa/asoundlib.h>
+#include <glib.h>
 #include <opus.h>
-#include <cstdio>
-#include <cstring>
+#include <pulse/error.h>
+#include <pulse/simple.h>
 
 namespace tgcalls_lite {
 
@@ -11,37 +11,32 @@ namespace {
 
 constexpr int kSampleRate = 48000;
 constexpr int kChannels = 1;
-constexpr int kFrameSamples = 960; // 20ms at 48kHz, matches libtgvoip's own AudioInputALSA BUFFER_SIZE
+constexpr int kFrameSamples = 960; // 20 ms
+constexpr size_t kFrameBytes = kFrameSamples * sizeof(int16_t) * kChannels;
 constexpr int kMaxOpusPacket = 1500;
 
-// Same device-name/fallback convention as plugin/libtgvoip/os/linux/AudioInputALSA.cpp /
-// AudioOutputALSA.cpp: "voipsource"/"voip" are audiod's phone-scenario-routed PCMs (real mic /
-// real loudspeaker only while callLunaSetCallAudio(true) has the phone scenario active); "default"
-// is the media source/sink, silent during a call.
-snd_pcm_t *open_pcm(const char *primaryDevice, snd_pcm_stream_t stream) {
-	snd_pcm_t *handle = nullptr;
-	int rc = snd_pcm_open(&handle, primaryDevice, stream, 0);
-	const char *opened = primaryDevice;
-	if (rc < 0) {
-		opened = "default";
-		rc = snd_pcm_open(&handle, "default", stream, 0);
-	}
-	if (rc < 0) {
-		fprintf(stderr, "tgcalls-lite audio: snd_pcm_open failed for both '%s' and 'default': %s\n",
-		        primaryDevice, snd_strerror(rc));
-		return nullptr;
-	}
-	fprintf(stderr, "tgcalls-lite audio: opened ALSA %s device '%s'\n",
-	        stream == SND_PCM_STREAM_CAPTURE ? "capture" : "playback", opened);
+pa_simple *open_stream(pa_stream_direction_t dir, const std::string &device) {
+	pa_sample_spec spec;
+	spec.format = PA_SAMPLE_S16LE;
+	spec.rate = kSampleRate;
+	spec.channels = kChannels;
 
-	rc = snd_pcm_set_params(handle, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
-	                          kChannels, kSampleRate, /*soft_resample=*/1, /*latency_us=*/100000);
-	if (rc < 0) {
-		fprintf(stderr, "tgcalls-lite audio: snd_pcm_set_params failed: %s\n", snd_strerror(rc));
-		snd_pcm_close(handle);
-		return nullptr;
-	}
-	return handle;
+	// Small buffers: 20 ms requests and fragments, about 60 ms queued for playback.
+	pa_buffer_attr attr;
+	attr.maxlength = (uint32_t)-1;
+	attr.tlength = (uint32_t)(3 * kFrameBytes);
+	attr.prebuf = (uint32_t)-1;
+	attr.minreq = (uint32_t)kFrameBytes;
+	attr.fragsize = (uint32_t)kFrameBytes;
+
+	int err = 0;
+	const bool playback = dir == PA_STREAM_PLAYBACK;
+	pa_simple *s = pa_simple_new(nullptr, "Telegram call", dir, device.empty() ? nullptr : device.c_str(),
+	                             playback ? "call playback" : "call capture", &spec, nullptr, &attr, &err);
+	if (!s)
+		g_warning("tgcalls-lite: cannot open PulseAudio %s \"%s\": %s", playback ? "sink" : "source",
+		          device.c_str(), pa_strerror(err));
+	return s;
 }
 
 } // namespace
@@ -52,12 +47,12 @@ AudioPipeline::~AudioPipeline() {
 	stop();
 }
 
-bool AudioPipeline::start() {
+bool AudioPipeline::start(const std::string &sink, const std::string &source) {
 	if (_running) return true;
 
-	_captureHandle = open_pcm("voipsource", SND_PCM_STREAM_CAPTURE);
-	_playbackHandle = open_pcm("voip", SND_PCM_STREAM_PLAYBACK);
-	if (!_captureHandle || !_playbackHandle) {
+	_capture = open_stream(PA_STREAM_RECORD, source);
+	_playback = open_stream(PA_STREAM_PLAYBACK, sink);
+	if (!_capture || !_playback) {
 		stop();
 		return false;
 	}
@@ -65,13 +60,15 @@ bool AudioPipeline::start() {
 	int opusErr = 0;
 	_encoder = opus_encoder_create(kSampleRate, kChannels, OPUS_APPLICATION_VOIP, &opusErr);
 	if (opusErr != OPUS_OK || !_encoder) {
-		fprintf(stderr, "tgcalls-lite audio: opus_encoder_create failed: %d\n", opusErr);
+		g_warning("tgcalls-lite: opus_encoder_create failed: %d", opusErr);
 		stop();
 		return false;
 	}
+	// In-band FEC, which we offer (useinbandfec=1).
+	opus_encoder_ctl(_encoder, OPUS_SET_INBAND_FEC(1));
 	_decoder = opus_decoder_create(kSampleRate, kChannels, &opusErr);
 	if (opusErr != OPUS_OK || !_decoder) {
-		fprintf(stderr, "tgcalls-lite audio: opus_decoder_create failed: %d\n", opusErr);
+		g_warning("tgcalls-lite: opus_decoder_create failed: %d", opusErr);
 		stop();
 		return false;
 	}
@@ -90,8 +87,8 @@ void AudioPipeline::stop() {
 	}
 	if (_encoder) { opus_encoder_destroy(_encoder); _encoder = nullptr; }
 	if (_decoder) { opus_decoder_destroy(_decoder); _decoder = nullptr; }
-	if (_captureHandle) { snd_pcm_close(_captureHandle); _captureHandle = nullptr; }
-	if (_playbackHandle) { snd_pcm_close(_playbackHandle); _playbackHandle = nullptr; }
+	if (_capture) { pa_simple_free(_capture); _capture = nullptr; }
+	if (_playback) { pa_simple_free(_playback); _playback = nullptr; }
 	std::lock_guard<std::mutex> lock(_playbackMx);
 	_playbackQueue.clear();
 }
@@ -101,22 +98,14 @@ void AudioPipeline::captureThreadMain() {
 	uint8_t opusPacket[kMaxOpusPacket];
 
 	while (_running) {
-		snd_pcm_sframes_t frames = snd_pcm_readi(_captureHandle, pcm, kFrameSamples);
-		if (frames < 0) {
-			frames = snd_pcm_recover(_captureHandle, (int)frames, 0);
-			if (frames < 0) {
-				fprintf(stderr, "tgcalls-lite audio: snd_pcm_readi unrecoverable: %s\n",
-				        snd_strerror((int)frames));
-				break;
-			}
-			continue; // recovered (e.g. after an xrun) -- try again next loop rather than encoding
-			          // a possibly-short/garbage buffer from this iteration
+		int err = 0;
+		if (pa_simple_read(_capture, pcm, sizeof(pcm), &err) < 0) {
+			g_warning("tgcalls-lite: PulseAudio capture failed: %s", pa_strerror(err));
+			break;
 		}
-		if (frames != kFrameSamples) continue; // partial read -- drop rather than encode a short frame
-
 		opus_int32 len = opus_encode(_encoder, pcm, kFrameSamples, opusPacket, sizeof(opusPacket));
 		if (len < 0) {
-			fprintf(stderr, "tgcalls-lite audio: opus_encode failed: %d\n", (int)len);
+			g_warning("tgcalls-lite: opus_encode failed: %d", (int)len);
 			continue;
 		}
 		if (onEncodedFrame) onEncodedFrame(opusPacket, (int)len);
@@ -137,19 +126,16 @@ void AudioPipeline::playbackThreadMain() {
 		}
 
 		int samples = opus_decode(_decoder, packet.data(), (opus_int32)packet.size(), pcm,
-		                            kFrameSamples, /*decode_fec=*/0);
-		if (samples < 0) {
-			fprintf(stderr, "tgcalls-lite audio: opus_decode failed: %d\n", samples);
+		                          kFrameSamples, /*decode_fec=*/0);
+		if (samples <= 0) {
+			g_warning("tgcalls-lite: opus_decode failed: %d", samples);
 			continue;
 		}
 
-		snd_pcm_sframes_t written = snd_pcm_writei(_playbackHandle, pcm, samples);
-		if (written < 0) {
-			written = snd_pcm_recover(_playbackHandle, (int)written, 0);
-			if (written < 0) {
-				fprintf(stderr, "tgcalls-lite audio: snd_pcm_writei unrecoverable: %s\n",
-				        snd_strerror((int)written));
-			}
+		int err = 0;
+		if (pa_simple_write(_playback, pcm, (size_t)samples * sizeof(int16_t) * kChannels, &err) < 0) {
+			g_warning("tgcalls-lite: PulseAudio playback failed: %s", pa_strerror(err));
+			break;
 		}
 	}
 }
