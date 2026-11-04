@@ -29,6 +29,8 @@ extern "C" {
 #define SV_PT_RED        120     /* RFC 2198 RED around VP8 or ULPFEC (RingRTC constants.h RED_PT) */
 #define SV_PT_ULPFEC     122
 #define SV_EXT_CVO       4
+#define SV_EXT_TCC       1       /* transport-wide sequence number (RingRTC TRANSPORT_CC1_EXT_ID) */
+#define SV_TCC_WINDOW    512     /* packets one feedback can cover */
 #define SV_SSRC_DATA     0x0000000Du
 #define SV_VIDEO_CLOCK   90000
 
@@ -73,6 +75,28 @@ size_t sv_rtp_add_ext(const uint8_t *in, size_t n, unsigned id, const uint8_t *d
  * *inner_pt, or 0 when in is not RTP, the RED headers are malformed or out (cap bytes) is too
  * small. in and out may not overlap. */
 size_t sv_red_unwrap(const uint8_t *in, size_t n, uint8_t *out, size_t cap, uint8_t *inner_pt);
+
+/* Transport-wide congestion control feedback (draft-holmer-rmcat-transport-wide-cc-extensions-01,
+ * RTCP RTPFB FMT 15). RingRTC negotiates transport-cc for video, and WebRTC's sender then sets its
+ * bitrate from this feedback alone: without it the far side's video falls to a trickle. Record
+ * each received packet's transport sequence number with its arrival time, then build a feedback
+ * packet now and then (WebRTC sends one about every 100 ms). */
+typedef struct {
+    int64_t  base;                     /* unwrapped seq of arrival[0], -1 before the first packet */
+    int64_t  highest;                  /* highest unwrapped seq seen, -1 before the first */
+    int64_t  arrival[SV_TCC_WINDOW];   /* arrival times in microseconds, -1 not received */
+    int      pending;                  /* packets recorded since the last feedback */
+    uint8_t  fb_count;                 /* feedback packet count */
+} SvTcc;
+
+void   sv_tcc_init(SvTcc *t);
+/* One received packet: its transport sequence number and arrival time (microseconds, any
+ * monotonic clock). Packets older than what was already reported are ignored. */
+void   sv_tcc_record(SvTcc *t, uint16_t seq, int64_t arrival_us);
+/* The feedback for everything recorded since the last one, from sender_ssrc about media_ssrc,
+ * into out (cap bytes). Returns its length (a multiple of 4), or 0 when there is nothing to
+ * report or it does not fit. The recorded packets are then forgotten. */
+size_t sv_tcc_build(SvTcc *t, uint32_t sender_ssrc, uint32_t media_ssrc, uint8_t *out, size_t cap);
 
 /* The CVO byte |0 0 0 0 C F R1 R0|: R1R0 is how far the picture has to be turned CLOCKWISE, in
  * quarter turns, to be upright (webrtc rtp_cvo.h, VideoRotation "enum for clockwise rotation").

@@ -204,6 +204,114 @@ size_t sv_red_unwrap(const uint8_t *in, size_t n, uint8_t *out, size_t cap, uint
     return total;
 }
 
+void sv_tcc_init(SvTcc *t)
+{
+    t->base = -1;
+    t->highest = -1;
+    for (int i = 0; i < SV_TCC_WINDOW; i++)
+        t->arrival[i] = -1;
+    t->pending = 0;
+    t->fb_count = 0;
+}
+
+void sv_tcc_record(SvTcc *t, uint16_t seq, int64_t arrival_us)
+{
+    int64_t u;
+    if (t->highest < 0) {
+        u = seq;
+        t->highest = u;
+    } else {
+        u = t->highest + (int16_t)(uint16_t)(seq - (uint16_t)t->highest);
+        if (u > t->highest)
+            t->highest = u;
+    }
+    if (t->base < 0)
+        t->base = u;
+    if (u < t->base)
+        return;                                 /* already reported (as lost) */
+    if (u - t->base >= SV_TCC_WINDOW) {         /* no feedback for a long time: drop the oldest */
+        int64_t shift = u - t->base - SV_TCC_WINDOW + 1;
+        for (int i = 0; i < SV_TCC_WINDOW; i++)
+            t->arrival[i] = i + shift < SV_TCC_WINDOW ? t->arrival[i + shift] : -1;
+        t->base += shift;
+    }
+    int64_t *slot = &t->arrival[u - t->base];
+    if (*slot < 0) {
+        *slot = arrival_us < 0 ? 0 : arrival_us;
+        t->pending++;
+    }
+}
+
+size_t sv_tcc_build(SvTcc *t, uint32_t sender_ssrc, uint32_t media_ssrc, uint8_t *out, size_t cap)
+{
+    if (!t || !out || t->pending == 0 || t->base < 0)
+        return 0;
+    /* The packets from base up to the last one received. */
+    int count = 0, first = -1;
+    for (int i = 0; i < SV_TCC_WINDOW; i++) {
+        if (t->arrival[i] >= 0) {
+            count = i + 1;
+            if (first < 0) first = i;
+        }
+    }
+    if (first < 0)
+        return 0;
+    int chunks = (count + 6) / 7;               /* two-bit status vector chunks, 7 packets each */
+    size_t need = 20 + 2u * (size_t)chunks + 2u * (size_t)count;
+    need = (need + 3) & ~(size_t)3;
+    if (need > cap)
+        return 0;
+    memset(out, 0, need);
+
+    int64_t ref = t->arrival[first] / 64000;    /* reference time, 64 ms units (24 bits) */
+    int64_t prev = ref * 64000;
+    size_t d = 20 + 2u * (size_t)chunks;        /* where the receive deltas go */
+    for (int i = 0; i < count; i++) {
+        unsigned sym = 0;
+        if (t->arrival[i] >= 0) {
+            int64_t delta = (t->arrival[i] - prev + (t->arrival[i] >= prev ? 125 : -125)) / 250;
+            if (delta >= 0 && delta <= 255) {
+                sym = 1;
+                out[d++] = (uint8_t)delta;
+            } else {
+                if (delta > 32767) delta = 32767;
+                if (delta < -32768) delta = -32768;
+                sym = 2;
+                wr16(out + d, (uint16_t)(int16_t)delta);
+                d += 2;
+            }
+            prev += delta * 250;
+        }
+        size_t c = 20 + 2u * (size_t)(i / 7);
+        unsigned shift = 12 - 2u * (unsigned)(i % 7);
+        uint16_t v = (uint16_t)(rd16(out + c) | 0xC000 | (sym << shift));
+        wr16(out + c, v);
+    }
+    size_t len = (d + 3) & ~(size_t)3;          /* zero padded to a 32-bit boundary */
+
+    out[0] = 0x80 | 15;                         /* V=2, FMT=15 */
+    out[1] = 205;                               /* RTPFB */
+    wr16(out + 2, (uint16_t)(len / 4 - 1));
+    wr32(out + 4, sender_ssrc);
+    wr32(out + 8, media_ssrc);
+    wr16(out + 12, (uint16_t)t->base);
+    wr16(out + 14, (uint16_t)count);
+    out[16] = (uint8_t)(ref >> 16);
+    out[17] = (uint8_t)(ref >> 8);
+    out[18] = (uint8_t)ref;
+    out[19] = t->fb_count++;
+
+    /* Forget what was reported; the next feedback starts after it. */
+    int64_t next = t->base + count;
+    for (int i = 0; i < SV_TCC_WINDOW; i++)
+        t->arrival[i] = i + count < SV_TCC_WINDOW ? t->arrival[i + count] : -1;
+    t->base = next;
+    t->pending = 0;
+    for (int i = 0; i < SV_TCC_WINDOW; i++)
+        if (t->arrival[i] >= 0) t->pending++;
+    return len;
+}
+
 size_t sv_rtcp_build_pli(uint32_t sender_ssrc, uint32_t media_ssrc, uint8_t out[12])
 {
     out[0] = 0x80 | 1;     /* V=2, FMT=1 (PLI) */

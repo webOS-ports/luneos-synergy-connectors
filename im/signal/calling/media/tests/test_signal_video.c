@@ -248,6 +248,63 @@ static void test_red(void)
     CHECK(sv_red_unwrap(in, 11, out, sizeof out, &pt) == 0);
 }
 
+static SvTcc tcc;   /* large: not on the stack */
+
+static void test_tcc(void)
+{
+    uint8_t out[1400];
+    sv_tcc_init(&tcc);
+    CHECK(sv_tcc_build(&tcc, 2003, 1003, out, sizeof out) == 0);   /* nothing yet */
+
+    /* 65534 received 1 ms after the reference time 2 (128 ms), 65535 lost, 0 (wrapped) 70 ms
+     * later: a small delta, a gap, a large delta. */
+    sv_tcc_record(&tcc, 65534, 129000);
+    sv_tcc_record(&tcc, 0, 199000);
+    size_t n = sv_tcc_build(&tcc, 2003, 1003, out, sizeof out);
+    static const uint8_t want1[28] = {
+        0x8f, 0xcd, 0x00, 0x06, 0x00, 0x00, 0x07, 0xd3, 0x00, 0x00, 0x03, 0xeb,
+        0xff, 0xfe, 0x00, 0x03, 0x00, 0x00, 0x02, 0x00,
+        0xd2, 0x00,                 /* status vector: small, not received, large */
+        0x04, 0x01, 0x18, 0x00,     /* 4 x 250 us, 280 x 250 us, padding */
+        0x00, 0x00,
+    };
+    CHECK(n == 28 && memcmp(out, want1, 26) == 0 && out[26] == 0 && out[27] == 0);
+    CHECK(sv_tcc_build(&tcc, 2003, 1003, out, sizeof out) == 0);   /* all reported */
+
+    /* A late 65535 was already reported lost: ignored. The next starts after the last. */
+    sv_tcc_record(&tcc, 65535, 199500);
+    CHECK(sv_tcc_build(&tcc, 2003, 1003, out, sizeof out) == 0);
+    sv_tcc_record(&tcc, 1, 200000);
+    n = sv_tcc_build(&tcc, 2003, 1003, out, sizeof out);
+    CHECK(n == 24);
+    CHECK(out[12] == 0x00 && out[13] == 0x01 && out[14] == 0 && out[15] == 1);
+    CHECK(out[16] == 0 && out[17] == 0 && out[18] == 3 && out[19] == 1);   /* ref 192 ms, count 1 */
+    CHECK(out[20] == 0xd0 && out[21] == 0x00 && out[22] == 32);
+
+    /* Out of order: the second packet arrived 1 ms before the first, a negative delta. */
+    sv_tcc_record(&tcc, 3, 299000);
+    sv_tcc_record(&tcc, 2, 300000);
+    n = sv_tcc_build(&tcc, 2003, 1003, out, sizeof out);
+    CHECK(n == 28);
+    CHECK(out[13] == 2 && out[15] == 2 && out[18] == 4 && out[19] == 2);
+    CHECK(out[20] == 0xd8 && out[21] == 0x00);                 /* small, large */
+    CHECK(out[22] == 176 && out[23] == 0xff && out[24] == 0xfc); /* 44 ms, -1 ms */
+
+    /* More than a window without feedback: the oldest are dropped, the rest reported. */
+    for (int i = 0; i < 600; i++)
+        sv_tcc_record(&tcc, (uint16_t)(4 + i), 400000 + 1000 * i);
+    n = sv_tcc_build(&tcc, 2003, 1003, out, sizeof out);
+    CHECK(n > 0 && ((out[14] << 8) | out[15]) == SV_TCC_WINDOW);
+    CHECK(((out[12] << 8) | out[13]) == 4 + 600 - SV_TCC_WINDOW);
+    CHECK((size_t)((out[2] << 8) | out[3]) == n / 4 - 1);
+    CHECK(sv_tcc_build(&tcc, 2003, 1003, out, sizeof out) == 0);
+
+    /* Too small a buffer: nothing built, nothing forgotten. */
+    sv_tcc_record(&tcc, 604, 900000);
+    CHECK(sv_tcc_build(&tcc, 2003, 1003, out, 23) == 0);
+    CHECK(sv_tcc_build(&tcc, 2003, 1003, out, sizeof out) == 24);
+}
+
 static void test_data_msg(void)
 {
     SvDataMsg m, back;
@@ -327,6 +384,7 @@ int main(void)
     test_cvo();
     test_rtcp();
     test_red();
+    test_tcc();
     test_data_msg();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);

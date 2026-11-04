@@ -142,11 +142,17 @@ typedef struct {
     gint        st_depay;       /* VP8 frames out of the depayloader */
     gint        st_dec;         /* decoded frames */
     gint        st_pli;         /* keyframe requests sent */
+    gint        st_tcc;         /* congestion feedback packets sent */
     gint        st_last_pt;     /* last "other" payload type seen */
     guint16     rx_fec_skipped; /* receive thread only: ULPFEC packets taken out of the VP8 stream */
 } SmVideo;
 
 static SmVideo g_v;
+
+/* Transport-cc: the receive thread records, the sender thread sends the feedback. */
+static GMutex g_tcc_lock;
+static SvTcc  g_tcc;
+static gint64 g_tcc_t0;         /* arrival times count from here (the 24-bit reference time wraps) */
 
 static signal_media_event_cb g_event_cb;
 static void                 *g_event_user;
@@ -420,19 +426,59 @@ static void sm_push_pli(void)
     g_atomic_int_inc(&g_v.st_pli);
 }
 
+/* Transport-cc feedback for what arrived since the last one, as SRTCP from our video SSRC.
+ * Sender thread only. */
+static void sm_push_tcc(void)
+{
+    static guint8 pkt[20 + 2 * ((SV_TCC_WINDOW + 6) / 7) + 2 * SV_TCC_WINDOW + 4 + SRTP_MAX_SRTCP_TRAILER_LEN];
+    if (!g_datasrc || (!g_accepted && !g_sm.is_caller))   /* nothing goes out before the answer */
+        return;
+    if (!sm_data_srtp_init()) return;
+    g_mutex_lock(&g_tcc_lock);
+    size_t n = sv_tcc_build(&g_tcc, sv_video_ssrc(g_sm.is_caller), sv_peer_video_ssrc(g_sm.is_caller),
+                            pkt, sizeof pkt - SRTP_MAX_SRTCP_TRAILER_LEN);
+    g_mutex_unlock(&g_tcc_lock);
+    if (n == 0) return;
+    int len = (int)n;
+    srtp_err_status_t st = srtp_protect_rtcp(g_data_srtp, pkt, &len);
+    if (st != srtp_err_status_ok) { g_message("signal_media: srtp_protect_rtcp(tcc) failed %d", (int)st); return; }
+    sm_push_protected(pkt, len, "congestion feedback");
+    g_atomic_int_inc(&g_v.st_tcc);
+}
+
+/* Packets keep coming but nothing decodes: the depayloader waits for a keyframe that its one
+ * request did not bring. Ask again (sm_pli_take keeps it to two a second). Sender thread only,
+ * called every 100 ms. */
+static void sm_keyframe_watchdog(void)
+{
+    static gint last_vp8, last_depay, stalled;
+    gint vp8 = g_atomic_int_get(&g_v.st_vp8), depay = g_atomic_int_get(&g_v.st_depay);
+    if (vp8 < last_vp8 || depay < last_depay) {         /* a new call */
+        last_vp8 = last_depay = stalled = 0;
+    }
+    if (depay != last_depay) {
+        stalled = 0;
+    } else if (vp8 != last_vp8 && ++stalled >= 10) {
+        g_atomic_int_set(&g_v.pli_wanted, 1);
+    }
+    last_vp8 = vp8;
+    last_depay = depay;
+}
+
 /* One line of receive statistics, when anything changed since the last one. Sender thread only. */
 static void sm_log_rx_stats(void)
 {
-    static gint last[6];
-    gint now[6] = {
+    static gint last[7];
+    gint now[7] = {
         g_atomic_int_get(&g_v.st_vp8), g_atomic_int_get(&g_v.st_push_fail), g_atomic_int_get(&g_v.st_other),
         g_atomic_int_get(&g_v.st_depay), g_atomic_int_get(&g_v.st_dec), g_atomic_int_get(&g_v.st_pli),
+        g_atomic_int_get(&g_v.st_tcc),
     };
     if (memcmp(now, last, sizeof now) == 0)
         return;
     memcpy(last, now, sizeof last);
-    g_message("signal_media: rx video vp8=%d refused=%d other=%d (pt %d) depay=%d decoded=%d pli=%d",
-              now[0], now[1], now[2], g_atomic_int_get(&g_v.st_last_pt), now[3], now[4], now[5]);
+    g_message("signal_media: rx video vp8=%d refused=%d other=%d (pt %d) depay=%d decoded=%d pli=%d tcc=%d",
+              now[0], now[1], now[2], g_atomic_int_get(&g_v.st_last_pt), now[3], now[4], now[5], now[6]);
 }
 
 /* Dedicated sender thread, for the whole call. CRITICAL: nice_agent_send() must NOT be called from
@@ -465,6 +511,8 @@ static gpointer sender_thread_fn(gpointer u)
     while (g_atomic_int_get(&g_sender_run)) {
         if (tick % 20 == 0)
             sm_log_rx_stats();
+        sm_push_tcc();
+        sm_keyframe_watchdog();
         if (tick++ % 5 == 0)
             sm_push_data_message();
         if (sm_pli_take(g_get_monotonic_time()))
@@ -645,6 +693,13 @@ static gboolean sm_rx_route(GstBuffer *buf)
     if (sv_rtp_parse(m.data, m.size, &r) != 0) {
         gst_buffer_unmap(buf, &m);
         return FALSE;
+    }
+    const guint8 *tseq = NULL;
+    size_t tseq_len = 0;
+    if (sv_rtp_find_ext(m.data, m.size, &r, SV_EXT_TCC, &tseq, &tseq_len) == 0 && tseq_len >= 2) {
+        g_mutex_lock(&g_tcc_lock);
+        sv_tcc_record(&g_tcc, (guint16)((guint)tseq[0] << 8 | tseq[1]), g_get_monotonic_time() - g_tcc_t0);
+        g_mutex_unlock(&g_tcc_lock);
     }
     /* WebRTC wraps its video in RED (and sends ULPFEC that way too): take out the VP8 inside. */
     GstBuffer *vp8 = NULL;
@@ -1243,6 +1298,10 @@ static void sm_video_reset(void)
     g_v.have_call_id = keep.have_call_id;
     g_v.peer_rot = -1;
     g_v.peer_video = -1;
+    g_mutex_lock(&g_tcc_lock);
+    sv_tcc_init(&g_tcc);
+    g_tcc_t0 = g_get_monotonic_time();
+    g_mutex_unlock(&g_tcc_lock);
     g_tx_vqueue = NULL;
     g_tx_head = NULL;
     g_tx_cam = NULL;
