@@ -14,8 +14,8 @@
  *                                                       `--other PTs--> fakesink
  *   TX: pulsesrc device=webcall -> opusenc -> rtpopuspay -> srtpenc(our master) -> queue -> nicesink
  *
- * Voice only. The peer BUNDLEs video onto the same ICE/SRTP transport when it has a camera on; those
- * packets (and RTX) are split off by rtpptdemux and dropped.
+ * The peer BUNDLEs video onto the same ICE/SRTP transport when it has a camera on: rtpptdemux
+ * splits its H264 off to the video branch (see the video section), RTX and the rest are dropped.
  *
  * Audio uses the PulseAudio call devices by name: voipcall (playback) and webcall (capture). A stream
  * that names its sink is routed by palm-policy to the output device for the call (earpiece, speaker,
@@ -36,12 +36,16 @@
  *                                                               applied WITHOUT rebuilding the
  *                                                               already-PLAYING pipeline; follow with
  *                                                               RCAND for the new leg's candidates)
+ *        VIDEO <0|1>                                         (the user turned our camera off/on)
  *        STOP
  *   out: UFRAG <our_ufrag>
  *        PWD <our_pwd>
  *        TXKEY <tx_master_b64>                                (our a=crypto inline key for the answer)
  *        SSRC <n>                                             (our audio RTP SSRC, for the answer's
  *                                                               a=x-ssrc-range)
+ *        VSSRC <n>                                            (our video SSRC, only when this device
+ *                                                               can do video; for the video m-line)
+ *        VSHM, VPREVIEW, VTX, PEERVIDEO, VIDEOERR             (video events, see the video section)
  *        CAND <candidate:... sdp line>                        (our local ICE candidate)
  *        AUDIOD <0|1>
  *        GATHERED                                             (local candidates complete)
@@ -66,6 +70,8 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+
+#include "teams_video.h"
 
 /* Opus RTP: 48 kHz. PT is dictated by the peer's offer (Teams uses 102); parsed from START. */
 #define TM_OPUS_CLOCKRATE 48000
@@ -111,8 +117,36 @@ typedef struct {
     struct {
         gint tx_pkts, tx_bytes, tx_ssrc, rx_pkts, mic_peak;
         gint rtcp_pkts, rr_reports, rr_ssrc, rr_frac, rr_cum_lost, rr_hseq;
+        gint v_rx_pkts, v_decoded, v_pli_sent, v_tx_pkts, v_key_asked;
     } stats;
     GSource      *stats_src;
+
+    /* Video (see the video section). Off unless every element it needs is installed and
+     * TEAMS_MEDIA_VIDEO is not "0"; then START also reports VSSRC, our video SSRC, which the
+     * plugin declares in the answer's video m-line. */
+    gboolean      video;
+    guint32       vtx_ssrc;
+    GstElement   *vrx_caps;       /* ptdemux target for the H264 payload type */
+    GstElement   *vtx_queue;      /* input of the persistent send tail; a camera head links here */
+    GstElement   *vtx_head;       /* the camera bin while the camera is on */
+    GstElement   *vtx_cam;        /* the droidcamsrc in it, if any (start-capture, orientation) */
+    gboolean      vtx_wanted;     /* VIDEO 1: the user has the camera on */
+    gint          vtx_capture;    /* atomic: start-capture sent to the droid camera */
+    gint          vtx_announced;  /* atomic: VPREVIEW sent for this camera head */
+    GstElement   *rtcp_out;       /* appsrc: our RTCP, to srtpenc */
+    gint          vrx_announced;  /* atomic: VSHM sent */
+    gint          peer_vssrc;     /* atomic: the far side's video SSRC, 0 none yet */
+    gint          pli_wanted;     /* atomic: our decoder wants a keyframe */
+    gint          key_wanted;     /* atomic: the far side asked us for a keyframe */
+    gint          peer_video;     /* media thread only: last PEERVIDEO said, -1 none */
+    gint64        last_pli, last_report, last_key;  /* media thread only */
+    GMutex        vlock;          /* everything below */
+    TvRxStats     vstats;
+    gint64        v_first, v_last, v_dec;           /* first/last video packet, last decoded frame */
+    guint32       sr_ntp_mid;     /* the far side's last sender report about its video */
+    gint64        sr_at;
+    GSource      *vtimer;
+    void        (*event_cb)(const char *line);
 } TeamsMedia;
 
 #define TM_STATS_SECONDS 5
@@ -261,7 +295,8 @@ static void tm_count_tx(TeamsMedia *tm, GstBuffer *b)
     g_atomic_int_inc(&tm->stats.tx_pkts);
     if (!gst_buffer_map(b, &m, GST_MAP_READ)) return;
     g_atomic_int_add(&tm->stats.tx_bytes, (gint)m.size);
-    if (m.size >= 12 && (m.data[0] >> 6) == 2 && !tm_is_rtcp(m.data, m.size))
+    /* The audio stream's SSRC only: video and RTCP go out on the same socket. */
+    if (m.size >= 12 && (m.data[0] >> 6) == 2 && !tm_is_rtcp(m.data, m.size) && (m.data[1] & 0x7f) == tm->pt)
         g_atomic_int_set(&tm->stats.tx_ssrc, (gint)GST_READ_UINT32_BE(m.data + 8));
     gst_buffer_unmap(b, &m);
 }
@@ -325,6 +360,17 @@ static void tm_read_rtcp(TeamsMedia *tm, GstBuffer *b)
         g_atomic_int_set(&tm->stats.rr_cum_lost, lost);
         g_atomic_int_set(&tm->stats.rr_hseq, (gint)hseq);
     }
+    if (tm->video) {
+        guint32 mid = 0, peer = (guint32)g_atomic_int_get(&tm->peer_vssrc);
+        if (peer && tv_rtcp_find_sr(m.data, m.size, peer, &mid) == 1) {
+            g_mutex_lock(&tm->vlock);
+            tm->sr_ntp_mid = mid;
+            tm->sr_at = g_get_monotonic_time();
+            g_mutex_unlock(&tm->vlock);
+        }
+        if (tv_rtcp_wants_keyframe(m.data, m.size, tm->vtx_ssrc) == 1)
+            g_atomic_int_set(&tm->key_wanted, 1);
+    }
     gst_buffer_unmap(b, &m);
 }
 
@@ -353,6 +399,11 @@ static gboolean tm_stats_tick(gpointer user)
               g_atomic_int_get(&tm->stats.rtcp_pkts), g_atomic_int_get(&tm->stats.rr_reports), (guint)g_atomic_int_get(&tm->stats.rr_ssrc),
               g_atomic_int_get(&tm->stats.rr_cum_lost), g_atomic_int_get(&tm->stats.rr_frac),
               (guint)g_atomic_int_get(&tm->stats.rr_hseq));
+    if (tm->video)
+        g_message("teams_media: video rx=%d pkts decoded=%d pli_sent=%d tx=%d pkts keyframes_asked=%d",
+                  g_atomic_int_get(&tm->stats.v_rx_pkts), g_atomic_int_get(&tm->stats.v_decoded),
+                  g_atomic_int_get(&tm->stats.v_pli_sent), g_atomic_int_get(&tm->stats.v_tx_pkts),
+                  g_atomic_int_get(&tm->stats.v_key_asked));
     return G_SOURCE_CONTINUE;
 }
 
@@ -375,6 +426,546 @@ static GstCaps *opus_rtp_caps(int pt)
                                "payload",       G_TYPE_INT,    pt, NULL);
 }
 
+/* ------------------------------------------------------------------ video ---------------------
+ * The Teams app sends H264 (PT 107, packetization-mode 1) on the audio's ICE component and SRTP
+ * key (BUNDLE). Received video is split off by rtpptdemux, decoded and published as I420 frames
+ * on a gst-shm socket for the Phone app (RemoteVideo.qml, the contract the Signal engine has).
+ * While the user has the camera on (VIDEO 1), the front camera's hardware H264 (droidcamsrc in
+ * video mode, as luneos-rtc-engine does for WhatsApp) is sent on PT 107 from our own SSRC, and
+ * the viewfinder goes to a second shm socket for the self-view.
+ *
+ *   RX: ptdemux --107--> capsfilter -> rtpjitterbuffer -> rtph264depay -> h264parse -> avdec_h264
+ *       -> videoconvert -> videoscale -> I420 640x480 -> leaky queue -> shmsink /tmp/teams-video
+ *   TX: [camera head: droidcamsrc vidsrc -> h264parse] -> queue -> rtph264pay -> srtpenc
+ *   RTCP: appsrc -> srtpenc (rtcp) : RR + REMB every second, PLI when our decoder needs a keyframe
+ *
+ * A WebRTC-style sender sends a keyframe only when asked and sizes its bitrate from what the
+ * receiver reports: so keyframe requests repeat while packets arrive and nothing decodes, and the
+ * receiver reports and REMB go out for the whole call. The offer has no transport-wide sequence
+ * number extension, so REMB is the bandwidth feedback there is.
+ *
+ * Video lines (stdout, through event_cb):
+ *   VSHM <path> <w> <h>           the far side's decoded picture is on this gst-shm socket
+ *   VPREVIEW <path> <w> <h> <q> <m> our camera's picture (q quarter turns, m mirrored 0/1)
+ *   VTX <0|1>                     our camera is sending / stopped
+ *   PEERVIDEO <0|1>               the far side's video is arriving / stopped for 2 s
+ *   VIDEOERR <what>               a video part could not be built; the call goes on without it */
+
+#define TM_VIDEO_W          640
+#define TM_VIDEO_H          480
+#define TM_PREVIEW_W        320
+#define TM_PREVIEW_H        240
+#define TM_VIDEO_BITRATE    800000
+#define TM_REMB_BPS         1500000u
+#define TM_VIDEO_SHM        "/tmp/teams-video"      /* device-side sockets: the Phone app opens them */
+#define TM_PREVIEW_SHM      "/tmp/teams-preview"
+#define TM_SHM_SIZE         (8u << 20)
+#define TM_VTICK_MS         100
+#define TM_PLI_INTERVAL_US  500000                  /* at most two keyframe requests a second */
+#define TM_REPORT_US        1000000                 /* RR + REMB once a second */
+#define TM_PEER_GONE_US     2000000                 /* no video for 2 s: PEERVIDEO 0 */
+
+static void tm_event(TeamsMedia *tm, const char *fmt, ...) G_GNUC_PRINTF(2, 3);
+static void tm_event(TeamsMedia *tm, const char *fmt, ...)
+{
+    if (!tm->event_cb)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    gchar *line = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    tm->event_cb(line);
+    g_free(line);
+}
+
+static const char *tm_env_or(const char *env, const char *dflt)
+{
+    const char *v = g_getenv(env);
+    return v && *v ? v : dflt;
+}
+
+/* Whether this device can do video calls at all: every element the video branches create. */
+static gboolean tm_video_available(void)
+{
+    static const char *const need[] = {
+        "rtpjitterbuffer", "rtph264depay", "rtph264pay", "h264parse", "avdec_h264", "videoconvert",
+        "videoscale", "shmsink", "appsrc", "funnel", NULL,
+    };
+    if (g_strcmp0(g_getenv("TEAMS_MEDIA_VIDEO"), "0") == 0)
+        return FALSE;
+    for (int i = 0; need[i]; i++) {
+        GstElementFactory *f = gst_element_factory_find(need[i]);
+        if (!f) {
+            g_message("teams_media: no %s, calls stay voice only", need[i]);
+            return FALSE;
+        }
+        gst_object_unref(f);
+    }
+    return TRUE;
+}
+
+static void tm_try_set(GstElement *e, const char *prop, const char *value)
+{
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(e), prop))
+        gst_util_set_object_arg(G_OBJECT(e), prop, value);
+}
+
+static void tm_drop_elements(GstElement **els, int n)
+{
+    for (int i = 0; i < n; i++)
+        if (els[i])
+            gst_object_unref(gst_object_ref_sink(els[i]));
+}
+
+/* A shmsink the Phone app reads, which must never hold the pipeline up: frames are dropped in the
+ * leaky queue in front of it, and it keeps no last sample (its deep copy on a drain query blocked
+ * a stop for ever in luneos-rtc-engine). */
+static void tm_configure_shm(GstElement *queue, GstElement *shm, const char *path)
+{
+    if (queue)
+        g_object_set(queue, "leaky", 2 /* downstream */, "max-size-buffers", 2, "max-size-time", (guint64)0,
+                     "max-size-bytes", 0, NULL);
+    g_object_set(shm, "socket-path", path, "shm-size", (guint)TM_SHM_SIZE, "wait-for-connection", FALSE,
+                 "sync", FALSE, "async", FALSE, "enable-last-sample", FALSE, NULL);
+}
+
+static GstCaps *tm_i420_caps(int w, int h)
+{
+    return gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "I420", "width", G_TYPE_INT, w,
+                               "height", G_TYPE_INT, h, "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1, NULL);
+}
+
+/* One received video packet, before the jitter buffer: statistics and the far side's SSRC. */
+static void tm_video_rx_packet(TeamsMedia *tm, GstBuffer *b)
+{
+    GstMapInfo m;
+    TvRtp r;
+    if (!gst_buffer_map(b, &m, GST_MAP_READ))
+        return;
+    if (tv_rtp_parse(m.data, m.size, &r) == 0) {
+        gint64 now = g_get_monotonic_time();
+        g_atomic_int_inc(&tm->stats.v_rx_pkts);
+        g_atomic_int_set(&tm->peer_vssrc, (gint)r.ssrc);
+        g_mutex_lock(&tm->vlock);
+        tv_rx_stats_update(&tm->vstats, r.ssrc, r.seq);
+        if (!tm->v_first)
+            tm->v_first = now;
+        tm->v_last = now;
+        g_mutex_unlock(&tm->vlock);
+    }
+    gst_buffer_unmap(b, &m);
+}
+
+static GstPadProbeReturn tm_probe_vrx(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    (void)pad;
+    if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+        GstBufferList *l = GST_PAD_PROBE_INFO_BUFFER_LIST(info);
+        for (guint i = 0; i < gst_buffer_list_length(l); i++) tm_video_rx_packet(tm, gst_buffer_list_get(l, i));
+    } else {
+        tm_video_rx_packet(tm, GST_PAD_PROBE_INFO_BUFFER(info));
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+/* rtph264depay asks upstream for a keyframe (GstForceKeyUnit) when it lost data: send a PLI. */
+static GstPadProbeReturn tm_probe_vkey(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    GstEvent *ev = GST_PAD_PROBE_INFO_EVENT(info);
+    (void)pad;
+    if (ev && GST_EVENT_TYPE(ev) == GST_EVENT_CUSTOM_UPSTREAM && gst_event_has_name(ev, "GstForceKeyUnit"))
+        g_atomic_int_set(&tm->pli_wanted, 1);
+    return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn tm_probe_vdec(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    (void)pad; (void)info;
+    g_atomic_int_inc(&tm->stats.v_decoded);
+    g_mutex_lock(&tm->vlock);
+    tm->v_dec = g_get_monotonic_time();
+    g_mutex_unlock(&tm->vlock);
+    return GST_PAD_PROBE_OK;
+}
+
+/* The first decoded frame on its way to the Phone app's socket: say where it is. */
+static GstPadProbeReturn tm_probe_vshm(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    (void)info;
+    if (g_atomic_int_compare_and_exchange(&tm->vrx_announced, 0, 1)) {
+        GstElement *shm = gst_pad_get_parent_element(pad);
+        gchar *path = NULL;
+        if (shm) {
+            g_object_get(shm, "socket-path", &path, NULL);
+            gst_object_unref(shm);
+        }
+        tm_event(tm, "VSHM %s %d %d", path ? path : TM_VIDEO_SHM, TM_VIDEO_W, TM_VIDEO_H);
+        g_free(path);
+    }
+    return GST_PAD_PROBE_REMOVE;
+}
+
+/* The receive branch, added to pipeline; tm->vrx_caps is where rtpptdemux links PT 107. Nothing
+ * runs until the far side sends video. FALSE (and nothing added) without one of its elements. */
+static gboolean tm_video_rx_build(TeamsMedia *tm, GstElement *pipeline)
+{
+    GstElement *e[10] = {
+        mk("capsfilter", "rxv-rtpcaps"), mk("rtpjitterbuffer", "rxv-jitterbuf"), mk("rtph264depay", "rxv-depay"),
+        mk("h264parse", "rxv-parse"), mk("avdec_h264", "rxv-dec"), mk("videoconvert", "rxv-conv"),
+        mk("videoscale", "rxv-scale"), mk("capsfilter", "rxv-caps"), mk("queue", "rxv-queue"),
+        mk("shmsink", "rxv-shm"),
+    };
+    for (int i = 0; i < 10; i++) {
+        if (!e[i]) {
+            tm_drop_elements(e, 10);
+            return FALSE;
+        }
+    }
+    GstCaps *rc = gst_caps_new_simple("application/x-rtp", "media", G_TYPE_STRING, "video",
+                                      "clock-rate", G_TYPE_INT, TV_VIDEO_CLOCK,
+                                      "encoding-name", G_TYPE_STRING, "H264",
+                                      "payload", G_TYPE_INT, TV_PT_H264, NULL);
+    g_object_set(e[0], "caps", rc, NULL);
+    gst_caps_unref(rc);
+    g_object_set(e[1], "latency", 200, "do-lost", TRUE, NULL);
+    tm_try_set(e[2], "request-keyframe", "true");
+    tm_try_set(e[2], "wait-for-keyframe", "true");
+    tm_try_set(e[4], "output-corrupt", "false");
+    tm_try_set(e[6], "add-borders", "true");
+    GstCaps *vc = tm_i420_caps(TM_VIDEO_W, TM_VIDEO_H);
+    g_object_set(e[7], "caps", vc, NULL);
+    gst_caps_unref(vc);
+    tm_configure_shm(e[8], e[9], tm_env_or("TEAMS_MEDIA_VIDEO_SHM", TM_VIDEO_SHM));
+
+    for (int i = 0; i < 10; i++)
+        gst_bin_add(GST_BIN(pipeline), e[i]);
+    for (int i = 0; i + 1 < 10; i++) {
+        if (!gst_element_link(e[i], e[i + 1])) {
+            g_printerr("teams_media: video receive link %d failed\n", i);
+            return FALSE;
+        }
+    }
+    tm_add_probe(e[0], "sink", GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, tm_probe_vrx, tm);
+    tm_add_probe(e[2], "sink", GST_PAD_PROBE_TYPE_EVENT_UPSTREAM, tm_probe_vkey, tm);
+    tm_add_probe(e[4], "src", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_vdec, tm);
+    tm_add_probe(e[9], "sink", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_vshm, tm);
+    tm->vrx_caps = e[0];
+    g_message("teams_media: video receive branch up");
+    return TRUE;
+}
+
+static GstPadProbeReturn tm_probe_vtx(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    (void)pad;
+    if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST)
+        g_atomic_int_add(&tm->stats.v_tx_pkts, (gint)gst_buffer_list_length(GST_PAD_PROBE_INFO_BUFFER_LIST(info)));
+    else
+        g_atomic_int_inc(&tm->stats.v_tx_pkts);
+    return GST_PAD_PROBE_OK;
+}
+
+/* The persistent send tail: queue -> rtph264pay -> sink_element (srtpenc's next rtp_sink, or a
+ * test's sink), plus the RTCP appsrc. A camera head (tm_video_tx_start) links to tm->vtx_queue.
+ * Returns the RTP and RTCP outputs to link, or FALSE. */
+static gboolean tm_video_tx_build(TeamsMedia *tm, GstElement *pipeline, GstElement **rtp_out, GstElement **rtcp_out)
+{
+    GstElement *q = mk("queue", "txv-queue"), *cf = mk("capsfilter", "txv-caps"), *pay = mk("rtph264pay", "txv-pay");
+    GstElement *rtcp = mk("appsrc", "tx-rtcp");
+    if (!q || !cf || !pay || !rtcp) {
+        GstElement *all[4] = { q, cf, pay, rtcp };
+        tm_drop_elements(all, 4);
+        return FALSE;
+    }
+    /* Leaky: a stalled network side drops video, never the audio sharing the funnel. */
+    g_object_set(q, "leaky", 2, "max-size-buffers", 30, "max-size-time", (guint64)0, "max-size-bytes", 0, NULL);
+    GstCaps *c = gst_caps_new_simple("video/x-h264", "stream-format", G_TYPE_STRING, "byte-stream",
+                                     "alignment", G_TYPE_STRING, "au", NULL);
+    g_object_set(cf, "caps", c, NULL);
+    gst_caps_unref(c);
+    g_object_set(pay, "pt", TV_PT_H264, "ssrc", tm->vtx_ssrc, "mtu", 1200, "config-interval", -1, NULL);
+    c = gst_caps_new_empty_simple("application/x-rtcp");
+    g_object_set(rtcp, "caps", c, "is-live", TRUE, "format", GST_FORMAT_TIME, "do-timestamp", TRUE,
+                 "block", FALSE, "max-bytes", (guint64)65536, NULL);
+    gst_caps_unref(c);
+    gst_bin_add_many(GST_BIN(pipeline), q, cf, pay, rtcp, NULL);
+    if (!gst_element_link_many(q, cf, pay, NULL))
+        return FALSE;
+    tm_add_probe(pay, "src", GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, tm_probe_vtx, tm);
+    tm->vtx_queue = q;
+    tm->rtcp_out = rtcp;
+    *rtp_out = pay;
+    *rtcp_out = rtcp;
+    return TRUE;
+}
+
+/* Hand bytes to the RTCP appsrc (srtpenc protects and the funnel sends them). */
+static void tm_push_rtcp(TeamsMedia *tm, const guint8 *p, gsize n)
+{
+    if (!tm->rtcp_out || !n)
+        return;
+    GstBuffer *b = gst_buffer_new_allocate(NULL, n, NULL);
+    GstFlowReturn fr = GST_FLOW_OK;
+    gst_buffer_fill(b, 0, p, n);
+    g_signal_emit_by_name(tm->rtcp_out, "push-buffer", b, &fr);   /* takes its own reference */
+    gst_buffer_unref(b);
+    if (fr != GST_FLOW_OK && fr != GST_FLOW_FLUSHING)
+        g_message("teams_media: could not queue RTCP: %s", gst_flow_get_name(fr));
+}
+
+/* Ask the camera's encoder for a keyframe: the far side sent a PLI or FIR. */
+static void tm_video_force_keyframe(TeamsMedia *tm)
+{
+    if (!tm->vtx_queue || !tm->vtx_head)
+        return;
+    GstPad *sink = gst_element_get_static_pad(tm->vtx_queue, "sink");
+    if (sink) {
+        /* GstForceKeyUnit as libgstvideo builds it, without linking libgstvideo for it */
+        GstStructure *st = gst_structure_new("GstForceKeyUnit", "running-time", G_TYPE_UINT64, GST_CLOCK_TIME_NONE,
+                                             "all-headers", G_TYPE_BOOLEAN, TRUE, "count", G_TYPE_UINT, 0u, NULL);
+        gst_pad_push_event(sink, gst_event_new_custom(GST_EVENT_CUSTOM_UPSTREAM, st));
+        gst_object_unref(sink);
+    }
+}
+
+/* Every TM_VTICK_MS on the media thread: keyframe requests, receiver reports and REMB, and
+ * whether the far side's video is arriving. */
+static gboolean tm_video_tick(gpointer user)
+{
+    TeamsMedia *tm = user;
+    gint64 now = g_get_monotonic_time();
+    guint8 pkt[32 + 24 + 12];
+    gsize n = 0;
+    guint32 peer = (guint32)g_atomic_int_get(&tm->peer_vssrc);
+
+    g_mutex_lock(&tm->vlock);
+    gint64 first = tm->v_first, last = tm->v_last, dec = tm->v_dec;
+    if (tv_keyframe_overdue(now, last, first, dec))
+        g_atomic_int_set(&tm->pli_wanted, 1);
+    gboolean pli = peer && g_atomic_int_get(&tm->pli_wanted) && now - tm->last_pli >= TM_PLI_INTERVAL_US;
+    gboolean report = peer && now - tm->last_report >= TM_REPORT_US;
+    if (pli || report) {
+        guint32 lsr = tm->sr_at ? tm->sr_ntp_mid : 0;
+        guint32 dlsr = tm->sr_at ? (guint32)(((now - tm->sr_at) * 65536) / 1000000) : 0;
+        n = tv_rtcp_build_rr(&tm->vstats, tm->vtx_ssrc, lsr, dlsr, pkt);
+    }
+    g_mutex_unlock(&tm->vlock);
+
+    if (report) {
+        n += tv_rtcp_build_remb(tm->vtx_ssrc, peer, TM_REMB_BPS, pkt + n);
+        tm->last_report = now;
+    }
+    if (pli) {
+        n += tv_rtcp_build_pli(tm->vtx_ssrc, peer, pkt + n);
+        g_atomic_int_set(&tm->pli_wanted, 0);
+        g_atomic_int_inc(&tm->stats.v_pli_sent);
+        tm->last_pli = now;
+    }
+    tm_push_rtcp(tm, pkt, n);
+
+    if (g_atomic_int_get(&tm->key_wanted) && now - tm->last_key >= TM_PLI_INTERVAL_US) {
+        g_atomic_int_set(&tm->key_wanted, 0);
+        g_atomic_int_inc(&tm->stats.v_key_asked);
+        tm->last_key = now;
+        tm_video_force_keyframe(tm);
+    }
+
+    gint arriving = dec && now - dec < TM_PEER_GONE_US ? 1 : 0;
+    if (arriving != tm->peer_video && (arriving || tm->peer_video == 1)) {
+        tm->peer_video = arriving;
+        tm_event(tm, "PEERVIDEO %d", arriving);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+/* The camera head: front camera, hardware H264 from droidcamsrc's video pad, its viewfinder to
+ * the self-view socket. TEAMS_MEDIA_CAMERA replaces it (tests, or another camera setup); it must
+ * have an element "tmvout" whose src pad gives H264 byte-stream access units, and may have a
+ * shmsink "tmpvshm" for the self-view. The vfsrc caps are fully fixed: droidcamsrc fixes only
+ * size and frame rate of its viewfinder, and left the pixel aspect ratio a range that the
+ * converters after it cannot take ("failed to negotiate vfsrc", Signal engine 9f38163). */
+static gchar *tm_camera_description(gboolean *mirrored)
+{
+    const char *env = g_getenv("TEAMS_MEDIA_CAMERA");
+    if (env && *env) {
+        *mirrored = FALSE;
+        return g_strdup(env);
+    }
+    *mirrored = TRUE;
+    return g_strdup_printf(
+        "droidcamsrc name=tmcam mode=2 camera-device=1 target-bitrate=%d "
+        "tmcam.imgsrc ! fakesink async=false "
+        "tmcam.vfsrc ! video/x-raw,format=NV21,width=%d,height=%d,framerate=30/1,pixel-aspect-ratio=1/1 ! "
+        "queue leaky=downstream max-size-buffers=2 ! videoconvert ! videoscale ! "
+        "video/x-raw,format=I420,width=%d,height=%d,pixel-aspect-ratio=1/1 ! "
+        "queue leaky=downstream max-size-buffers=2 ! shmsink name=tmpvshm "
+        "tmcam.vidsrc ! video/x-h264,width=%d,height=%d ! h264parse config-interval=-1 ! "
+        "video/x-h264,stream-format=byte-stream,alignment=au ! queue name=tmvout",
+        TM_VIDEO_BITRATE, TM_VIDEO_W, TM_VIDEO_H, TM_PREVIEW_W, TM_PREVIEW_H, TM_VIDEO_W, TM_VIDEO_H);
+}
+
+/* Quarter turns (counter-clockwise, as the Phone app turns the self-view) for the camera's sensor
+ * orientation; TEAMS_MEDIA_VIDEO_ROTATION overrides it. */
+static gint tm_preview_turns(TeamsMedia *tm)
+{
+    const char *env = g_getenv("TEAMS_MEDIA_VIDEO_ROTATION");
+    gint cw = 0;
+    if (env && *env)
+        cw = (gint)(g_ascii_strtoll(env, NULL, 10) & 3);
+    else if (tm->vtx_cam && g_object_class_find_property(G_OBJECT_GET_CLASS(tm->vtx_cam), "sensor-orientation")) {
+        gint deg = 0;
+        g_object_get(tm->vtx_cam, "sensor-orientation", &deg, NULL);
+        cw = ((deg + 45) / 90) & 3;
+    }
+    return (4 - cw) & 3;
+}
+
+static gboolean tm_video_tx_mirrored;
+
+/* Media thread: begin the hardware-encoded stream, once per camera head. droidcamsrc ignores a
+ * start-capture before the camera runs, so it waits for the first viewfinder frame. */
+static gboolean tm_start_capture(gpointer user)
+{
+    TeamsMedia *tm = user;
+    if (tm->vtx_cam && g_atomic_int_compare_and_exchange(&tm->vtx_capture, 0, 1)) {
+        g_signal_emit_by_name(tm->vtx_cam, "start-capture");
+        g_message("teams_media: camera capture started");
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static GstPadProbeReturn tm_probe_vpreview(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    (void)info;
+    if (g_atomic_int_compare_and_exchange(&tm->vtx_announced, 0, 1)) {
+        GstElement *shm = gst_pad_get_parent_element(pad);
+        gchar *path = NULL;
+        if (shm) {
+            g_object_get(shm, "socket-path", &path, NULL);
+            gst_object_unref(shm);
+        }
+        tm_event(tm, "VPREVIEW %s %d %d %d %d", path ? path : TM_PREVIEW_SHM, TM_PREVIEW_W, TM_PREVIEW_H,
+                 tm_preview_turns(tm), tm_video_tx_mirrored ? 1 : 0);
+        g_free(path);
+        if (tm->vtx_cam && g_signal_lookup("start-capture", G_OBJECT_TYPE(tm->vtx_cam))) {
+            GSource *s = g_idle_source_new();
+            g_source_set_callback(s, tm_start_capture, tm, NULL);
+            g_source_attach(s, tm->ctx);
+            g_source_unref(s);
+        }
+    }
+    return GST_PAD_PROBE_REMOVE;
+}
+
+/* Media thread: put a camera head in front of the send tail. */
+static gboolean tm_video_tx_start(gpointer user)
+{
+    TeamsMedia *tm = user;
+    if (tm->vtx_head || !tm->vtx_wanted || !tm->vtx_queue || !tm->pipeline)
+        return G_SOURCE_REMOVE;
+    gboolean mirrored = FALSE;
+    gchar *desc = tm_camera_description(&mirrored);
+    GError *err = NULL;
+    GstElement *head = gst_parse_bin_from_description(desc, FALSE, &err);
+    if (!head) {
+        g_printerr("teams_media: camera '%s': %s\n", desc, err ? err->message : "?");
+        g_clear_error(&err);
+        g_free(desc);
+        tm_event(tm, "VIDEOERR tx-camera");
+        return G_SOURCE_REMOVE;
+    }
+    g_clear_error(&err);
+    GstElement *out = gst_bin_get_by_name(GST_BIN(head), "tmvout");
+    GstPad *src = out ? gst_element_get_static_pad(out, "src") : NULL;
+    GstPad *ghost = src ? gst_ghost_pad_new("src", src) : NULL;
+    if (src) gst_object_unref(src);
+    if (out) gst_object_unref(out);
+    if (!ghost || !gst_element_add_pad(head, ghost)) {
+        gst_object_unref(gst_object_ref_sink(head));
+        g_free(desc);
+        tm_event(tm, "VIDEOERR tx-camera");
+        return G_SOURCE_REMOVE;
+    }
+    GstElement *pv = gst_bin_get_by_name(GST_BIN(head), "tmpvshm");
+    if (pv) {
+        tm_configure_shm(NULL, pv, tm_env_or("TEAMS_MEDIA_PREVIEW_SHM", TM_PREVIEW_SHM));
+        tm_add_probe(pv, "sink", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_vpreview, tm);
+        gst_object_unref(pv);
+    }
+    tm->vtx_cam = gst_bin_get_by_name(GST_BIN(head), "tmcam");
+    tm_video_tx_mirrored = mirrored;
+    g_atomic_int_set(&tm->vtx_announced, 0);
+    g_atomic_int_set(&tm->vtx_capture, 0);
+
+    gst_bin_add(GST_BIN(tm->pipeline), head);
+    GstPad *qsink = gst_element_get_static_pad(tm->vtx_queue, "sink");
+    GstPadLinkReturn lr = gst_pad_link(ghost, qsink);
+    gst_object_unref(qsink);
+    if (lr != GST_PAD_LINK_OK || !gst_element_sync_state_with_parent(head)) {
+        gst_element_set_state(head, GST_STATE_NULL);
+        gst_bin_remove(GST_BIN(tm->pipeline), head);
+        if (tm->vtx_cam) { gst_object_unref(tm->vtx_cam); tm->vtx_cam = NULL; }
+        g_free(desc);
+        tm_event(tm, "VIDEOERR tx-camera");
+        return G_SOURCE_REMOVE;
+    }
+    tm->vtx_head = head;
+    tm_event(tm, "VTX 1");
+    g_message("teams_media: camera on (%s)", desc);
+    g_free(desc);
+    return G_SOURCE_REMOVE;
+}
+
+/* Media thread: take the camera head away again. */
+static gboolean tm_video_tx_stop(gpointer user)
+{
+    TeamsMedia *tm = user;
+    if (!tm->vtx_head)
+        return G_SOURCE_REMOVE;
+    GstElement *head = tm->vtx_head;
+    tm->vtx_head = NULL;
+    gst_element_set_state(head, GST_STATE_NULL);
+    GstPad *ghost = gst_element_get_static_pad(head, "src");
+    GstPad *peer = ghost ? gst_pad_get_peer(ghost) : NULL;
+    if (peer) {
+        gst_pad_unlink(ghost, peer);
+        gst_object_unref(peer);
+    }
+    if (ghost) gst_object_unref(ghost);
+    gst_bin_remove(GST_BIN(tm->pipeline), head);
+    if (tm->vtx_cam) { gst_object_unref(tm->vtx_cam); tm->vtx_cam = NULL; }
+    tm_event(tm, "VTX 0");
+    g_message("teams_media: camera off");
+    return G_SOURCE_REMOVE;
+}
+
+/* Run fn on the media thread, through one idle source attached to its context. */
+static void tm_on_media_thread(TeamsMedia *tm, GSourceFunc fn)
+{
+    if (!tm->ctx)
+        return;
+    GSource *s = g_idle_source_new();
+    g_source_set_callback(s, fn, tm, NULL);
+    g_source_attach(s, tm->ctx);
+    g_source_unref(s);
+}
+
+/* VIDEO 0|1 from the plugin: the user turned the camera off or on. */
+static void tm_set_video(TeamsMedia *tm, gboolean on)
+{
+    if (!tm->video) {
+        tm_event(tm, "VIDEOERR unavailable");
+        return;
+    }
+    tm->vtx_wanted = on;
+    tm_on_media_thread(tm, on ? tm_video_tx_start : tm_video_tx_stop);
+}
+
 /* ------------------------------------------------------------------ bus ------------------------ */
 
 static gboolean on_bus(GstBus *bus, GstMessage *msg, gpointer user)
@@ -389,6 +980,13 @@ static gboolean on_bus(GstBus *bus, GstMessage *msg, gpointer user)
                        GST_OBJECT_NAME(msg->src), err ? err->message : "?", dbg ? dbg : "");
             if (err) g_error_free(err);
             g_free(dbg);
+            /* A camera that fails takes our video away, not the call. */
+            if (tm->vtx_head && GST_MESSAGE_SRC(msg) &&
+                (GST_MESSAGE_SRC(msg) == GST_OBJECT(tm->vtx_head) ||
+                 gst_object_has_as_ancestor(GST_MESSAGE_SRC(msg), GST_OBJECT(tm->vtx_head)))) {
+                tm_event(tm, "VIDEOERR tx-camera");
+                tm_video_tx_stop(tm);
+            }
             break;
         }
         case GST_MESSAGE_WARNING: {
@@ -516,9 +1114,12 @@ static void on_rtpptdemux_new_pt(GstElement *demux, GstPad *pad, gpointer user)
     }
 
     gboolean audio = (int)pt == tm->pt;
+    gboolean video = pt == TV_PT_H264 && tm->vrx_caps;
     GstPad *sink = NULL;
     if (audio) {
         sink = gst_element_get_static_pad(tm->rx_audio_caps, "sink");
+    } else if (video) {
+        sink = gst_element_get_static_pad(tm->vrx_caps, "sink");
     } else {
         GstElement *fs = mk("fakesink", NULL);
         if (fs) {
@@ -531,9 +1132,45 @@ static void on_rtpptdemux_new_pt(GstElement *demux, GstPad *pad, gpointer user)
     if (sink) {
         GstPadLinkReturn r = gst_pad_link(pad, sink);
         gst_object_unref(sink);
-        g_message("teams_media: ptdemux PT %u -> %s (%s)", pt, audio ? "audio" : "dropped",
+        g_message("teams_media: ptdemux PT %u -> %s (%s)", pt, audio ? "audio" : video ? "video" : "dropped",
                   r == GST_PAD_LINK_OK ? "linked" : "LINK FAILED");
     }
+}
+
+/* Link up's src pad through a new srtpenc stream ("rtp" or "rtcp") into a new funnel sink pad.
+ * srtpenc numbers the <kind>_src_N it makes by the requested sink pad's name, so the sink pad is
+ * requested by name: requested without one it is called "padN", every stream then maps to
+ * <kind>_src_0 and only the first one links. */
+static gboolean tm_link_srtp_stream(GstElement *up, GstElement *senc, const char *kind, GstElement *funnel)
+{
+    gchar *tmpl_name = g_strdup_printf("%s_sink_%%u", kind);
+    GstPadTemplate *tmpl = gst_element_get_pad_template(senc, tmpl_name);
+    g_free(tmpl_name);
+    GstPad *sink = NULL;
+    guint n = 0;
+    for (; tmpl && !sink && n < 16; n++) {
+        gchar *name = g_strdup_printf("%s_sink_%u", kind, n);
+        GstPad *have = gst_element_get_static_pad(senc, name);
+        if (have) gst_object_unref(have);
+        else sink = gst_element_request_pad(senc, tmpl, name, NULL);
+        g_free(name);
+    }
+    if (!sink)
+        return FALSE;
+    gchar *src_name = g_strdup_printf("%s_src_%u", kind, n - 1);
+    GstPad *upsrc = gst_element_get_static_pad(up, "src");
+    gboolean ok = upsrc && gst_pad_link(upsrc, sink) == GST_PAD_LINK_OK;
+    if (upsrc) gst_object_unref(upsrc);
+    gst_object_unref(sink);
+    GstPad *esrc = ok ? gst_element_get_static_pad(senc, src_name) : NULL;
+    g_free(src_name);
+    GstPad *fsink = esrc ? gst_element_request_pad_simple(funnel, "sink_%u") : NULL;
+    ok = esrc && fsink && gst_pad_link(esrc, fsink) == GST_PAD_LINK_OK;
+    if (esrc) gst_object_unref(esrc);
+    if (fsink) gst_object_unref(fsink);
+    if (!ok)
+        g_printerr("teams_media: could not link a %s stream through srtpenc\n", kind);
+    return ok;
 }
 
 static gboolean build_pipeline(TeamsMedia *tm)
@@ -634,8 +1271,35 @@ static gboolean build_pipeline(TeamsMedia *tm)
       if (rtcp) gst_object_unref(rtcp);
       if (fsink) gst_object_unref(fsink);
       if (!ok) { g_printerr("teams_media: sdec.rtcp_src -> fakesink link failed\n"); return FALSE; } }
-    if (!gst_element_link_many(asrc, tconv, tres, tcap, oenc, pay, senc, txq, nsink, NULL)) {
+    /* Everything we send goes through srtpenc, one stream each, and a funnel into the queue in
+     * front of nicesink: audio, and with video our H264 and our RTCP. */
+    GstElement *funnel = mk("funnel", "tx-funnel");
+    if (!funnel) return FALSE;
+    gst_bin_add(GST_BIN(tm->pipeline), funnel);
+    if (!gst_element_link_many(asrc, tconv, tres, tcap, oenc, pay, NULL) ||
+        !tm_link_srtp_stream(pay, senc, "rtp", funnel) ||
+        !gst_element_link_many(funnel, txq, nsink, NULL)) {
         g_printerr("teams_media: TX audio link failed\n"); return FALSE; }
+    if (tm->video) {
+        GstElement *vpay = NULL, *rtcp = NULL;
+        gboolean ok = tm_video_rx_build(tm, tm->pipeline) &&
+                      tm_video_tx_build(tm, tm->pipeline, &vpay, &rtcp) &&
+                      tm_link_srtp_stream(vpay, senc, "rtp", funnel) &&
+                      tm_link_srtp_stream(rtcp, senc, "rtcp", funnel);
+        if (!ok) {
+            /* Half-built video elements stay in the bin, unlinked from the audio, and do nothing. */
+            g_printerr("teams_media: video could not be built, the call stays voice only\n");
+            tm->vrx_caps = NULL;
+            tm->vtx_queue = NULL;
+            tm->rtcp_out = NULL;
+            tm_event(tm, "VIDEOERR build");
+        } else {
+            tm->peer_video = -1;
+            tm->vtimer = g_timeout_source_new(TM_VTICK_MS);
+            g_source_set_callback(tm->vtimer, tm_video_tick, tm, NULL);
+            g_source_attach(tm->vtimer, tm->ctx);
+        }
+    }
 
     tm_add_probe(nsink, "sink", GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, tm_probe_tx, tm);
     tm_add_probe(nsrc, "src", GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, tm_probe_rx, tm);
@@ -681,6 +1345,8 @@ static int tm_run_pipeline(void)
         g_printerr("teams_media: set PLAYING failed\n"); return -1;
     }
     if (!g_tm.thread) { g_tm.running = TRUE; g_tm.thread = g_thread_new("teams-media", media_thread, &g_tm); }
+    /* A camera turned on before the pipeline was there (we called, the answer came later). */
+    if (g_tm.vtx_wanted) tm_on_media_thread(&g_tm, tm_video_tx_start);
     return 0;
 }
 
@@ -693,7 +1359,7 @@ static void ipc_gathered(void);
 
 static int tm_start(int is_caller, const char *rx_master_b64, const char *remote_ufrag,
                     const char *remote_pwd, int pt,
-                    void (*cand_cb)(const char*), void (*audiod_cb)(int),
+                    void (*cand_cb)(const char*), void (*audiod_cb)(int), void (*event_cb)(const char *),
                     gchar **out_ufrag, gchar **out_pwd, gchar **out_txkey_b64)
 {
     tm_init();
@@ -704,6 +1370,11 @@ static int tm_start(int is_caller, const char *rx_master_b64, const char *remote
     g_tm.pt = pt > 0 ? pt : TM_DEFAULT_PT;
     /* Never 0, which is how a stats line says "none yet". */
     do { g_tm.tx_ssrc = g_random_int(); } while (!g_tm.tx_ssrc);
+    g_mutex_init(&g_tm.vlock);
+    g_tm.event_cb = event_cb;
+    g_tm.video = tm_video_available();
+    if (g_tm.video)
+        do { g_tm.vtx_ssrc = g_random_int(); } while (!g_tm.vtx_ssrc || g_tm.vtx_ssrc == g_tm.tx_ssrc);
 
     if (!is_caller) {
         g_tm.rx_master = master_buffer_from_b64(rx_master_b64);
@@ -781,6 +1452,9 @@ static void tm_stop(void)
     if (g_tm.loop) g_main_loop_quit(g_tm.loop);
     if (g_tm.thread) { g_thread_join(g_tm.thread); g_tm.thread = NULL; }
     if (g_tm.stats_src) { g_source_destroy(g_tm.stats_src); g_source_unref(g_tm.stats_src); g_tm.stats_src = NULL; }
+    if (g_tm.vtimer) { g_source_destroy(g_tm.vtimer); g_source_unref(g_tm.vtimer); g_tm.vtimer = NULL; }
+    if (g_tm.vtx_cam) { gst_object_unref(g_tm.vtx_cam); g_tm.vtx_cam = NULL; }
+    g_tm.vtx_head = NULL;   /* owned by the pipeline */
     if (g_tm.pipeline) { gst_object_unref(g_tm.pipeline); g_tm.pipeline = NULL; }
     if (g_tm.agent) { g_object_unref(g_tm.agent); g_tm.agent = NULL; }
     set_rx_master(&g_tm, NULL);
@@ -788,6 +1462,7 @@ static void tm_stop(void)
     if (g_tm.loop) { g_main_loop_unref(g_tm.loop); g_tm.loop = NULL; }
     if (g_tm.ctx) { g_main_context_unref(g_tm.ctx); g_tm.ctx = NULL; }
     g_mutex_clear(&g_tm.key_lock);
+    g_mutex_clear(&g_tm.vlock);
 }
 
 /* ------------------------------------------------------------------ IPC ------------------------ */
@@ -804,6 +1479,7 @@ static void emit(const char *fmt, ...)
 static void ipc_cand(const char *sdp)  { emit("CAND %s\n", sdp); }
 static void ipc_audiod(int active)     { emit("AUDIOD %d\n", active ? 1 : 0); }
 static void ipc_gathered(void)         { emit("GATHERED\n"); }
+static void ipc_event(const char *line) { emit("%s\n", line); }
 
 /* The IPv4 address of a STUN server given by name or address, into out. libnice's stun-server
  * property takes an address only; a name was silently never asked, which left a call with host
@@ -872,7 +1548,7 @@ static int run_ipc(int is_caller)
                 /* CALLER: no rx key/remote yet - we produce the OFFER. START [pt] */
                 char *pts = strtok_r(NULL, " ", &sp);
                 rc = tm_start(1, NULL, NULL, NULL, pts ? atoi(pts) : TM_DEFAULT_PT,
-                              ipc_cand, ipc_audiod, &uf, &pw, &txk);
+                              ipc_cand, ipc_audiod, ipc_event, &uf, &pw, &txk);
             } else {
                 /* ANSWERER: START <rxkey_b64> <rem_ufrag> <rem_pwd> [pt] */
                 char *rxk = strtok_r(NULL, " ", &sp);
@@ -881,7 +1557,7 @@ static int run_ipc(int is_caller)
                 char *pts = strtok_r(NULL, " ", &sp);
                 if (!rxk || !ruf || !rpw) { wipe(line, sizeof line); emit("ERR start-missing-fields\n"); continue; }
                 rc = tm_start(0, rxk, ruf, rpw, pts ? atoi(pts) : TM_DEFAULT_PT,
-                              ipc_cand, ipc_audiod, &uf, &pw, &txk);
+                              ipc_cand, ipc_audiod, ipc_event, &uf, &pw, &txk);
             }
             wipe(line, sizeof line);
             if (rc != 0) {
@@ -894,6 +1570,7 @@ static int run_ipc(int is_caller)
             emit("PWD %s\n",   pw ? pw : "");
             emit("TXKEY %s\n", txk ? txk : "");
             emit("SSRC %u\n", g_tm.tx_ssrc);
+            if (g_tm.video) emit("VSSRC %u\n", g_tm.vtx_ssrc);
             g_free(uf); g_free(pw); if (txk) { wipe(txk, strlen(txk)); g_free(txk); }
             started = 1;
             emit("READY\n");
@@ -972,6 +1649,10 @@ static int run_ipc(int is_caller)
             g_message("teams_media: ICE restart - stream reset, new local+remote creds applied%s",
                       new_key ? " (+ new rx key)" : "");
             emit("RESTARTED\n");
+        } else if (!strcmp(line, "VIDEO 0") || !strcmp(line, "VIDEO 1")) {
+            /* The user turned our camera off or on (only sent once the call is answered). */
+            if (!started) { emit("ERR video-before-start\n"); continue; }
+            tm_set_video(&g_tm, line[6] == '1');
         } else if (!strcmp(line, "STOP")) {
             break;
         } else {

@@ -8,7 +8,9 @@
 # It needs GStreamer 1.x and libnice at build time, and at run time the elements the pipeline uses:
 # nicesrc/nicesink (libnice), srtpenc/srtpdec (gst-plugins-bad, with libsrtp built against OpenSSL
 # for AES-GCM), rtpopuspay/rtpopusdepay, rtpjitterbuffer and rtpptdemux, opusenc/opusdec,
-# pulsesrc/pulsesink, audioconvert and audioresample.
+# pulsesrc/pulsesink, audioconvert and audioresample, funnel. Video calls also use rtph264pay/
+# rtph264depay, h264parse, avdec_h264 (gst-libav), videoconvert/videoscale, shmsink, appsrc and on
+# the device droidcamsrc; without one of them calls stay voice only.
 
 PKG_CONFIG ?= pkg-config
 CC         ?= gcc
@@ -20,8 +22,8 @@ PKGS = gstreamer-1.0 nice glib-2.0
 
 all: teams_media
 
-teams_media: teams_media.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra `$(PKG_CONFIG) --cflags $(PKGS)` -o $@ $< \
+teams_media: teams_media.c teams_video.c teams_video.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra `$(PKG_CONFIG) --cflags $(PKGS)` -o $@ teams_media.c teams_video.c \
 		$(LDFLAGS) `$(PKG_CONFIG) --libs $(PKGS)`
 
 install: teams_media
