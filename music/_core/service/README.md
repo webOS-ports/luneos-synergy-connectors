@@ -98,6 +98,30 @@ and it never expires; so the app never sees a server URL: tracks play from
 add the sign-in and pass Range on for seeking. Errors never carry the URL
 they failed on.
 
+## Jellyfin, Emby and Plex (signed in in Videos)
+
+`videoaccounts.go`, `mediabrowser.go` (Jellyfin and Emby), `plexmusic.go`:
+the music on the user's media servers, with the sign-in Videos keeps. A
+Videos account of type `org.webosports.video.jellyfin`, `.emby` or `.plex`
+brings the `jellyfin`, `emby` or `plex` provider; the templates list
+`org.webosports.app.music.service` in their readPermissions (read only:
+signing in and out stays with Videos). The accounts are looked at when the
+app asks for `/providers`, at most every 30 s, and again after a server
+refused the sign-in. With two accounts of one kind, the first is used.
+
+Search, playlists, and browsing artists, albums and the album lists go
+through the provider routes. The token goes in a header (Jellyfin and
+Emby's `Authorization: MediaBrowser ... Token=`, Plex's `X-Plex-Token`), never
+in a URL: tracks play from `/mediastream?p=<id>&id=` and covers come from
+`/mediaart?p=<id>&...`, which add it and pass Range on for seeking. A Plex
+id is `<server>.<Plex id>`, so that one plex.tv account's servers keep
+apart; Plex's addresses are tried local first, the relay last, as in Videos.
+
+Checked on 2026-11-04 against Jellyfin 12.4.0, Emby 4.10.2.0 and Plex
+Media Server 1.43.5 (test servers with a small music library): artists,
+albums, tracks, the album lists, search, playlists, a seek into a stream
+and covers on each.
+
 ## Internet Radio
 
 `radio.go`: the stations of [Radio Browser](https://www.radio-browser.info),

@@ -177,7 +177,8 @@ func main() {
 	if (&appleProvider{}).Available() {
 		registerProvider(&appleProvider{})
 	}
-	loadSubsonic() // the user's own Subsonic server, once signed in (subsonic.go)
+	loadSubsonic()                // the user's own Subsonic server, once signed in (subsonic.go)
+	go refreshMediaAccounts(true) // Jellyfin, Emby and Plex, signed in in Videos (videoaccounts.go)
 
 	startMediaSession()     // before librespot starts (mediasession.go)
 	restoreLibrespotToken() // before restoreSession, which starts librespot
@@ -214,6 +215,8 @@ func main() {
 	mux.HandleFunc("/subsonicstream", handleSubsonicStream)                  // a song, the sign-in added (gst/Qt only)
 	mux.HandleFunc("/subsonicart", handleSubsonicArt)                        // a cover, the sign-in added
 	mux.HandleFunc("/radioauth/lists", withCORS(handleRadioAuthLists))       // Internet Radio: the user's station lists
+	mux.HandleFunc("/mediastream", handleMediaStream)                        // Jellyfin/Emby/Plex song, the sign-in added (gst/Qt only)
+	mux.HandleFunc("/mediaart", handleMediaArt)                              // Jellyfin/Emby/Plex cover, the sign-in added
 	mux.HandleFunc("/dzauth/login", withCORS(handleDeezerAuthLogin))         // Deezer email+password -> ARL
 	mux.HandleFunc("/auth/login", withCORS(handleAuthLogin))
 	mux.HandleFunc("/auth/callback", handleAuthCallback) // browser redirect target (no CORS)

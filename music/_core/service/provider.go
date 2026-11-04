@@ -135,6 +135,8 @@ func handleProviders(w http.ResponseWriter, r *http.Request) {
 		// tracks (libraryBrowser, browse.go). Left out when it has none.
 		Browse bool `json:"browse,omitempty"`
 	}
+	// The servers of the user's Videos accounts, looked at again now and then.
+	refreshMediaAccounts(false)
 	out := []row{}
 	providersMu.RLock()
 	for _, p := range providers {
