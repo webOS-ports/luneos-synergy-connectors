@@ -96,10 +96,18 @@ function createDirectory() {
 	}
 
 	return {
-		// Look again (the libraries panel asked) and answer what is there.
+		// Look again and answer what is there.
 		async refresh(ctx) {
 			if (!pending) { pending = discover(ctx).finally(() => { pending = null; }); }
 			return pending;
+		},
+		// For the libraries panel: once a search has been made, what it found at once, with a new
+		// search started behind it for the next time (a search waits SEARCH_WAIT_MS for replies).
+		// Only the first one is waited for.
+		async known(ctx) {
+			if (at === 0) { return this.refresh(ctx); }
+			this.refresh(ctx).catch(() => {});
+			return servers;
 		},
 		// The server behind a source; looked for again when it is not known (or known long ago).
 		async get(ctx, udn) {
@@ -109,7 +117,8 @@ function createDirectory() {
 			return s;
 		},
 		peek: (udn) => servers.get(udn),
-		_set(list) { servers = new Map(list.map((s) => [s.udn, s])); at = Date.now(); },
+		// For the tests: these servers, as found by a search just now; none is a fresh start.
+		_set(list) { servers = new Map(list.map((s) => [s.udn, s])); at = list.length ? Date.now() : 0; },
 	};
 }
 
@@ -260,7 +269,7 @@ function createProvider() {
 		},
 
 		async sources(ctx) {
-			const servers = await dir.refresh(ctx);
+			const servers = await dir.known(ctx);
 			await Promise.all(Array.from(servers.values()).map((s) => searchCaps(ctx, s)));
 			return Array.from(servers.values()).map((s) => ({ id: s.udn, name: s.name }))
 				.sort((a, b) => a.name.localeCompare(b.name));

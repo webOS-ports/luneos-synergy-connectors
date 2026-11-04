@@ -395,3 +395,16 @@ test("a Free TV account browses as any list, without the YouTube links", async (
 	assert.deepStrictEqual(items.map((i) => [i.kind, i.title]), [["live", "NPO 1"]]);
 	t.stop();
 });
+
+test("Free-TV's marks come off the names (no glyph for them on the phone); Ⓖ is said under it", async () => {
+	const list = "#EXTM3U\n#EXTINF:-1 group-title=\"Netherlands\",L1 Ⓢ\nhttps://a.example/l1.m3u8\n" +
+		"#EXTINF:-1 group-title=\"Netherlands\",NPO 1 Ⓖ\nhttps://a.example/npo1.m3u8\n" +
+		"#EXTINF:-1,Ⓖ\nhttps://a.example/only-mark.m3u8\n#EXTINF:-1,Café Ⓢ Ⓖ\nhttps://a.example/c.m3u8\n";
+	const { entries } = T.parse(list, "https://a.example/");
+	assert.deepStrictEqual(entries.map((e) => [e.title, e.geo]), [["L1", false], ["NPO 1", true], ["only-mark", true], ["Café", true]]);
+	const t = start({ rts: routes({ list: () => ({ body: list }) }) });
+	const items = (await t.call("listItems", { sourceId: "acc-m3", sectionId: "all", limit: 9 })).items;
+	assert.deepStrictEqual(items.map((i) => i.subtitle), ["Netherlands", "Netherlands · Only in its own country", "Only in its own country", "Only in its own country"]);
+	assert.deepStrictEqual((await t.call("search", { sourceId: "acc-m3", query: "npo" })).items.map((i) => i.title), ["NPO 1"]);
+	t.stop();
+});

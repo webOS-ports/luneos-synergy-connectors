@@ -224,7 +224,7 @@ enyo.kind({
 		this.$.catalogNote.setContent(own ? esc(this.k.ownText)
 			: "Channels that are free to watch in their country, from the " + esc(src ? src.name : "Free-TV") +
 				" lists (" + esc(src ? src.link.replace(/^https?:\/\//, "") : "github.com/Free-TV/IPTV") + "). " +
-				"Some (marked \u24bc) play only in their own country.");
+				"Some play only in their own country.");
 		this.$.catalogNote.show();
 		this.showError("");
 	},

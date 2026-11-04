@@ -246,6 +246,37 @@ test("listSources: one per account, one per media server found, none for unknown
 	t.stop();
 });
 
+test("listSources: only the first waits for the network search; later ones answer what it found", { timeout: 10000 }, async () => {
+	// A search that ends when the test lets it, as the real one ends after its wait.
+	const until = async (fn) => { for (let n = 0; n < 200 && !fn(); n++) { await new Promise((r) => setTimeout(r, 5)); } assert.ok(fn()); };
+	let found = [{ location: DLNA + "/rootDesc.xml", usn: "uuid:" + UDN + "::urn:x", st: "", server: "" }];
+	const searches = [];
+	const ssdp = { searches, search: (st, ms) => new Promise((res) => { searches.push({ st, ms, done: () => res(found) }); }) };
+	const t = start({ routes: allRoutes(), ssdp });
+	let answered = false;
+	const first = t.call("listSources", {}).then((r) => { answered = true; return r; });
+	await until(() => searches.length === 1);
+	await new Promise((r) => setTimeout(r, 20));
+	assert.strictEqual(answered, false, "the first waits for the search");
+	searches[0].done();
+	assert.deepStrictEqual((await first).sources.map((s) => s.sourceId), ["acc-jf", "acc-pt", "acc-up|" + UDN]);
+
+	// The next answers at once, with a search started behind it that finds the server gone.
+	found = [];
+	const again = await t.call("listSources", {});
+	assert.deepStrictEqual(again.sources.map((s) => s.sourceId), ["acc-jf", "acc-pt", "acc-up|" + UDN], "what the last search found");
+	assert.strictEqual(searches.length, 2, "and a new search behind it");
+	searches[1].done();
+	await new Promise((r) => setTimeout(r, 20));
+	// The list after it says so, again at once.
+	const after = await t.call("listSources", {});
+	assert.deepStrictEqual(after.sources.map((s) => s.sourceId), ["acc-jf", "acc-pt"]);
+	assert.strictEqual(searches.length, 3);
+	searches[2].done();
+	await new Promise((r) => setTimeout(r, 20));
+	t.stop();
+});
+
 test("only Videos may browse; anyone may sign in or list PeerTube instances", async () => {
 	const t = start({ routes: allRoutes() });
 	for (const m of ["listSources", "listSections", "listItems", "getItem", "search", "resolve", "reportProgress", "getInfo"]) {

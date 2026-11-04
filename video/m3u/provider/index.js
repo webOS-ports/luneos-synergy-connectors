@@ -21,6 +21,8 @@
  * them for the sign-in app; login with catalog "freetv:<id>" adds one.
  *
  * YouTube page links (Free-TV marks them Ⓨ) are left out: Videos plays streams, not web pages.
+ * Free-TV's other marks after a name - Ⓢ (not HD), Ⓖ (only in its own country) - are taken off
+ * the name, as the phone's fonts have no glyph for them; Ⓖ is said under it instead.
  *
  * Credentials (credentials.common): { url, name, catalog }. The playlist's address often holds the IPTV
  * service's user name and password (get.php?username=...&password=..., or in the path), so it is
@@ -191,6 +193,10 @@ function parseExtinf(line) {
 	return { duration: m ? Number(m[1]) : -1, attrs, title };
 }
 
+// Circled letters after a name (Free-TV's Ⓢ, Ⓖ, Ⓨ).
+const MARKS = /\s*[\u24B6-\u24E9]/g;
+const GEO = "\u24BC";
+
 function idOf(url, title) {
 	return crypto.createHash("sha256").update(url + "\n" + title).digest("hex").slice(0, 20);
 }
@@ -225,13 +231,15 @@ function parse(text, baseUrl) {
 		if ((u.protocol !== "http:" && u.protocol !== "https:") || isPage(u)) { skipped++; continue; }
 		if (entries.length >= LIMITS.entries) { cut = true; break; }
 		const url = u.href;
-		const title = C.text(meta.title, 500) || C.text(meta.attrs["tvg-name"], 500) || fileTitle(u);
+		const named = C.text(meta.title, 500) || C.text(meta.attrs["tvg-name"], 500) || "";
+		const geo = named.includes(GEO);
+		const title = named.replace(MARKS, "").trim() || fileTitle(u);
 		const id = idOf(url, title);
 		// The same link twice under one name is one entry; under another name, both are kept.
 		if (seen.has(id)) { continue; }
 		seen.add(id);
 		const logo = meta.attrs["tvg-logo"];
-		entries.push({ id, title, url, group: groups[0] || null, groups, logo: C.isLink(logo) ? logo : undefined,
+		entries.push({ id, title, url, group: groups[0] || null, groups, geo, logo: C.isLink(logo) ? logo : undefined,
 			durationMs: meta.duration > 0 ? Math.round(meta.duration * 1000) : 0 });
 	}
 	return { entries, skipped, cut };
@@ -258,7 +266,7 @@ function groupsOf(entries) {
 function toItem(e) {
 	return {
 		id: e.id, kind: e.durationMs > 0 ? "video" : "live", title: e.title,
-		subtitle: e.group || undefined,
+		subtitle: [e.group, e.geo ? "Only in its own country" : null].filter(Boolean).join(" · ") || undefined,
 		artwork: e.logo ? { thumb: e.logo, poster: e.logo } : {},
 		durationMs: e.durationMs > 0 ? e.durationMs : undefined,
 		playable: true, hasChildren: false,
