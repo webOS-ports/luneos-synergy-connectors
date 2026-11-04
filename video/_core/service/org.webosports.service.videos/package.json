@@ -1,7 +1,7 @@
 {
 	"name": "org.webosports.service.videos",
 	"version": "1.0.0",
-	"description": "The video services of LuneOS Synergy (Jellyfin, Emby, UPnP/DLNA, PeerTube, Plex, M3U playlists) for Videos (capability Video)",
+	"description": "The video services of LuneOS Synergy (Jellyfin, Emby, UPnP/DLNA, PeerTube, Plex, M3U playlists, the public broadcasters' Mediatheks) for Videos (capability Video)",
 	"main": "service.js",
 	"private": true,
 	"engines": { "node": ">=22" },

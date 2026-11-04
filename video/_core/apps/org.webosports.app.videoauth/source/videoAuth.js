@@ -14,6 +14,8 @@
  *   m3u       Free TV: one of Free-TV/IPTV's lists (m3uCatalogs), the phone's country picked to
  *             begin with; or "My own playlist": its web address (an IPTV service's list holds its
  *             password: shown as typed, never logged) and, if wanted, a name for it
+ *   mediathek nothing: one tap adds the public broadcasters' libraries (ARD, ZDF, Arte, 3sat, ...)
+ *             through MediathekViewWeb
  *
  * Every kind calls org.webosports.service.videos/login with the templateId and what was typed; the
  * service checks it against the server and answers the account (username, alias, credentials),
@@ -60,6 +62,13 @@ enyo.kind({
 			text: "Watch TV channels in Videos: the free channels of a country from Free TV, or your own M3U " +
 				"playlist - the list an IPTV service gives you, or any playlist of streams on the web.",
 			ownText: "Enter the playlist's address as the service gives it.",
+			button: "Add"
+		},
+		mediathek: {
+			fields: [],
+			text: "Watch the libraries of the German, Austrian and Swiss public broadcasters in Videos: ARD and its " +
+				"regional channels, ZDF, Arte, 3sat, KiKA, ORF, SRF and more, through MediathekViewWeb. There is nothing " +
+				"to sign in to. Some programmes play only in their own country.",
 			button: "Add"
 		},
 		plex: {

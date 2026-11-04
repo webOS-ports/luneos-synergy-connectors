@@ -161,3 +161,23 @@ test("Emby asks for the server, user name and password, and signs in with its ow
 	assert.deepStrictEqual(JSON.parse(JSON.stringify(card.$.svc.calls.map((c) => [c.opts.method, c.params]))), [["login",
 		{ templateId: "org.webosports.video.emby", server: "emby.example.org", username: "alice", password: "pw" }]]);
 });
+
+test("Mediathek asks for nothing: one tap signs in with its templateId alone", () => {
+	const card = load({ template: { templateId: "org.webosports.video.mediathek", loc_name: "Mediathek" } });
+	assert.strictEqual(card.$.title.content, "Mediathek");
+	assert.match(card.$.bodyText.content, /public broadcasters/);
+	assert.deepStrictEqual([card.$.serverGroup.showing, card.$.usernameGroup.showing, card.$.passwordGroup.showing, card.$.urlGroup.showing,
+		card.$.catalogGroup.showing, card.$.instanceGroup.showing, card.$.addressLink.showing], [false, false, false, false, false, false, false]);
+	assert.strictEqual(card.$.headerIcon.src, "images/connectors/mediathek.png");
+	assert.ok(fs.existsSync(path.join(APP, card.$.headerIcon.src)));
+	for (const n of ["mediathek-32x32.png", "mediathek-48x48.png"]) {
+		assert.ok(fs.existsSync(path.join(__dirname, "../../video/mediathek/account/org.webosports.video.mediathek/images", n)), n);
+	}
+	card.primaryTap();
+	assert.deepStrictEqual(plain(card.$.svc.calls.map((c) => [c.opts.method, c.params])), [["login", { templateId: "org.webosports.video.mediathek" }]]);
+	const sent = [];
+	card.$.crossAppResult.sendResult = (r) => sent.push(r);
+	card.loginSuccess(null, { username: "mediathekviewweb.de", alias: "Mediathek", credentials: { common: { service: "mediathekviewweb" } } });
+	assert.deepStrictEqual(plain(sent.map((r) => [r.returnValue, r.templateId, r.username, r.alias, r.credentials])),
+		[[true, "org.webosports.video.mediathek", "mediathekviewweb.de", "Mediathek", { common: { service: "mediathekviewweb" } }]]);
+});

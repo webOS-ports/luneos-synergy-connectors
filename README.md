@@ -8,7 +8,7 @@ and plugs a network or service into the stock apps.
 | `cloud/` | box, dropbox, flickr, google (Drive), hidrive, kdrive, koofr, mega, onedrive, pcloud, immich, photoprism, pigallery2, s3, smugmug, webdav (Nextcloud, ownCloud, any WebDAV server), yandex | Documents (DOCUMENTS) and Photos (PHOTO.UPLOAD) |
 | `im/` | discord, facebook (E2EE), googlechat, signal, teams, telegram, whatsapp | Messaging, through `imlibpurpleservice` and libpurple |
 | `music/` | apple, archive, deezer, jamendo, qobuz, soundcloud, spotify, tidal, youtube | Music, through the streaming daemon |
-| `video/` | emby, jellyfin, m3u (IPTV and other playlists of web streams), peertube, plex, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Kodi, or Plex and Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
+| `video/` | emby, jellyfin, m3u (IPTV and other playlists of web streams), mediathek (ARD, ZDF, Arte, 3sat and the other public broadcasters of Germany, Austria and Switzerland), peertube, plex, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Kodi, or Plex and Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
 
 ## Layout
 
@@ -100,6 +100,17 @@ The sign-in offers Free TV ready made: the per-country and per-topic playlists o
 everybody in their country, or all of them in one list. It picks the phone's region to begin
 with; "My own playlist" takes an address instead. The lists are named in the provider, so login
 only ever fetches one of those addresses for a `catalog`.
+
+A Mediathek account needs no sign-in: it reads the public broadcasters' libraries through
+[MediathekViewWeb](https://mediathekviewweb.de) (`POST /api/query`, `/api/entries`), the search
+over the [MediathekView](https://github.com/mediathekview) project's film list, which holds ARD
+and its regional channels, ZDF, Arte, 3sat, KiKA, Phoenix, ORF, SRF and more as plain MP4 files
+and HLS streams (no DRM). The sections are "New", "Live TV" and one per channel; search goes over
+titles and topics. `resolve` picks the tallest of the three links (low, normal, HD) no taller
+than `prefer.maxHeight`, by the size the link names where it names one; ARD's subtitles come as
+WebVTT. The film list does not say where an item plays, so the CDNs' marks in the links (`/de/`,
+`/dach/`, `geo`, ORF's `cms-austria`, ...) are read and such items say "Only in its own country".
+Requests name the client (`User-Agent: LuneOS-Videos/1.0`), and answers are kept a minute.
 
 UPnP searches with SSDP from UDP port 41900 and keeps only servers on private,
 link-local or loopback addresses. The replies come from each server's own
