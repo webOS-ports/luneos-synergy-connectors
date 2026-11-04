@@ -44,12 +44,14 @@ MediaSession::MediaSession(GMainContext *ctx, bool isOutgoing)
 
 	_dtls->onOutgoingData = [this](const uint8_t *data, size_t len) { _ice->send(data, len); };
 	_dtls->onHandshakeComplete = [this]() {
+		g_message("tgcalls-lite: DTLS handshake done (%s)", _isOutgoing ? "client" : "server");
 		_dtlsDone = true;
 		// If the peer's fingerprint has not arrived yet (media connected before signalling),
 		// setRemoteDtlsFingerprint() finishes this once it does.
 		if (!_remoteFingerprint.empty()) finishHandshake();
 	};
-	_dtls->onHandshakeFailed = [this](const std::string &) {
+	_dtls->onHandshakeFailed = [this](const std::string &reason) {
+		g_warning("tgcalls-lite: DTLS handshake failed: %s", reason.c_str());
 		if (_state != MediaSessionState::Ready) setState(MediaSessionState::Failed);
 	};
 }
@@ -57,6 +59,7 @@ MediaSession::MediaSession(GMainContext *ctx, bool isOutgoing)
 void MediaSession::finishHandshake() {
 	if (_srtp || _state == MediaSessionState::Failed) return;
 	if (!_dtls->verifyPeerFingerprint(_remoteFingerprint)) {
+		g_warning("tgcalls-lite: the peer's DTLS certificate does not match its fingerprint");
 		setState(MediaSessionState::Failed);
 		return;
 	}
@@ -68,6 +71,7 @@ void MediaSession::finishHandshake() {
 	auto recvKey = isClient ? concat_key_salt(mat.serverKey, mat.serverSalt)
 	                        : concat_key_salt(mat.clientKey, mat.clientSalt);
 	_srtp = std::make_unique<SrtpSession>(sendKey.data(), recvKey.data());
+	if (!_srtp->ok()) g_warning("tgcalls-lite: SRTP setup failed");
 	setState(_srtp->ok() ? MediaSessionState::Ready : MediaSessionState::Failed);
 }
 
@@ -108,8 +112,12 @@ size_t MediaSession::setServers(const std::vector<RtcServer> &servers) {
 
 bool MediaSession::sendRtp(uint8_t *buf, int *len) {
 	if (_state != MediaSessionState::Ready || !_srtp) return false;
-	if (!_srtp->protectRtp(buf, len)) return false;
-	return _ice->send(buf, (size_t)*len) >= 0;
+	if (!_srtp->protectRtp(buf, len) || _ice->send(buf, (size_t)*len) < 0) {
+		_stats.sendErrors++;
+		return false;
+	}
+	_stats.rtpOut++;
+	return true;
 }
 
 bool MediaSession::sendRtcp(uint8_t *buf, int *len) {
@@ -124,10 +132,14 @@ void MediaSession::tick() {
 
 void MediaSession::handleIceData(const uint8_t *data, size_t len) {
 	if (looks_like_dtls(data, len)) {
+		_stats.dtlsIn++;
 		_dtls->feedIncomingData(data, len);
 		return;
 	}
-	if (!_srtp) return; // media arrived before SRTP was ready -- drop, matches WebRTC's own behavior
+	if (!_srtp) { // media arrived before SRTP was ready -- drop, matches WebRTC's own behavior
+		_stats.beforeSrtp++;
+		return;
+	}
 	if (len < 2) return;
 	uint8_t firstByte = data[0];
 	bool isRtcp = firstByte >= 128 && firstByte <= 191 && data[1] >= 192 && data[1] <= 223;
@@ -138,11 +150,17 @@ void MediaSession::handleIceData(const uint8_t *data, size_t len) {
 	                                  // consistent buffer sizing with the protect path elsewhere.
 	if (isRtcp) {
 		if (_srtp->unprotectRtcp(copy.data(), &copyLen)) {
+			_stats.rtcpIn++;
 			if (onRtcpReceived) onRtcpReceived(copy.data(), copyLen);
+		} else {
+			_stats.srtpErrors++;
 		}
 	} else {
 		if (_srtp->unprotectRtp(copy.data(), &copyLen)) {
+			_stats.rtpIn++;
 			if (onRtpReceived) onRtpReceived(copy.data(), copyLen);
+		} else {
+			_stats.srtpErrors++;
 		}
 	}
 }

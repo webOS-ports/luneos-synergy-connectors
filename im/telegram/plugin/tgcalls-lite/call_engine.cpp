@@ -181,6 +181,7 @@ void CallEngine::sendAudioFrame(const uint8_t *opusPacket, int len) {
 
 CallEngine::~CallEngine() {
 	_audio.stop(); // joins the capture thread, the only internal caller of postEncodedAudio()
+	logStats();    // the call's final counters
 	std::lock_guard<std::mutex> lock(_audioQueue->mx);
 	_audioQueue->engine = nullptr; // a drain still queued on the context then does nothing
 	_audioQueue->frames.clear();
@@ -225,6 +226,8 @@ void CallEngine::handleParsedMessage(const SignalingMessage &msg) {
 	switch (msg.type) {
 		case SignalingMessageType::InitialSetup: {
 			const auto &setup = msg.initialSetup;
+			g_message("tgcalls-lite: peer InitialSetup, DTLS setup \"%s\"",
+			          setup.fingerprints.empty() ? "" : setup.fingerprints[0].setup.c_str());
 			_media.setRemoteIceCredentials(setup.ufrag, setup.pwd);
 			if (!setup.fingerprints.empty()) {
 				// tgcalls sends one sha-256 fingerprint. Our DTLS role is fixed (caller = client),
@@ -237,11 +240,16 @@ void CallEngine::handleParsedMessage(const SignalingMessage &msg) {
 			break;
 		}
 		case SignalingMessageType::Candidates: {
+			// Counts only: candidate strings carry the peer's addresses. Telegram reflector
+			// candidates ("... typ relay" on a reflector host) cannot be parsed or used here.
+			size_t added = 0, skipped = 0;
 			for (const auto &c : msg.candidates.iceCandidates) {
-				if (!_media.addRemoteCandidateSdp(c.sdpString)) {
-					fprintf(stderr, "tgcalls-lite: failed to parse peer candidate: %s\n", c.sdpString.c_str());
-				}
+				if (_media.addRemoteCandidateSdp(c.sdpString))
+					added++;
+				else
+					skipped++;
 			}
+			g_message("tgcalls-lite: peer candidates: %zu added, %zu unusable", added, skipped);
 			break;
 		}
 		case SignalingMessageType::NegotiateChannels: {
@@ -357,6 +365,22 @@ void CallEngine::sendVideoAccessUnit(const uint8_t *accessUnit, size_t len) {
 
 void CallEngine::tick() {
 	_media.tick();
+	// Every 10th tick (5 s at the usual 500 ms) for the first minute, then every 60th.
+	_ticks++;
+	if (_ticks % (_ticks <= 120 ? 10 : 60) == 0) logStats();
+}
+
+void CallEngine::logStats() const {
+	static const char *const kStates[] = {"gathering", "connecting", "ready", "failed"};
+	const auto &m = _media.stats();
+	const auto a = _audio.stats();
+	g_message("tgcalls-lite: stats media=%s dtls-in=%llu rtp-in=%llu rtcp-in=%llu srtp-err=%llu early=%llu "
+	          "rtp-out=%llu send-err=%llu | opus enc=%llu dec=%llu dec-err=%llu last-frame=%d samples",
+	          kStates[(int)_media.state()], (unsigned long long)m.dtlsIn, (unsigned long long)m.rtpIn,
+	          (unsigned long long)m.rtcpIn, (unsigned long long)m.srtpErrors,
+	          (unsigned long long)m.beforeSrtp, (unsigned long long)m.rtpOut,
+	          (unsigned long long)m.sendErrors, (unsigned long long)a.encoded,
+	          (unsigned long long)a.decoded, (unsigned long long)a.decodeErrors, a.lastDecodedSamples);
 }
 
 } // namespace tgcalls_lite

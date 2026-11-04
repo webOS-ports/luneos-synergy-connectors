@@ -84,8 +84,12 @@ public:
 	// Fires with each received Opus payload, on the engine's thread, before it goes to playback.
 	std::function<void(const uint8_t *opusPacket, int len)> onAudioFrame;
 
-	// Drive periodically (e.g. every 500ms) for DTLS retransmission timers.
+	// Drive periodically (e.g. every 500ms) for DTLS retransmission timers. Also logs packet and
+	// audio counters every 10th tick for the first 120 ticks, then every 60th.
 	void tick();
+
+	// Logs the packet and audio counters once.
+	void logStats() const;
 
 private:
 	void sendInitialSetupAndCandidates();
@@ -114,6 +118,7 @@ private:
 	bool _isOutgoing;
 	bool _isVideo;
 	bool _sentInitialSetup = false;
+	unsigned _ticks = 0;
 	std::unique_ptr<ContentNegotiator> _negotiator;
 
 	uint32_t _localAudioSsrc;

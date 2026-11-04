@@ -41,7 +41,24 @@ pa_simple *open_stream(pa_stream_direction_t dir, const std::string &device) {
 
 } // namespace
 
+int decode_opus_packet(OpusDecoder *decoder, const uint8_t *packet, int len, std::vector<int16_t> &pcm) {
+	pcm.resize((size_t)kMaxOpusDecodeSamples * kChannels);
+	int samples = opus_decode(decoder, packet, (opus_int32)len, pcm.data(), kMaxOpusDecodeSamples,
+	                          /*decode_fec=*/0);
+	pcm.resize(samples > 0 ? (size_t)samples * kChannels : 0);
+	return samples;
+}
+
 AudioPipeline::AudioPipeline() {}
+
+AudioPipeline::Stats AudioPipeline::stats() const {
+	Stats s;
+	s.encoded = _encoded.load();
+	s.decoded = _decoded.load();
+	s.decodeErrors = _decodeErrors.load();
+	s.lastDecodedSamples = _lastDecodedSamples.load();
+	return s;
+}
 
 AudioPipeline::~AudioPipeline() {
 	stop();
@@ -108,12 +125,13 @@ void AudioPipeline::captureThreadMain() {
 			g_warning("tgcalls-lite: opus_encode failed: %d", (int)len);
 			continue;
 		}
+		_encoded++;
 		if (onEncodedFrame) onEncodedFrame(opusPacket, (int)len);
 	}
 }
 
 void AudioPipeline::playbackThreadMain() {
-	int16_t pcm[kFrameSamples];
+	std::vector<int16_t> pcm;
 
 	while (_running) {
 		std::vector<uint8_t> packet;
@@ -125,15 +143,18 @@ void AudioPipeline::playbackThreadMain() {
 			_playbackQueue.pop_front();
 		}
 
-		int samples = opus_decode(_decoder, packet.data(), (opus_int32)packet.size(), pcm,
-		                          kFrameSamples, /*decode_fec=*/0);
+		int samples = decode_opus_packet(_decoder, packet.data(), (int)packet.size(), pcm);
 		if (samples <= 0) {
-			g_warning("tgcalls-lite: opus_decode failed: %d", samples);
+			// Once per call; the periodic call stats carry the count.
+			if (_decodeErrors++ == 0)
+				g_warning("tgcalls-lite: opus_decode failed: %d (%zu-byte packet)", samples, packet.size());
 			continue;
 		}
+		_decoded++;
+		_lastDecodedSamples = samples;
 
 		int err = 0;
-		if (pa_simple_write(_playback, pcm, (size_t)samples * sizeof(int16_t) * kChannels, &err) < 0) {
+		if (pa_simple_write(_playback, pcm.data(), pcm.size() * sizeof(int16_t), &err) < 0) {
 			g_warning("tgcalls-lite: PulseAudio playback failed: %s", pa_strerror(err));
 			break;
 		}

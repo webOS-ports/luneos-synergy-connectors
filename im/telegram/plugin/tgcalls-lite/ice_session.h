@@ -42,6 +42,9 @@ enum class IceConnectionState {
 	Disconnected,
 };
 
+// "host", "srflx", "prflx" or "relay" for a NiceCandidateType, for logs.
+const char *candidate_type_name(int type);
+
 class IceSession {
 public:
 	// ctx: the GMainContext whose loop the caller is iterating/running -- libnice's timers only
@@ -90,6 +93,8 @@ private:
 	                            guint state, gpointer user_data);
 	static void recvCb(NiceAgent *agent, guint stream_id, guint component_id, guint len,
 	                    gchar *buf, gpointer user_data);
+	static void selectedPairCb(NiceAgent *agent, guint stream_id, guint component_id,
+	                           NiceCandidate *local, NiceCandidate *remote, gpointer user_data);
 
 	NiceAgent *_agent = nullptr;
 	guint _streamId = 0;

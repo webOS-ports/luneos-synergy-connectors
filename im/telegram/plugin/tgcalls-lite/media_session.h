@@ -8,6 +8,7 @@
 
 #include <glib.h>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <memory>
@@ -58,6 +59,19 @@ public:
 
 	void tick(); // drive DTLS retransmission timers; call periodically (e.g. every 500ms)
 
+	// Packet counters for the call log.
+	struct Stats {
+		uint64_t dtlsIn = 0;
+		uint64_t rtpIn = 0;
+		uint64_t rtcpIn = 0;
+		uint64_t srtpErrors = 0;   // received RTP/RTCP that failed to unprotect
+		uint64_t beforeSrtp = 0;   // media received before SRTP was ready
+		uint64_t rtpOut = 0;
+		uint64_t sendErrors = 0;   // protect or ICE send failures
+	};
+	const Stats &stats() const { return _stats; }
+	MediaSessionState state() const { return _state; }
+
 	std::function<void()> onGatheringDone;
 	std::function<void(MediaSessionState)> onStateChanged;
 	std::function<void(const uint8_t *payload, int len)> onRtpReceived;   // already decrypted
@@ -76,6 +90,7 @@ private:
 	bool _iceConnected = false;
 	bool _dtlsDone = false;
 	MediaSessionState _state = MediaSessionState::Gathering;
+	Stats _stats;
 };
 
 } // namespace tgcalls_lite

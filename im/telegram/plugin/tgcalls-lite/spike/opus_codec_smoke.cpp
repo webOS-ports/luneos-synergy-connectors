@@ -7,6 +7,9 @@
 #include <cstdint>
 #include <cmath>
 #include <opus.h>
+#include <vector>
+
+#include "../audio_pipeline.h"
 
 int main() {
 	constexpr int kSampleRate = 48000;
@@ -52,6 +55,35 @@ int main() {
 	if (outEnergy < inEnergy * 0.3 || outEnergy > inEnergy * 3.0) {
 		fprintf(stderr, "FAIL: decoded energy wildly different from input -- codec likely misconfigured\n");
 		failures++;
+	}
+
+	// The peer chooses its own frame length: tgcalls sends 60 ms frames, and Opus allows up to
+	// 120 ms. decode_opus_packet() (the playback path) must take every one of them.
+	for (int ms : {10, 20, 40, 60, 80, 100, 120}) {
+		const int n = kSampleRate / 1000 * ms;
+		std::vector<int16_t> in((size_t)n);
+		for (int i = 0; i < n; i++) in[(size_t)i] = (int16_t)(8000.0 * sin(2.0 * M_PI * 440.0 * i / kSampleRate));
+		uint8_t packet[4000];
+		opus_int32 len = opus_encode(enc, in.data(), n, packet, sizeof(packet));
+		if (len <= 0) { fprintf(stderr, "FAIL: opus_encode %d ms: %d\n", ms, (int)len); failures++; continue; }
+		std::vector<int16_t> out;
+		int samples = tgcalls_lite::decode_opus_packet(dec, packet, (int)len, out);
+		if (samples != n || out.size() != (size_t)n) {
+			fprintf(stderr, "FAIL: decode_opus_packet %d ms frame returned %d samples (%zu in pcm), expected %d\n",
+			        ms, samples, out.size(), n);
+			failures++;
+		}
+	}
+
+	// A corrupt packet reports the Opus error and leaves no samples behind.
+	{
+		const uint8_t junk[] = {0xff, 0xff, 0xff};
+		std::vector<int16_t> out(100, 1);
+		int samples = tgcalls_lite::decode_opus_packet(dec, junk, (int)sizeof(junk), out);
+		if (samples >= 0 || !out.empty()) {
+			fprintf(stderr, "FAIL: corrupt packet gave %d samples, %zu in pcm\n", samples, out.size());
+			failures++;
+		}
 	}
 
 	opus_encoder_destroy(enc);

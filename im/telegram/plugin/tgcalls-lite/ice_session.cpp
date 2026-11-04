@@ -12,6 +12,8 @@ IceSession::IceSession(GMainContext *ctx, bool controlling) {
 	                  G_CALLBACK(&IceSession::gatheringDoneCb), this);
 	g_signal_connect(G_OBJECT(_agent), "component-state-changed",
 	                  G_CALLBACK(&IceSession::stateChangedCb), this);
+	g_signal_connect(G_OBJECT(_agent), "new-selected-pair-full",
+	                  G_CALLBACK(&IceSession::selectedPairCb), this);
 
 	_streamId = nice_agent_add_stream(_agent, 1);
 	nice_agent_attach_recv(_agent, _streamId, kComponentId, ctx,
@@ -121,6 +123,7 @@ void IceSession::gatheringDoneCb(NiceAgent *, guint, gpointer user_data) {
 void IceSession::stateChangedCb(NiceAgent *, guint, guint component_id, guint state, gpointer user_data) {
 	auto *self = (IceSession *)user_data;
 	if (component_id != kComponentId) return;
+	g_message("tgcalls-lite: ICE %s", nice_component_state_to_string((NiceComponentState)state));
 	IceConnectionState mapped;
 	switch (state) {
 		case NICE_COMPONENT_STATE_GATHERING: mapped = IceConnectionState::Gathering; break;
@@ -131,6 +134,26 @@ void IceSession::stateChangedCb(NiceAgent *, guint, guint component_id, guint st
 		default: mapped = IceConnectionState::Disconnected; break;
 	}
 	if (self->onStateChanged) self->onStateChanged(mapped);
+}
+
+const char *candidate_type_name(int type) {
+	switch (type) {
+		case NICE_CANDIDATE_TYPE_HOST: return "host";
+		case NICE_CANDIDATE_TYPE_SERVER_REFLEXIVE: return "srflx";
+		case NICE_CANDIDATE_TYPE_PEER_REFLEXIVE: return "prflx";
+		case NICE_CANDIDATE_TYPE_RELAYED: return "relay";
+		default: return "unknown";
+	}
+}
+
+void IceSession::selectedPairCb(NiceAgent *, guint, guint component_id, NiceCandidate *local,
+                                NiceCandidate *remote, gpointer) {
+	if (component_id != kComponentId || !local || !remote) return;
+	// Types only: the addresses identify the user's network.
+	g_message("tgcalls-lite: ICE selected pair %s/%s -> %s/%s", candidate_type_name(local->type),
+	          local->transport == NICE_CANDIDATE_TRANSPORT_UDP ? "udp" : "tcp",
+	          candidate_type_name(remote->type),
+	          remote->transport == NICE_CANDIDATE_TRANSPORT_UDP ? "udp" : "tcp");
 }
 
 void IceSession::recvCb(NiceAgent *, guint, guint component_id, guint len, gchar *buf, gpointer user_data) {
