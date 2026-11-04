@@ -1,0 +1,43 @@
+[
+    {
+        "templateId": "org.webosports.video.m3u",
+        "loc_name": "M3U Playlist",
+        "icon": {
+            "loc_32x32": "images/m3u-32x32.png",
+            "loc_48x48": "images/m3u-48x48.png"
+        },
+        "__comment": "An M3U playlist on the web - an IPTV service's channel list, or any list of streams - in Videos, its groups as sections. The customUI app org.webosports.app.videoauth asks for the playlist's address and calls org.webosports.service.videos/login with this templateId, which reads the list before Accounts stores the account. The address often holds the IPTV service's password, so it is a credential.",
+        "validator": {
+            "customUI": {
+                "appId": "org.webosports.app.videoauth",
+                "name": "validator.html"
+            },
+            "address": "palm://org.webosports.service.videos/login"
+        },
+        "loc_usernameLabel": "PLAYLIST",
+        "__comment2": "org.webosports.app.videoauth MUST be in write/readPermissions: createAccount runs as the customUI app. org.webosports.service.videos reads the credentials for every catalogue call.",
+        "readPermissions": [
+            "org.webosports.service.videos",
+            "org.webosports.app.videoauth"
+        ],
+        "writePermissions": [
+            "org.webosports.service.videos",
+            "org.webosports.app.videoauth"
+        ],
+        "capabilityProviders": [
+            {
+                "capability": "Video",
+                "capabilitySubtype": "STREAMING",
+                "id": "org.webosports.video.m3u.streaming",
+                "alwaysOn": true,
+                "implementation": "palm://org.webosports.service.videos/",
+                "loc_shortName": "M3U",
+                "icon": {
+                    "loc_32x32": "images/m3u-32x32.png",
+                    "loc_48x48": "images/m3u-48x48.png",
+                    "splitter": "images/m3u-32x32.png"
+                }
+            }
+        ]
+    }
+]
