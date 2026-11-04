@@ -1000,7 +1000,12 @@ static const char *sm_camera_description(gboolean *mirrored)
     if (f) {
         gst_object_unref(f);
         *mirrored = g_strcmp0(mir, "0") != 0;
-        return "droidcamsrc camera-device=1 name=sigcam sigcam.vfsrc ! video/x-raw,format=NV21 ! queue "
+        /* Fixed viewfinder caps: droidcamsrc only fixes the size and frame rate of what its peer
+         * accepts, and a peer that scales to pixel-aspect-ratio 1/1 accepts a range of them; the
+         * unfixed caps then fail the viewfinder ("failed to negotiate vfsrc", seen on sargo
+         * 2026-11-04). 640x480 at 30 fps is a viewfinder mode of sargo's front camera. */
+        return "droidcamsrc camera-device=1 name=sigcam sigcam.vfsrc ! "
+               "video/x-raw,format=NV21,width=640,height=480,framerate=30/1,pixel-aspect-ratio=1/1 ! queue "
                "sigcam.imgsrc ! fakesink sigcam.vidsrc ! fakesink";
     }
     f = gst_element_factory_find("v4l2src");
