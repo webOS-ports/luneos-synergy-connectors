@@ -1,0 +1,19 @@
+{
+    "appId": "com.palm.service.pigallery2",
+    "allowedNames": [
+        "com.palm.service.pigallery2"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "com.palm.service.pigallery2",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}

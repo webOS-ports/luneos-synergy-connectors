@@ -1,0 +1,11 @@
+{
+    "com.palm.service.pigallery2": ["accountsservice.operation", "activity.operation", "systemsettings.query", "time.query"],
+    "com.palm.service.accounts": ["synergy-pigallery2.operation"],
+    "com.palm.app.accounts": ["synergy-pigallery2.operation"],
+    "com.palm.app.accounts-*": ["synergy-pigallery2.operation"],
+    "com.palm.app.pigallery2-auth-*": ["synergy-pigallery2.operation"],
+    "com.palm.app.pigallery2-auth": ["synergy-pigallery2.operation"],
+    "org.webosports.app.photos-*": ["synergy-pigallery2.operation"],
+    "org.webosports.app.photos": ["synergy-pigallery2.operation"],
+    "com.palm.service.photos": ["synergy-pigallery2.operation"]
+}

@@ -1,0 +1,5 @@
+{
+    "synergy-pigallery2.operation": [
+        "com.palm.service.pigallery2/*"
+    ]
+}

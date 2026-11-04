@@ -1,0 +1,33 @@
+{
+	"templateId": "com.palm.pigallery2",
+	"loc_name": "PiGallery2",
+	"loc_usernameLabel": "USER",
+	"icon": {
+		"loc_32x32": "images/pigallery2-32x32.png",
+		"loc_48x48": "images/pigallery2-48x48.png"
+	},
+
+	"__comment": "PiGallery2, a self-hosted, folder-based photo gallery. No OAuth: the customUI app com.palm.app.pigallery2-auth collects the server's address, the user name and the password, and calls com.palm.service.pigallery2/login, which checks them. PiGallery2 has no tokens, so the password is what the account keeps (as WebDAV's does); a gallery with sign-in turned off keeps none. A PHOTO source only - no DOCUMENTS capability, no files app.",
+	"validator": {
+		"customUI": { "appId": "com.palm.app.pigallery2-auth", "name": "login.html" },
+		"address":  "palm://com.palm.service.pigallery2/login"
+	},
+	"onCredentialsChanged": "palm://com.palm.service.pigallery2/checkCredentials",
+
+	"__comment2": "com.palm.app.pigallery2-auth MUST be in write/readPermissions: createAccount runs under the customUI auth app's identity and is permission-checked against these lists.",
+	"__comment3": "com.palm.service.pigallery2 is in readPermissions so the service itself can readCredentials(accountId) for the photo-provider calls. The Photos app is not: it never needs the password.",
+	"readPermissions":  ["com.palm.app.pigallery2-auth", "com.palm.service.pigallery2", "com.palm.service.photos"],
+	"writePermissions": ["com.palm.app.pigallery2-auth", "com.palm.service.pigallery2", "com.palm.service.photos"],
+
+	"capabilityProviders": [
+		{
+			"capability": "PHOTO.UPLOAD",
+			"id": "com.palm.pigallery2.photos",
+			"implementation": "palm://com.palm.service.photos",
+			"onEnabled": "palm://com.palm.service.photos/onEnabled",
+			"onDelete": "palm://com.palm.service.photos/onDelete",
+			"onCredentialsChanged": "palm://com.palm.service.photos/onCredentialsChanged",
+			"__comment": "Makes the PiGallery2 account a photo source. The Photos aggregator (com.palm.service.photos, its service name derived from the templateId) calls com.palm.service.pigallery2/listAlbums+listPhotos: every folder is an album, with the folder it is in as its parentAid (sub-albums). PiGallery2's links need its session, which listPhotos hands over as a Cookie header for that listing's downloads, never the password."
+		}
+	]
+}

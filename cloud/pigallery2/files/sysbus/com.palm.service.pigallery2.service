@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=com.palm.service.pigallery2
+Exec=/usr/bin/run-js-service -n /usr/palm/services/com.palm.service.pigallery2
