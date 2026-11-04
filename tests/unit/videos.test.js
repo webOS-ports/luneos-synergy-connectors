@@ -213,6 +213,21 @@ const allRoutes = (o = {}) => jellyfinRoutes(o.jf).concat(peertubeRoutes(o.pt), 
 
 // --- sources ------------------------------------------------------------------------------------
 
+test("listSources: a label drops the kind the icon shows, as the sign-in names an account", async () => {
+	const accounts = [
+		{ _id: "a1", templateId: "org.webosports.video.peertube", username: "h", alias: "PeerTube (tube.example:9000)" },
+		{ _id: "a2", templateId: "org.webosports.video.peertube", username: "h", alias: "Tube (tube.example)" },
+		{ _id: "a3", templateId: "org.webosports.video.jellyfin", username: "h", alias: "Jellyfin" },
+		{ _id: "a4", templateId: "org.webosports.video.jellyfin", username: "h", alias: "Jellyfin – " },
+		{ _id: "a5", templateId: "org.webosports.video.jellyfin", username: "h", alias: "My Jellyfin – Home" },
+	];
+	const t = start({ routes: allRoutes(), accounts });
+	const r = await t.call("listSources", {});
+	assert.deepStrictEqual(r.sources.map((s) => s.label), ["tube.example:9000", "Tube", "Jellyfin", "Jellyfin –", "My Jellyfin – Home"]);
+	assert.strictEqual(r.sources[0].name, "PeerTube (tube.example:9000)", "the name as it was");
+	t.stop();
+});
+
 test("listSources: one per account, one per media server found, none for unknown or deleted accounts", async () => {
 	const t = start({ routes: allRoutes() });
 	const r = await t.call("listSources", {});
@@ -222,6 +237,7 @@ test("listSources: one per account, one per media server found, none for unknown
 		["acc-pt", "peertube", "Tube"],
 		["acc-up|" + UDN, "upnp", "LuneOS test DLNA"],
 	]);
+	assert.deepStrictEqual(r.sources.map((s) => s.label), ["Home", "Tube", "LuneOS test DLNA"], "the name without its kind");
 	assert.deepStrictEqual(r.sources[0].features, { search: true, progress: true, continueWatching: true, live: false });
 	assert.deepStrictEqual(r.sources[2].features, { search: true, progress: false, continueWatching: false, live: false });
 	assert.match(r.sources[0].icon, /jellyfin-48x48\.png$/);

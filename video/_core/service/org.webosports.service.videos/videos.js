@@ -126,6 +126,17 @@ function createVideos({ config, providers, call, http, ssdp = null, log = consol
 		return C.text(account.alias) || C.text(account.username) || C.text(account.loc_name) || provider.name;
 	}
 
+	// A source's name without its kind, for where the account's icon already
+	// shows the kind (Videos' tabs): "Plex – Home" is "Home", "PeerTube
+	// (tube.example)" is "tube.example", "Tube (tube.example)" is "Tube".
+	function labelOf(name, provider) {
+		const kind = provider.name;
+		if (name.startsWith(kind + " – ")) { return name.slice(kind.length + 3); }
+		const m = /^(.+) \(([^()]+)\)$/.exec(name);
+		if (m) { return m[1] === kind ? m[2] : m[1]; }
+		return name;
+	}
+
 	// The provider, account and credentials behind a source id.
 	async function context(sourceId) {
 		const { accountId, sub } = splitSourceId(sourceId);
@@ -159,7 +170,7 @@ function createVideos({ config, providers, call, http, ssdp = null, log = consol
 	}
 
 	const methods = {
-		// -> { sources: [{ sourceId, accountId, templateId, provider, name, icon, features }] }
+		// -> { sources: [{ sourceId, accountId, templateId, provider, name, label, icon, features }] }
 		listSources: {
 			allow: appIds,
 			timeoutMs: 20000,
@@ -184,7 +195,7 @@ function createVideos({ config, providers, call, http, ssdp = null, log = consol
 					for (const s of subs || []) {
 						const name = C.text(s && s.name, 200);
 						if (!name) { continue; }
-						sources.push(Object.assign({ sourceId: sourceIdOf(account._id, s.id || ""), name },
+						sources.push(Object.assign({ sourceId: sourceIdOf(account._id, s.id || ""), name, label: labelOf(name, provider) },
 							base, { features: C.features(provider.features(Object.assign({}, ctx, { sub: s.id || "" }))) }));
 					}
 				}
