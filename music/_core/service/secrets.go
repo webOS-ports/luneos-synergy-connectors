@@ -43,6 +43,7 @@ var secretPaths = func() []string {
 		ytTokenFile,
 		appleUserTokenFile,
 		subsonicAuthPath,
+		radioListsPath,
 	}
 }
 

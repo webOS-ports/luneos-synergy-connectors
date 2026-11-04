@@ -98,6 +98,28 @@ and it never expires; so the app never sees a server URL: tracks play from
 add the sign-in and pass Range on for seeking. Errors never carry the URL
 they failed on.
 
+## Internet Radio
+
+`radio.go`: the stations of [Radio Browser](https://www.radio-browser.info),
+a free directory kept by its users, and the user's own station lists (M3U or
+PLS playlists at an address). The account (template
+`org.webosports.app.music.radio`) needs no sign-in; the sign-in app can post a
+list's address to `/radioauth/lists`, which reads it (a playlist with
+stations, or a station's own stream) before keeping it in `radio-lists`.
+
+They show as the service's playlists, so the app needs nothing new: the
+user's lists (one playlist per group when a list has groups), then Radio
+Browser's most played and most liked stations, those of the system's country
+(the settings service's UI locale) and ten genres. Search looks in the
+user's lists first, then in Radio Browser. A station is a track with no
+length: `radio:rb.<stationuuid>` or `radio:u.<base64url of its stream>`.
+
+As Radio Browser asks: the server comes from the DNS name
+`all.api.radio-browser.info` (the next one when one fails), requests carry
+`User-Agent: LuneOS-Music/1.0`, and each play counts a click on
+`/json/url/<stationuuid>`. A station's own `.pls` or `.m3u` file is opened
+for its stream when it plays (GStreamer plays HLS's `.m3u8` itself).
+
 ## Browsing a library
 
 A provider with a library to walk implements `libraryBrowser` (`browse.go`),

@@ -88,7 +88,7 @@ func (l *rawAcceptListener) Accept() (net.Conn, error) {
 	}
 }
 
-func (l *rawAcceptListener) Close() error { return l.file.Close() }
+func (l *rawAcceptListener) Close() error   { return l.file.Close() }
 func (l *rawAcceptListener) Addr() net.Addr { return l.addr }
 
 // session holds the current authenticated Spotify client + chosen device.
@@ -152,6 +152,7 @@ func main() {
 	registerProvider(&soundcloudProvider{})
 	registerProvider(newJamendoProvider())
 	registerProvider(&archiveProvider{})
+	registerProvider(newRadioProvider()) // Radio Browser and the user's station lists (radio.go)
 
 	// First-party services double as lossless DOWNLOADERS (self-register only if
 	// their credential file exists) and streaming PROVIDERS. Qobuz/Tidal stream URLs
@@ -212,6 +213,7 @@ func main() {
 	mux.HandleFunc("/subsonicauth/login", withCORS(handleSubsonicAuthLogin)) // Subsonic server + username + password
 	mux.HandleFunc("/subsonicstream", handleSubsonicStream)                  // a song, the sign-in added (gst/Qt only)
 	mux.HandleFunc("/subsonicart", handleSubsonicArt)                        // a cover, the sign-in added
+	mux.HandleFunc("/radioauth/lists", withCORS(handleRadioAuthLists))       // Internet Radio: the user's station lists
 	mux.HandleFunc("/dzauth/login", withCORS(handleDeezerAuthLogin))         // Deezer email+password -> ARL
 	mux.HandleFunc("/auth/login", withCORS(handleAuthLogin))
 	mux.HandleFunc("/auth/callback", handleAuthCallback) // browser redirect target (no CORS)
