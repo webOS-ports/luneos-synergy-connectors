@@ -3,6 +3,7 @@
  */
 #include "teams_video.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
@@ -197,4 +198,24 @@ int tv_keyframe_overdue(int64_t now, int64_t last_packet, int64_t first_packet, 
         return 0;                                   /* nothing arriving: nothing to recover */
     int64_t since = last_decoded ? last_decoded : first_packet;
     return since && now - since >= 1000000;
+}
+
+int tv_parse_video_cmd(const char *line, int *on, unsigned *w, unsigned *h, unsigned *kbps)
+{
+    unsigned a = 0, b = 0, c = 0;
+    char tail;
+    *w = *h = *kbps = 0;
+    if (!strcmp(line, "VIDEO 0") || !strcmp(line, "VIDEO 1")) {
+        *on = line[6] == '1';
+        return 1;
+    }
+    if (sscanf(line, "VIDEO 1 %u %u %u%c", &a, &b, &c, &tail) != 3)
+        return 0;
+    if (a < 96 || a > 1920 || b < 96 || b > 1920 || (a & 1) || (b & 1) || c < 32 || c > 4000)
+        return 0;
+    *on = 1;
+    *w = a;
+    *h = b;
+    *kbps = c;
+    return 1;
 }

@@ -682,6 +682,56 @@ static void test_srtp_funnel(void)
     teardown(p);
 }
 
+/* Our shmsinks answer no allocation query (else the decoder fills the shm area and the receive
+ * chain blocks); a plain shmsink offers its allocator (the control). */
+static guint allocation_params(GstElement *shm)
+{
+    GstPad *sp = gst_element_get_static_pad(shm, "sink");
+    GstCaps *c = tm_i420_caps(64, 64);
+    GstQuery *q = gst_query_new_allocation(c, TRUE);
+    gst_pad_query(sp, q);
+    guint n = gst_query_get_n_allocation_params(q) + gst_query_get_n_allocation_pools(q);
+    gst_query_unref(q);
+    gst_caps_unref(c);
+    gst_object_unref(sp);
+    return n;
+}
+
+static void test_shm_allocation(const char *dir)
+{
+    GstElement *p = gst_pipeline_new("shm");
+    GstElement *plain = el("shmsink", NULL), *ours = el("shmsink", NULL);
+    gchar *a = g_build_filename(dir, "alloc-a.sock", NULL), *b = g_build_filename(dir, "alloc-b.sock", NULL);
+    g_object_set(plain, "socket-path", a, "shm-size", (guint)TM_SHM_SIZE, "wait-for-connection", FALSE, NULL);
+    tm_configure_shm(NULL, ours, b);
+    gst_bin_add_many(GST_BIN(p), plain, ours, NULL);
+    CHECK(gst_element_set_state(p, GST_STATE_PAUSED) != GST_STATE_CHANGE_FAILURE);
+    guint np = allocation_params(plain), no = allocation_params(ours);
+    CHECK(np > 0);
+    CHECK(no == 0);
+    g_print("shm allocation: plain shmsink offers %u, ours %u\n", np, no);
+    gst_element_set_state(p, GST_STATE_NULL);
+    gst_object_unref(p);
+    g_free(a); g_free(b);
+}
+
+/* The camera head sends the size and bitrate VIDEO asked for, the defaults otherwise. */
+static void test_camera_size(void)
+{
+    TeamsMedia tm;
+    gboolean m;
+    memset(&tm, 0, sizeof tm);
+    g_unsetenv("TEAMS_MEDIA_CAMERA");
+    gchar *d = tm_camera_description(&tm, &m);
+    CHECK(strstr(d, "target-bitrate=800000 ") && strstr(d, "vidsrc ! video/x-h264,width=640,height=480 "));
+    g_free(d);
+    tm.vtx_w = 176; tm.vtx_h = 144; tm.vtx_kbps = 208;
+    d = tm_camera_description(&tm, &m);
+    CHECK(strstr(d, "target-bitrate=208000 ") && strstr(d, "vidsrc ! video/x-h264,width=176,height=144 "));
+    CHECK(strstr(d, "vfsrc ! video/x-raw,format=NV21,width=640,height=480,"));   /* the viewfinder stays */
+    g_free(d);
+}
+
 /* VIDEO without video support only says so. */
 static void test_unavailable(void)
 {
@@ -706,6 +756,8 @@ int main(int argc, char **argv)
     CHECK(tm_video_available());
     test_unavailable();
     test_srtp_funnel();
+    test_shm_allocation(dir);
+    test_camera_size();
     test_rx(h264, dir);
     reset_rtcp_counts();            /* each test starts from clean RTCP counters */
     test_rx_nokey(h264);

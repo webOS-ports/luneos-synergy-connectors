@@ -36,7 +36,9 @@
  *                                                               applied WITHOUT rebuilding the
  *                                                               already-PLAYING pipeline; follow with
  *                                                               RCAND for the new leg's candidates)
- *        VIDEO <0|1>                                         (the user turned our camera off/on)
+ *        VIDEO <0|1> [<w> <h> <kbps>]                        (the user turned our camera off/on;
+ *                                                               optional: the size and bitrate to
+ *                                                               send, from the far side's fmtp)
  *        STOP
  *   out: UFRAG <our_ufrag>
  *        PWD <our_pwd>
@@ -131,6 +133,7 @@ typedef struct {
     GstElement   *vtx_head;       /* the camera bin while the camera is on */
     GstElement   *vtx_cam;        /* the droidcamsrc in it, if any (start-capture, orientation) */
     gboolean      vtx_wanted;     /* VIDEO 1: the user has the camera on */
+    guint         vtx_w, vtx_h, vtx_kbps; /* VIDEO 1 <w> <h> <kbps>: what to send; 0 = defaults */
     gint          vtx_capture;    /* atomic: start-capture sent to the droid camera */
     gint          vtx_announced;  /* atomic: VPREVIEW sent for this camera head */
     GstElement   *rtcp_out;       /* appsrc: our RTCP, to srtpenc */
@@ -520,8 +523,24 @@ static void tm_drop_elements(GstElement **els, int n)
 /* A shmsink the Phone app reads, which must never hold the pipeline up: frames are dropped in the
  * leaky queue in front of it, and it keeps no last sample (its deep copy on a drain query blocked
  * a stop for ever in luneos-rtc-engine). */
+/* shmsink offers its shm area as the allocator upstream. When nothing between it and the decoder
+ * copies (no scaling needed), the decoder keeps its frames in that area, the area fills and the
+ * whole chain blocks ahead of the leaky queue: the jitter buffer stops pushing (Signal engine,
+ * fd22e21). Answer no allocation query, so upstream allocates its own memory and shmsink copies. */
+static GstPadProbeReturn tm_no_shm_allocation(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    (void)pad; (void)user;
+    GstQuery *q = GST_PAD_PROBE_INFO_QUERY(info);
+    return q && GST_QUERY_TYPE(q) == GST_QUERY_ALLOCATION ? GST_PAD_PROBE_DROP : GST_PAD_PROBE_OK;
+}
+
 static void tm_configure_shm(GstElement *queue, GstElement *shm, const char *path)
 {
+    GstPad *sp = gst_element_get_static_pad(shm, "sink");
+    if (sp) {
+        gst_pad_add_probe(sp, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM, tm_no_shm_allocation, NULL, NULL);
+        gst_object_unref(sp);
+    }
     if (queue)
         g_object_set(queue, "leaky", 2 /* downstream */, "max-size-buffers", 2, "max-size-time", (guint64)0,
                      "max-size-bytes", 0, NULL);
@@ -788,8 +807,10 @@ static gboolean tm_video_tick(gpointer user)
  * shmsink "tmpvshm" for the self-view. The vfsrc caps are fully fixed: droidcamsrc fixes only
  * size and frame rate of its viewfinder, and left the pixel aspect ratio a range that the
  * converters after it cannot take ("failed to negotiate vfsrc", Signal engine 9f38163). */
-static gchar *tm_camera_description(gboolean *mirrored)
+static gchar *tm_camera_description(const TeamsMedia *tm, gboolean *mirrored)
 {
+    int w = tm->vtx_w ? (int)tm->vtx_w : TM_VIDEO_W, h = tm->vtx_h ? (int)tm->vtx_h : TM_VIDEO_H;
+    int bps = tm->vtx_kbps ? (int)tm->vtx_kbps * 1000 : TM_VIDEO_BITRATE;
     const char *env = g_getenv("TEAMS_MEDIA_CAMERA");
     if (env && *env) {
         *mirrored = FALSE;
@@ -805,7 +826,7 @@ static gchar *tm_camera_description(gboolean *mirrored)
         "queue leaky=downstream max-size-buffers=2 ! shmsink name=tmpvshm "
         "tmcam.vidsrc ! video/x-h264,width=%d,height=%d ! h264parse config-interval=-1 ! "
         "video/x-h264,stream-format=byte-stream,alignment=au ! queue name=tmvout",
-        TM_VIDEO_BITRATE, TM_VIDEO_W, TM_VIDEO_H, TM_PREVIEW_W, TM_PREVIEW_H, TM_VIDEO_W, TM_VIDEO_H);
+        bps, TM_VIDEO_W, TM_VIDEO_H, TM_PREVIEW_W, TM_PREVIEW_H, w, h);
 }
 
 /* Quarter turns (counter-clockwise, as the Phone app turns the self-view) for the camera's sensor
@@ -869,7 +890,7 @@ static gboolean tm_video_tx_start(gpointer user)
     if (tm->vtx_head || !tm->vtx_wanted || !tm->vtx_queue || !tm->pipeline)
         return G_SOURCE_REMOVE;
     gboolean mirrored = FALSE;
-    gchar *desc = tm_camera_description(&mirrored);
+    gchar *desc = tm_camera_description(tm, &mirrored);
     GError *err = NULL;
     GstElement *head = gst_parse_bin_from_description(desc, FALSE, &err);
     if (!head) {
@@ -1649,10 +1670,14 @@ static int run_ipc(int is_caller)
             g_message("teams_media: ICE restart - stream reset, new local+remote creds applied%s",
                       new_key ? " (+ new rx key)" : "");
             emit("RESTARTED\n");
-        } else if (!strcmp(line, "VIDEO 0") || !strcmp(line, "VIDEO 1")) {
+        } else if (g_str_has_prefix(line, "VIDEO ")) {
             /* The user turned our camera off or on (only sent once the call is answered). */
+            int on = 0;
+            unsigned vw, vh, vk;
+            if (!tv_parse_video_cmd(line, &on, &vw, &vh, &vk)) { emit("ERR bad-video\n"); continue; }
             if (!started) { emit("ERR video-before-start\n"); continue; }
-            tm_set_video(&g_tm, line[6] == '1');
+            if (on) { g_tm.vtx_w = vw; g_tm.vtx_h = vh; g_tm.vtx_kbps = vk; }
+            tm_set_video(&g_tm, on);
         } else if (!strcmp(line, "STOP")) {
             break;
         } else {

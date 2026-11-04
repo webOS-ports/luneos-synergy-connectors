@@ -155,8 +155,27 @@ static void test_overdue(void)
     CHECK(!tv_keyframe_overdue(13 * s, 11 * s, 10 * s, 0));   /* the far side stopped sending */
 }
 
+static void test_video_cmd(void)
+{
+    int on = -1;
+    unsigned w = 9, h = 9, k = 9;
+    CHECK(tv_parse_video_cmd("VIDEO 1", &on, &w, &h, &k) && on == 1 && !w && !h && !k);
+    CHECK(tv_parse_video_cmd("VIDEO 0", &on, &w, &h, &k) && on == 0);
+    CHECK(tv_parse_video_cmd("VIDEO 1 176 144 208", &on, &w, &h, &k) && on == 1 && w == 176 && h == 144 && k == 208);
+    CHECK(!tv_parse_video_cmd("VIDEO 2", &on, &w, &h, &k));
+    CHECK(!tv_parse_video_cmd("VIDEO 1 176 144", &on, &w, &h, &k));
+    CHECK(!tv_parse_video_cmd("VIDEO 1 176 144 208x", &on, &w, &h, &k));
+    CHECK(!tv_parse_video_cmd("VIDEO 1 177 144 208", &on, &w, &h, &k));   /* odd */
+    CHECK(!tv_parse_video_cmd("VIDEO 1 64 64 208", &on, &w, &h, &k));
+    CHECK(!tv_parse_video_cmd("VIDEO 1 4000 144 208", &on, &w, &h, &k));
+    CHECK(!tv_parse_video_cmd("VIDEO 1 176 144 5000", &on, &w, &h, &k));
+    CHECK(!tv_parse_video_cmd("VIDEO 1 176 144 8", &on, &w, &h, &k));
+    CHECK(!tv_parse_video_cmd("VIDEO 0 176 144 208", &on, &w, &h, &k));
+}
+
 int main(void)
 {
+    test_video_cmd();
     test_parse();
     test_rr();
     test_remb();

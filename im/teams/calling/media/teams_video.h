@@ -77,6 +77,11 @@ int tv_rtcp_find_sr(const uint8_t *p, size_t n, uint32_t ssrc, uint32_t *ntp_mid
  * was ever decoded. All times in microseconds on one clock, 0 meaning never. */
 int tv_keyframe_overdue(int64_t now, int64_t last_packet, int64_t first_packet, int64_t last_decoded);
 
+/* The plugin's "VIDEO 0", "VIDEO 1" or "VIDEO 1 <width> <height> <kbit/s>" (the size and bitrate
+ * our camera sends, from the far side's H264 fmtp limits). Returns 1 and fills *on (and *w, *h,
+ * *kbps, 0 when not given) for a valid line, 0 otherwise. Sizes are even, 96..1920; 32..4000 kbit/s. */
+int tv_parse_video_cmd(const char *line, int *on, unsigned *w, unsigned *h, unsigned *kbps);
+
 #ifdef __cplusplus
 }
 #endif
