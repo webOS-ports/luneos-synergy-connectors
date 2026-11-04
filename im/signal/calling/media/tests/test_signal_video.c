@@ -248,6 +248,23 @@ static void test_red(void)
     CHECK(sv_red_unwrap(in, 11, out, sizeof out, &pt) == 0);
 }
 
+static void test_vp8_keyframe(void)
+{
+    /* No extension: S, partition 0, P bit clear = keyframe; set = delta frame. */
+    CHECK(sv_vp8_is_keyframe_start((const uint8_t *)"\x10\x00", 2) == 1);
+    CHECK(sv_vp8_is_keyframe_start((const uint8_t *)"\x10\x01", 2) == 0);
+    CHECK(sv_vp8_is_keyframe_start((const uint8_t *)"\x00\x00", 2) == 0);   /* not a start */
+    CHECK(sv_vp8_is_keyframe_start((const uint8_t *)"\x11\x00", 2) == 0);   /* partition 1 */
+    /* WebRTC's form: X, I with a 15-bit picture id, then the payload header. */
+    CHECK(sv_vp8_is_keyframe_start((const uint8_t *)"\x90\x80\x81\x23\x00", 5) == 1);
+    CHECK(sv_vp8_is_keyframe_start((const uint8_t *)"\x90\x80\x81\x23\x01", 5) == 0);
+    /* I with a 7-bit id, L and T/K. */
+    CHECK(sv_vp8_is_keyframe_start((const uint8_t *)"\x90\xf0\x05\x07\x20\x00", 6) == 1);
+    CHECK(sv_vp8_is_keyframe_start((const uint8_t *)"\x90\xf0\x05\x07\x20", 5) == 0);   /* cut */
+    CHECK(sv_vp8_is_keyframe_start((const uint8_t *)"\x90\x80", 2) == 0);
+    CHECK(sv_vp8_is_keyframe_start(NULL, 0) == 0);
+}
+
 static SvTcc tcc;   /* large: not on the stack */
 
 static void test_tcc(void)
@@ -385,6 +402,7 @@ int main(void)
     test_rtcp();
     test_red();
     test_tcc();
+    test_vp8_keyframe();
     test_data_msg();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);

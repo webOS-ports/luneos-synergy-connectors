@@ -204,6 +204,24 @@ size_t sv_red_unwrap(const uint8_t *in, size_t n, uint8_t *out, size_t cap, uint
     return total;
 }
 
+int sv_vp8_is_keyframe_start(const uint8_t *p, size_t n)
+{
+    if (!p || n < 2 || !(p[0] & 0x10) || (p[0] & 0x07) != 0)   /* S, partition 0 */
+        return 0;
+    size_t i = 1;
+    if (p[0] & 0x80) {                                          /* X: extension byte */
+        uint8_t x = p[1];
+        i = 2;
+        if (x & 0x80) {                                         /* I: picture id, 1 or 2 bytes */
+            if (i >= n) return 0;
+            i += (p[i] & 0x80) ? 2 : 1;
+        }
+        if (x & 0x40) i++;                                      /* L: TL0PICIDX */
+        if (x & 0x30) i++;                                      /* T or K: TID/KEYIDX */
+    }
+    return i < n && (p[i] & 0x01) == 0;
+}
+
 void sv_tcc_init(SvTcc *t)
 {
     t->base = -1;

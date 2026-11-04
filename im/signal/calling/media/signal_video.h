@@ -98,6 +98,10 @@ void   sv_tcc_record(SvTcc *t, uint16_t seq, int64_t arrival_us);
  * report or it does not fit. The recorded packets are then forgotten. */
 size_t sv_tcc_build(SvTcc *t, uint32_t sender_ssrc, uint32_t media_ssrc, uint8_t *out, size_t cap);
 
+/* 1 if the VP8 RTP payload p (RFC 7741: payload descriptor, then the VP8 payload header) starts a
+ * keyframe: S set, partition 0, and the payload header's inverse keyframe bit clear. */
+int sv_vp8_is_keyframe_start(const uint8_t *p, size_t n);
+
 /* The CVO byte |0 0 0 0 C F R1 R0|: R1R0 is how far the picture has to be turned CLOCKWISE, in
  * quarter turns, to be upright (webrtc rtp_cvo.h, VideoRotation "enum for clockwise rotation").
  * The Phone app's incomingVideoOrientation turns the picture back by its value COUNTER-clockwise

@@ -121,6 +121,8 @@ static gboolean g_accepted;     /* defined with the rtp-data channel below */
 typedef struct {
     GstElement *rx_src;         /* appsrc the split probe feeds received VP8 RTP into */
     GstElement *rx_shm;         /* its shmsink */
+    GstElement *rx_jb;          /* its jitter buffer (statistics) */
+    gint        st_depay_in;    /* atomic: packets into the depayloader */
     gint        rx_announced;   /* atomic: VSHM sent */
     GstElement *tx_enc;         /* the VP8 encoder in the persistent send tail */
     gint        tx_announced;   /* atomic: VPREVIEW sent */
@@ -143,6 +145,9 @@ typedef struct {
     gint        st_dec;         /* decoded frames */
     gint        st_pli;         /* keyframe requests sent */
     gint        st_tcc;         /* congestion feedback packets sent */
+    gint        st_kf;          /* VP8 keyframe starts received */
+    gint        st_gap;         /* VP8 sequence numbers missing (lost or late) */
+    gint        st_last_seq;    /* receive thread only: last VP8 sequence number, -1 none */
     gint        st_last_pt;     /* last "other" payload type seen */
     guint16     rx_fec_skipped; /* receive thread only: ULPFEC packets taken out of the VP8 stream */
 } SmVideo;
@@ -468,17 +473,34 @@ static void sm_keyframe_watchdog(void)
 /* One line of receive statistics, when anything changed since the last one. Sender thread only. */
 static void sm_log_rx_stats(void)
 {
-    static gint last[7];
-    gint now[7] = {
+    static gint last[9];
+    gint now[9] = {
         g_atomic_int_get(&g_v.st_vp8), g_atomic_int_get(&g_v.st_push_fail), g_atomic_int_get(&g_v.st_other),
         g_atomic_int_get(&g_v.st_depay), g_atomic_int_get(&g_v.st_dec), g_atomic_int_get(&g_v.st_pli),
-        g_atomic_int_get(&g_v.st_tcc),
+        g_atomic_int_get(&g_v.st_tcc), g_atomic_int_get(&g_v.st_kf), g_atomic_int_get(&g_v.st_gap),
     };
     if (memcmp(now, last, sizeof now) == 0)
         return;
     memcpy(last, now, sizeof last);
-    g_message("signal_media: rx video vp8=%d refused=%d other=%d (pt %d) depay=%d decoded=%d pli=%d tcc=%d",
-              now[0], now[1], now[2], g_atomic_int_get(&g_v.st_last_pt), now[3], now[4], now[5], now[6]);
+    guint64 jpushed = 0, jlost = 0, jlate = 0, jdup = 0;
+    GstElement *jb = g_v.rx_jb;
+    if (jb) {
+        GstStructure *s = NULL;
+        g_object_get(jb, "stats", &s, NULL);
+        if (s) {
+            gst_structure_get_uint64(s, "num-pushed", &jpushed);
+            gst_structure_get_uint64(s, "num-lost", &jlost);
+            gst_structure_get_uint64(s, "num-late", &jlate);
+            gst_structure_get_uint64(s, "num-duplicates", &jdup);
+            gst_structure_free(s);
+        }
+    }
+    g_message("signal_media: rx video vp8=%d refused=%d other=%d (pt %d) jb pushed=%" G_GUINT64_FORMAT
+              " lost=%" G_GUINT64_FORMAT " late=%" G_GUINT64_FORMAT " dup=%" G_GUINT64_FORMAT
+              " depay in=%d out=%d decoded=%d pli=%d tcc=%d keyframes=%d gaps=%d fec=%u",
+              now[0], now[1], now[2], g_atomic_int_get(&g_v.st_last_pt), jpushed, jlost, jlate, jdup,
+              g_atomic_int_get(&g_v.st_depay_in), now[3], now[4], now[5], now[6], now[7], now[8],
+              (unsigned)g_v.rx_fec_skipped);
 }
 
 /* Dedicated sender thread, for the whole call. CRITICAL: nice_agent_send() must NOT be called from
@@ -750,6 +772,21 @@ static gboolean sm_rx_route(GstBuffer *buf)
             }
         }
         g_atomic_int_inc(&g_v.st_vp8);
+        GstMapInfo vm;
+        if (gst_buffer_map(vp8, &vm, GST_MAP_READ)) {
+            SvRtp vr;
+            if (sv_rtp_parse(vm.data, vm.size, &vr) == 0) {
+                if (g_v.st_last_seq >= 0) {
+                    guint16 d = (guint16)(vr.seq - (guint16)g_v.st_last_seq);
+                    if (d > 1 && d < 1000)
+                        g_atomic_int_add(&g_v.st_gap, d - 1);
+                }
+                g_v.st_last_seq = vr.seq;
+                if (sv_vp8_is_keyframe_start(vm.data + vr.header_len, vm.size - vr.header_len))
+                    g_atomic_int_inc(&g_v.st_kf);
+            }
+            gst_buffer_unmap(vp8, &vm);
+        }
         if (!g_v.rx_src)
             gst_buffer_unref(vp8);
         else if (gst_app_src_push_buffer(GST_APP_SRC(g_v.rx_src), vp8) != GST_FLOW_OK)  /* takes vp8 */
@@ -952,6 +989,9 @@ static gboolean sm_video_rx_build(GstElement *pipeline)
     GstPad *p = gst_element_get_static_pad(depay, "sink");
     gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_EVENT_UPSTREAM, sm_rx_keyframe_probe, NULL, NULL);
     gst_object_unref(p);
+    p = gst_element_get_static_pad(depay, "sink");
+    gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, sm_count_probe, &g_v.st_depay_in, NULL);
+    gst_object_unref(p);
     p = gst_element_get_static_pad(depay, "src");
     gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, sm_count_probe, &g_v.st_depay, NULL);
     gst_object_unref(p);
@@ -963,6 +1003,7 @@ static gboolean sm_video_rx_build(GstElement *pipeline)
     gst_object_unref(p);
     g_v.rx_src = src;
     g_v.rx_shm = shm;
+    g_v.rx_jb = jb;
     g_message("signal_media: video receive branch up (%s)", decname);
     return TRUE;
 }
@@ -1298,6 +1339,7 @@ static void sm_video_reset(void)
     g_v.have_call_id = keep.have_call_id;
     g_v.peer_rot = -1;
     g_v.peer_video = -1;
+    g_v.st_last_seq = -1;
     g_mutex_lock(&g_tcc_lock);
     sv_tcc_init(&g_tcc);
     g_tcc_t0 = g_get_monotonic_time();
@@ -1815,6 +1857,7 @@ void signal_media_stop(void)
      * the pipeline's and go with it below. */
     g_v.rx_src = NULL;
     g_v.rx_shm = NULL;
+    g_v.rx_jb = NULL;
     g_v.tx_enc = NULL;
     g_tx_vqueue = NULL;
     g_tx_head = NULL;
