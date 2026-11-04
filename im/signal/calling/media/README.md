@@ -60,17 +60,59 @@ and `webcall` onto its input. purple-presage reports the call to audiod itself w
 and `{"lines":[]}` when it ends; audiod then picks the device (the earpiece first). The engine does
 not choose a scenario.
 
+### Video
+
+RingRTC (v2.73.0, webrtc 8037a) never sends an SDP: each side rebuilds it from the other's
+`ConnectionParametersV4`. Ours lists only VP8, so the peer uses its legacy layout: one bundled
+video m-line, VP8 on PT 108, fixed SSRCs (caller 1003, callee 2003), the orientation extension
+(urn:3gpp:video-orientation) on id 4. `signal_video.c` holds the byte-level parts (RTP extensions,
+the CVO byte, PLI/FIR, RingRTC's rtp-data protobuf) and is tested by `tests/test_signal_video.c`.
+
+```
+RX: srtpdec ─ split by PT ─ Opus → the audio branch above
+                          ├ VP8 (and its CVO → PEERROT) → appsrc ─ rtpjitterbuffer ─ rtpvp8depay ─ avdec_vp8 ─ I420 640x480 ─ shmsink /tmp/signal-video
+                          └ rtp-data SenderStatus → PEERVIDEO
+    srtpdec rtcp_src: PLI/FIR for our SSRC → force a keyframe on our encoder
+
+TX: camera (droidcamsrc vfsrc) ─ I420 640x480@15 ─ tee ─ [persistent tail] queue ─ vp8enc ─ rtpvp8pay(PT 108) ─ CVO ─ srtpenc ─ funnel
+                                                    └ 320x240 ─ shmsink /tmp/signal-preview (self-view)
+```
+
+- The decoded picture goes out on a gst-shm socket as I420, the same contract as the WhatsApp
+  engine, so the Phone app's `RemoteVideo` reads it unchanged.
+- The send tail (encoder, payloader, srtpenc) is built once per call and kept; only the camera part
+  comes and goes. RTP sequence numbers and the SRTP index then never restart under one key, which
+  AES-GCM requires.
+- No video is sent before the call is answered. The callee's `Accepted` and our
+  `SenderStatus.video_enabled` go out together in the rtp-data message twice a second.
+- When a frame is lost the depayloader asks for a keyframe, and the engine sends a PLI to the far
+  side (at most one every 0.5 s).
+- Elements can be overridden for bring-up: `SIGNAL_MEDIA_VP8_DEC`, `SIGNAL_MEDIA_VP8_ENC`,
+  `SIGNAL_MEDIA_VIDEO_SRC` (+ `SIGNAL_MEDIA_VIDEO_MIRROR`), `SIGNAL_MEDIA_VIDEO_ROTATION`,
+  `SIGNAL_MEDIA_VIDEO_SHM`, `SIGNAL_MEDIA_PREVIEW_SHM`; `SIGNAL_MEDIA_VIDEO=0` turns receiving off.
+- The image needs a VP8 encoder (`vp8enc`, from gstreamer1.0-plugins-good with PACKAGECONFIG
+  `vpx`) to send; without one the engine reports `VIDEOERR tx-encoder` and the call stays
+  receive-only.
+
 ## Protocol
 
 See the comment above `run_ipc()` in `signal_media.c`: `PREPARE`, `RELAY`, `START`, `RCAND`,
-`ACCEPT` and `STOP` in; `PUB`, `CAND`, `AUDIOD`, `READY` and `ERR` out. Keys are hex.
+`ACCEPT`, `CALLID`, `VIDEO` and `STOP` in; `PUB`, `CAND`, `AUDIOD`, `READY`, `ERR` and the video
+lines (`VSHM`, `VPREVIEW`, `VTX`, `PEERVIDEO`, `PEERROT`, `VIDEOERR`, see `signal_media.h`) out.
+Keys are hex.
 
 ## Build and self-test
 
 ```sh
 make                 # needs pkg-config for gstreamer-1.0, gstreamer-app-1.0, nice, libsrtp2, libcrypto, speexdsp
-make check           # signal_media --loopback
+make check           # tests/test_signal_video, then signal_media --loopback
 ```
+
+`tests/test_video_pipeline.c` builds against the engine source (it `#include`s `signal_media.c`)
+and runs the video branches in-process: a VP8 stream from an IVF file (`SIGNAL_TEST_IVF`), SRTP
+encrypted and decrypted, through the RX split to the shm socket; the rtp-data message and PLI as
+the far side decrypts them; the send gate and CVO; and the camera turned on and off twice (with
+`videotestsrc`). It needs ivfparse, rtpvp8pay/depay, avdec_vp8 and shmsrc/shmsink.
 
 The loopback self-test round-trips a test tone in-process, with no ICE and no audio devices:
 

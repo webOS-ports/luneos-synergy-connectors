@@ -63,6 +63,30 @@ int signal_media_start(const unsigned char local_priv[32],
  * IceUpdate opaque). Safe to call repeatedly as candidates trickle in. Returns 0 on success. */
 int signal_media_add_remote_candidate(const char *sdp_candidate);
 
+/* The user answered an incoming call (RingRTC call id): open the microphone and send RingRTC's
+ * Accepted. */
+void signal_media_accept(unsigned long long call_id);
+
+/* Video events, one line each, without a newline (called on engine threads; keep it short):
+ *   VSHM <path> <w> <h>               the far side's decoded picture is on this gst-shm socket (I420)
+ *   VPREVIEW <path> <w> <h> <q> <m>   our camera's picture; q quarter turns counter-clockwise to show
+ *                                     it upright, m 1 if it is to be shown mirrored
+ *   VTX <0|1>                         our camera is sending / stopped
+ *   PEERVIDEO <0|1>                   the far side says its camera is on / off (RingRTC SenderStatus)
+ *   PEERROT <q>                       the far side's picture needs q quarter turns counter-clockwise
+ *   VIDEOERR <what>                   rx-elements, rx-link, tx-encoder, tx-elements, tx-link, tx-camera
+ * Set before signal_media_start. */
+typedef void (*signal_media_event_cb)(const char *line, void *user);
+void signal_media_set_event_cb(signal_media_event_cb cb, void *user);
+
+/* The user turned our camera on (1) or off (0). May come before signal_media_start (an outgoing
+ * video call); for an incoming call the camera only starts once the user answered. */
+void signal_media_set_video(int on);
+
+/* The RingRTC call id, for the SenderStatus we send. An incoming call has it from
+ * signal_media_accept; an outgoing call needs this. Only the first value counts. */
+void signal_media_set_call_id(unsigned long long call_id);
+
 /* Tear the call down: stop the pipeline, free the ICE agent, fire audiod_cb(0), join the thread. */
 void signal_media_stop(void);
 

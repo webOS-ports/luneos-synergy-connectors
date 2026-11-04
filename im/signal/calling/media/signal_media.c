@@ -28,11 +28,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <errno.h>
 #include <speex/speex_echo.h>        /* SpeexDSP acoustic echo canceller */
 #include <speex/speex_preprocess.h>  /* residual-echo suppression + denoise */
 
 #include "srtp_kdf.h"
 #include "signal_media.h"
+#include "signal_video.h"
 
 /* ------------------------------------------------------------------ tunables / constants ------- */
 
@@ -96,6 +98,81 @@ static GstPadProbeReturn sm_tx_gate_probe(GstPad *pad, GstPadProbeInfo *info, gp
 }
 
 static gboolean g_accepted;     /* defined with the rtp-data channel below */
+
+/* --- Video ------------------------------------------------------------------------------------
+ * A 1:1 Signal call carries VP8 next to the audio, on the same ICE component and SRTP keys (see
+ * signal_video.h for what RingRTC puts on the wire). Received VP8 is split off after srtpdec,
+ * decoded and published as I420 frames on a gst-shm socket for the Phone app (RemoteVideo.qml,
+ * the same contract luneos-rtc-engine has for WhatsApp). Our camera, while the user has it on,
+ * is encoded to VP8 and joins the audio's funnel to the nicesink; its picture also goes to a
+ * second shm socket for the Phone app's self-view. Video events go to the event callback
+ * (signal_media_set_event_cb) as lines for purple-presage. */
+#define SM_VIDEO_W          640
+#define SM_VIDEO_H          480
+#define SM_PREVIEW_W        320
+#define SM_PREVIEW_H        240
+#define SM_VIDEO_FPS        15
+#define SM_VIDEO_BITRATE    600000
+#define SM_VIDEO_SHM        "/tmp/signal-video"     /* device-side sockets: the Phone app opens them */
+#define SM_PREVIEW_SHM      "/tmp/signal-preview"
+#define SM_SHM_SIZE         (8u << 20)
+#define SM_PLI_INTERVAL_US  500000                  /* at most two keyframe requests a second */
+
+typedef struct {
+    GstElement *rx_src;         /* appsrc the split probe feeds received VP8 RTP into */
+    GstElement *rx_shm;         /* its shmsink */
+    gint        rx_announced;   /* atomic: VSHM sent */
+    GstElement *tx_enc;         /* the VP8 encoder in the persistent send tail */
+    gint        tx_announced;   /* atomic: VPREVIEW sent */
+    gboolean    tx_wanted;      /* VIDEO 1: the user has the camera on */
+    gint        tx_cvo;         /* atomic: our CVO byte */
+    gboolean    tx_mirrored;    /* front camera: the self-view is shown mirrored */
+    gint        status_known;   /* atomic: send SenderStatus (video was asked for at least once) */
+    gint        status_video;   /* atomic: SenderStatus.video_enabled we send */
+    gint        peer_rot;       /* atomic: last PEERROT reported, -1 none */
+    gint        peer_video;     /* atomic: last PEERVIDEO reported, -1 none */
+    gint        pli_wanted;     /* atomic: our decoder wants a keyframe from the far side */
+    gint64      last_pli_us;    /* sender thread only */
+    guint64     call_id;        /* RingRTC call id for SenderStatus (CALLID, or ACCEPT's) */
+    gint        have_call_id;   /* atomic */
+} SmVideo;
+
+static SmVideo g_v;
+
+static signal_media_event_cb g_event_cb;
+static void                 *g_event_user;
+
+void signal_media_set_event_cb(signal_media_event_cb cb, void *user)
+{
+    g_event_cb = cb;
+    g_event_user = user;
+}
+
+static void sm_event(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+static void sm_event(const char *fmt, ...)
+{
+    if (!g_event_cb)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    gchar *line = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    g_event_cb(line, g_event_user);
+    g_free(line);
+}
+
+/* Run fn on the media thread (the thread that runs g_sm.ctx), through one idle source attached
+ * to that context: g_main_context_invoke() would run it on the calling thread whenever nobody
+ * owns the context yet. */
+static void sm_on_media_thread(GSourceFunc fn, gpointer data)
+{
+    if (!g_sm.ctx)
+        return;
+    GSource *s = g_idle_source_new();
+    g_source_set_callback(s, fn, data, NULL);
+    g_source_attach(s, g_sm.ctx);
+    g_source_unref(s);
+}
 
 /* Mic gate: as the answerer the engine starts when the offer arrives, so ICE is ready by the time the
  * user answers. The pulsesrc only joins the pipeline when they do (sm_open_mic), so nothing records
@@ -221,7 +298,8 @@ static GstPadProbeReturn sm_tx_aec_probe(GstPad *pad, GstPadProbeInfo *info, gpo
  * eventually deadlocks libnice 0.1.21's agent mutex, freezing audio + STUN; a funnel-merge into the
  * audio nicesink broke caps negotiation and killed all TX). Two nicesinks on one component each send
  * from their own thread and libnice serializes internally. signal_media_accept() (from the ACCEPT
- * stdin cmd = the user tapped Answer) turns it on. */
+ * stdin cmd = the user tapped Answer) turns it on; the sender thread below sends it, and the
+ * video's SenderStatus and keyframe requests. */
 #define RTP_DATA_PT       101
 #define RTP_DATA_SSRC     0x0000000DU
 static srtp_t      g_data_srtp    = NULL;  /* TX SRTP session for the data SSRC (our TX key) */
@@ -229,20 +307,13 @@ static gboolean    g_srtp_inited  = FALSE;
 static GstElement *g_datasrc      = NULL;  /* appsrc -> 2nd nicesink (that nicesink does the actual send) */
 static guint64     g_accept_id    = 0;     /* RingRTC call_id -> Accepted.id */
 static gboolean    g_accepted     = FALSE; /* user accepted -> keep resending; also opens the mic gate */
-static GThread    *g_accept_thread= NULL;  /* dedicated resend thread (NOT g_sm.ctx - see below) */
 static guint16     g_data_seq     = 0;     /* RTP seq for the data stream */
 static guint32     g_data_ts      = 0;     /* RTP timestamp for the data stream */
 
-/* minimal LEB128 varint writer (proto wire type 0) */
-static int sm_varint(guint8 *out, guint64 v)
-{
-    int i = 0;
-    do { guint8 b = v & 0x7f; v >>= 7; if (v) b |= 0x80; out[i++] = b; } while (v);
-    return i;
-}
-
-/* Lazily create the TX SRTP session for the data SSRC, keyed with OUR TX master (answerer=answer_key,
- * caller=offer_key) - the same key the audio srtpenc uses; different SSRC, so no keystream reuse. */
+/* Lazily create the TX SRTP session, keyed with OUR TX master (answerer=answer_key, caller=offer_key),
+ * the same key the audio srtpenc uses. Two streams: RTP for the data SSRC, and RTCP for our video
+ * SSRC (the keyframe requests we send). Neither SSRC/direction is protected anywhere else - srtpenc
+ * protects RTP only, and never for 0xD - so no keystream is used twice. */
 static gboolean sm_data_srtp_init(void)
 {
     if (g_data_srtp) return TRUE;
@@ -259,65 +330,119 @@ static gboolean sm_data_srtp_init(void)
     const unsigned char *s = g_sm.is_caller ? g_sm.keys.offer_salt : g_sm.keys.answer_salt;
     memcpy(master,                       k, SIGNAL_SRTP_KEY_SIZE);
     memcpy(master + SIGNAL_SRTP_KEY_SIZE, s, SIGNAL_SRTP_SALT_SIZE);
-    srtp_policy_t policy;
-    memset(&policy, 0, sizeof policy);
-    srtp_crypto_policy_set_aes_gcm_256_16_auth(&policy.rtp);
-    srtp_crypto_policy_set_aes_gcm_256_16_auth(&policy.rtcp);
-    policy.ssrc.type  = ssrc_specific;
-    policy.ssrc.value = RTP_DATA_SSRC;
-    policy.key        = master;
-    policy.next       = NULL;
-    if (srtp_create(&g_data_srtp, &policy) != srtp_err_status_ok) {
+    srtp_policy_t policy[2];
+    memset(policy, 0, sizeof policy);
+    for (int i = 0; i < 2; i++) {
+        srtp_crypto_policy_set_aes_gcm_256_16_auth(&policy[i].rtp);
+        srtp_crypto_policy_set_aes_gcm_256_16_auth(&policy[i].rtcp);
+        policy[i].ssrc.type = ssrc_specific;
+        policy[i].key       = master;
+    }
+    policy[0].ssrc.value = RTP_DATA_SSRC;
+    policy[1].ssrc.value = sv_video_ssrc(g_sm.is_caller);
+    policy[0].next = &policy[1];
+    srtp_err_status_t st = srtp_create(&g_data_srtp, &policy[0]);
+    memset(master, 0, sizeof master);
+    if (st != srtp_err_status_ok) {
         g_message("signal_media: srtp_create(data) failed"); g_data_srtp = NULL; return FALSE;
     }
     return TRUE;
 }
 
-/* Build one rtp_data.Message{ accepted{id=call_id}, seqnum }, SRTP-encrypt it, send it out the nice
- * component. Runs only on the media thread. */
-static void sm_push_accepted(void)
+/* Hand SRTP/SRTCP-protected bytes to the data appsrc, whose funnel/queue/nicesink sends them on the
+ * queue's single thread - never us - so no agent-mutex deadlock. */
+static void sm_push_protected(const guint8 *pkt, int len, const char *what)
 {
-    if (!g_accepted || !g_datasrc || !sm_data_srtp_init()) return;
-    /* proto: Accepted{ id(1,varint) } */
-    guint8 acc[16]; int an = 0;
-    acc[an++] = 0x08; an += sm_varint(acc + an, g_accept_id);
-    /* proto: Message{ accepted(1,LEN), seqnum(4,varint) } */
-    guint8 body[48]; int bn = 0;
-    body[bn++] = 0x0A; body[bn++] = (guint8)an; memcpy(body + bn, acc, an); bn += an;
-    static guint64 seqnum = 0; seqnum++;
-    body[bn++] = 0x20; bn += sm_varint(body + bn, seqnum);
+    GstBuffer *buf = gst_buffer_new_allocate(NULL, (gsize)len, NULL);
+    gst_buffer_fill(buf, 0, pkt, (gsize)len);
+    GstFlowReturn fr = gst_app_src_push_buffer(GST_APP_SRC(g_datasrc), buf);  /* takes ownership */
+    if (fr != GST_FLOW_OK)
+        g_message("signal_media: could not queue the %s: %s", what, gst_flow_get_name(fr));
+}
+
+/* Build our rtp_data.Message - accepted{id} once the user answered here (only the callee may send
+ * it: RingRTC treats an Accepted from the caller as an error), senderStatus{id, video_enabled} once
+ * video was asked for - SRTP-encrypt it and send it. Runs only on the sender thread. */
+static void sm_push_data_message(void)
+{
+    if (!g_datasrc || !sm_data_srtp_init()) return;
+    SvDataMsg m;
+    sv_data_msg_init(&m);
+    if (g_accepted && !g_sm.is_caller) {
+        m.has_accepted = 1;
+        m.accepted_id = g_accept_id;
+    }
+    if (g_atomic_int_get(&g_v.status_known) && g_atomic_int_get(&g_v.have_call_id)) {
+        m.has_status = 1;
+        m.status_id = g_v.call_id;
+        m.video_enabled = g_atomic_int_get(&g_v.status_video) ? 1 : 0;
+    }
+    if (!m.has_accepted && !m.has_status) return;
+    static guint64 seqnum = 0;
+    m.has_seqnum = 1;
+    m.seqnum = ++seqnum;
     /* 12-byte RTP header + payload, with slack for the GCM tag srtp_protect appends in place */
-    guint8 pkt[12 + 48 + SRTP_MAX_TRAILER_LEN];
+    guint8 pkt[12 + 64 + SRTP_MAX_TRAILER_LEN];
+    size_t bn = sv_data_msg_encode(&m, pkt + 12, 64);
+    if (bn == 0) return;
     pkt[0] = 0x80; pkt[1] = RTP_DATA_PT;
     g_data_seq++; pkt[2] = (guint8)(g_data_seq >> 8); pkt[3] = (guint8)g_data_seq;
     g_data_ts++;  pkt[4] = (guint8)(g_data_ts >> 24); pkt[5] = (guint8)(g_data_ts >> 16);
                   pkt[6] = (guint8)(g_data_ts >> 8);  pkt[7] = (guint8)g_data_ts;
     pkt[8] = 0; pkt[9] = 0; pkt[10] = 0; pkt[11] = 0x0D;   /* SSRC = 0x0000000D */
-    memcpy(pkt + 12, body, bn);
-    int len = 12 + bn;
+    int len = 12 + (int)bn;
     srtp_err_status_t st = srtp_protect(g_data_srtp, pkt, &len);
     if (st != srtp_err_status_ok) { g_message("signal_media: srtp_protect(data) failed %d", (int)st); return; }
-    /* Hand the SRTP-encrypted bytes to the 2nd nicesink via its appsrc. That nicesink calls
-     * nice_agent_send on its OWN streaming thread - never us - so no agent-mutex deadlock. */
-    GstBuffer *buf = gst_buffer_new_allocate(NULL, len, NULL);
-    gst_buffer_fill(buf, 0, pkt, (gsize)len);
-    GstFlowReturn fr = gst_app_src_push_buffer(GST_APP_SRC(g_datasrc), buf);  /* takes ownership */
-    if (fr != GST_FLOW_OK)
-        g_message("signal_media: could not queue the rtp-data Accepted: %s", gst_flow_get_name(fr));
+    sm_push_protected(pkt, len, "rtp-data message");
 }
 
-/* Dedicated resend thread. CRITICAL: nice_agent_send() must NOT be called from the agent's own
- * GMainContext (g_sm.ctx) - doing so self-deadlocks on the agent mutex in libnice 0.1.21, which froze
- * BOTH the media thread (no more STUN consent responses) AND nicesink's audio (also nice_agent_send),
- * so the peer saw us go silent and hung up ~2-5s in. Sending from a separate thread is exactly what
- * gstnicesink does from its streaming thread, and is safe. This thread also owns g_data_srtp, so
- * srtp_protect is never hit concurrently. */
-static gpointer accept_thread_fn(gpointer u)
+/* Ask the far side for a VP8 keyframe: an SRTCP PLI from our video SSRC about theirs. WebRTC
+ * sends keyframes only on request, so after loss this is the only way the picture recovers. Runs
+ * only on the sender thread. */
+static void sm_push_pli(void)
+{
+    if (!g_datasrc || !sm_data_srtp_init()) return;
+    guint8 pkt[12 + SRTP_MAX_SRTCP_TRAILER_LEN];
+    sv_rtcp_build_pli(sv_video_ssrc(g_sm.is_caller), sv_peer_video_ssrc(g_sm.is_caller), pkt);
+    int len = 12;
+    srtp_err_status_t st = srtp_protect_rtcp(g_data_srtp, pkt, &len);
+    if (st != srtp_err_status_ok) { g_message("signal_media: srtp_protect_rtcp(pli) failed %d", (int)st); return; }
+    sm_push_protected(pkt, len, "keyframe request");
+}
+
+/* Dedicated sender thread, for the whole call. CRITICAL: nice_agent_send() must NOT be called from
+ * the agent's own GMainContext (g_sm.ctx) - doing so self-deadlocks on the agent mutex in libnice
+ * 0.1.21, which froze BOTH the media thread (no more STUN consent responses) AND nicesink's audio
+ * (also nice_agent_send), so the peer saw us go silent and hung up ~2-5s in. This thread only pushes
+ * into the data appsrc. It also owns g_data_srtp, so srtp_protect is never hit concurrently. The
+ * rtp-data message goes out every 500 ms (RingRTC re-sends its own every second); a keyframe
+ * request as soon as one is wanted, at most every SM_PLI_INTERVAL_US. Nothing is sent until there
+ * is something to say: before the user answers an incoming call, or in a voice call we placed,
+ * this sends nothing at all. */
+static gint     g_sender_run = 0;
+static GThread *g_sender_thread = NULL;
+
+/* TRUE if a keyframe request is wanted and the last one went out at least SM_PLI_INTERVAL_US
+ * before `now`; it is then taken. */
+static gboolean sm_pli_take(gint64 now)
+{
+    if (!g_atomic_int_get(&g_v.pli_wanted) || now - g_v.last_pli_us < SM_PLI_INTERVAL_US)
+        return FALSE;
+    g_atomic_int_set(&g_v.pli_wanted, 0);
+    g_v.last_pli_us = now;
+    return TRUE;
+}
+
+static gpointer sender_thread_fn(gpointer u)
 {
     (void)u;
-    while (g_accepted) {
-        sm_push_accepted();
-        g_usleep(500 * 1000);   /* ~1-2 Hz resend, like RingRTC */
+    guint tick = 0;
+    while (g_atomic_int_get(&g_sender_run)) {
+        if (tick++ % 5 == 0)
+            sm_push_data_message();
+        if (sm_pli_take(g_get_monotonic_time()))
+            sm_push_pli();
+        g_usleep(100000);
     }
     return NULL;
 }
@@ -340,14 +465,21 @@ static gboolean sm_open_mic(gpointer data)
 
 /* The user tapped Answer (ACCEPT stdin cmd): open the microphone and start emitting the RingRTC
  * Accepted so the caller's phone stops ringing and both sides ungate audio. Idempotent. */
-void signal_media_accept(guint64 call_id)
+static gboolean sm_video_tx_start(gpointer data);
+
+void signal_media_accept(unsigned long long call_id)
 {
     g_accept_id = call_id;
     if (g_accepted) return;         /* already emitting */
+    if (!g_atomic_int_get(&g_v.have_call_id)) {
+        g_v.call_id = call_id;
+        g_atomic_int_set(&g_v.have_call_id, 1);
+    }
     g_accepted = TRUE;
     if (g_sm.ctx) g_main_context_invoke(g_sm.ctx, sm_open_mic, &g_sm);
-    g_accept_thread = g_thread_new("sig-accept", accept_thread_fn, NULL);
-    g_message("signal_media: ACCEPT call_id=%" G_GUINT64_FORMAT " -> emitting rtp-data Accepted", call_id);
+    /* A camera the user turned on while it rang starts now, not before the answer. */
+    if (g_v.tx_wanted) sm_on_media_thread(sm_video_tx_start, NULL);
+    g_message("signal_media: ACCEPT call_id=%llu -> emitting rtp-data Accepted", call_id);
 }
 
 /* STUN/TURN relays for the nice agent, populated from RELAY lines (Signal's /v2/calling/relays,
@@ -423,8 +555,8 @@ static GstCaps *on_srtpdec_request_key(GstElement *dec, guint ssrc, gpointer use
                                         "srtcp-cipher", G_TYPE_STRING, SRTP_CIPHER_GCM256,
                                         "srtcp-auth",   G_TYPE_STRING, SRTP_AUTH_NULL,
                                         NULL);
-    /* gst_caps_set_simple takes ownership of neither the caps ref-count nor the buffer; ref buffer. */
-    gst_caps_set_simple(caps, "srtp-key", GST_TYPE_BUFFER, gst_buffer_ref(sm->rx_master), NULL);
+    /* gst_caps_set_simple takes its own reference to the buffer; ours stays with sm. */
+    gst_caps_set_simple(caps, "srtp-key", GST_TYPE_BUFFER, sm->rx_master, NULL);
     return caps;
 }
 
@@ -437,6 +569,593 @@ static GstCaps *opus_rtp_caps(void)
                                "encoding-name", G_TYPE_STRING, "OPUS",
                                "payload",       G_TYPE_INT,    SIGNAL_OPUS_PT,
                                NULL);
+}
+
+/* ------------------------------------------------------------------ video ---------------------- */
+
+/* Set a property from a string only where the element has it (versions differ). */
+static void sm_try_set(GstElement *e, const char *prop, const char *value)
+{
+    if (e && g_object_class_find_property(G_OBJECT_GET_CLASS(e), prop))
+        gst_util_set_object_arg(G_OBJECT(e), prop, value);
+}
+
+/* The element factory to use: $env if set, else the first of names that exists. */
+static const char *sm_pick_factory(const char *env, const char *const *names)
+{
+    const char *forced = g_getenv(env);
+    if (forced && *forced)
+        return forced;
+    for (int i = 0; names[i]; i++) {
+        GstElementFactory *f = gst_element_factory_find(names[i]);
+        if (f) {
+            gst_object_unref(f);
+            return names[i];
+        }
+    }
+    return NULL;
+}
+
+/* Free elements that were made but never added to a bin. */
+static void sm_drop_elements(GstElement **els, int n)
+{
+    for (int i = 0; i < n; i++)
+        if (els[i])
+            gst_object_unref(gst_object_ref_sink(els[i]));
+}
+
+/* One received packet that srtpdec decrypted: TRUE to keep it in the audio chain. VP8 goes to the
+ * video branch, the far side's rtp-data messages are read here, everything else (RTX, RED, FEC,
+ * which we never negotiate away) is dropped instead of reaching the Opus depayloader. Runs on the
+ * receive streaming thread. */
+static gboolean sm_rx_route(GstBuffer *buf)
+{
+    GstMapInfo m;
+    SvRtp r;
+    gboolean keep = FALSE;
+    if (!gst_buffer_map(buf, &m, GST_MAP_READ))
+        return FALSE;
+    if (sv_rtp_parse(m.data, m.size, &r) != 0) {
+        gst_buffer_unmap(buf, &m);
+        return FALSE;
+    }
+    if (r.pt == SV_PT_OPUS) {
+        keep = TRUE;
+    } else if (r.pt == SV_PT_VP8) {
+        const guint8 *cvo = NULL;
+        size_t cvo_len = 0;
+        if (sv_rtp_find_ext(m.data, m.size, &r, SV_EXT_CVO, &cvo, &cvo_len) == 0 && cvo_len >= 1) {
+            gint q = sv_cvo_to_phone_quarter_turns(cvo[0]);
+            if (g_atomic_int_get(&g_v.peer_rot) != q) {
+                g_atomic_int_set(&g_v.peer_rot, q);
+                sm_event("PEERROT %d", q);
+            }
+        }
+        if (g_v.rx_src)
+            gst_app_src_push_buffer(GST_APP_SRC(g_v.rx_src), gst_buffer_ref(buf));
+    } else if (r.pt == SV_PT_DATA && r.ssrc == SV_SSRC_DATA) {
+        size_t plen = m.size - r.header_len;
+        if ((m.data[0] & 0x20) && plen > 0)           /* padding: its count is the last byte */
+            plen = m.data[m.size - 1] <= plen ? plen - m.data[m.size - 1] : 0;
+        SvDataMsg dm;
+        if (sv_data_msg_decode(m.data + r.header_len, plen, &dm) == 0 && dm.has_status &&
+            dm.video_enabled >= 0 && g_atomic_int_get(&g_v.peer_video) != dm.video_enabled) {
+            g_atomic_int_set(&g_v.peer_video, dm.video_enabled);
+            sm_event("PEERVIDEO %d", dm.video_enabled);
+        }
+    }
+    gst_buffer_unmap(buf, &m);
+    return keep;
+}
+
+/* On srtpdec's rtp_src: route every decrypted packet (nicesrc pushes buffer lists too). */
+static GstPadProbeReturn sm_rx_split_probe(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+{
+    (void)pad; (void)u;
+    if (info->type & GST_PAD_PROBE_TYPE_BUFFER)
+        return sm_rx_route(GST_PAD_PROBE_INFO_BUFFER(info)) ? GST_PAD_PROBE_OK : GST_PAD_PROBE_DROP;
+    if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+        GstBufferList *list = GST_PAD_PROBE_INFO_BUFFER_LIST(info);
+        GstBufferList *keep = gst_buffer_list_new();
+        guint n = gst_buffer_list_length(list);
+        for (guint i = 0; i < n; i++) {
+            GstBuffer *b = gst_buffer_list_get(list, i);
+            if (sm_rx_route(b))
+                gst_buffer_list_add(keep, gst_buffer_ref(b));
+        }
+        if (gst_buffer_list_length(keep) == 0) {
+            gst_buffer_list_unref(keep);
+            return GST_PAD_PROBE_DROP;
+        }
+        gst_buffer_list_unref(list);
+        GST_PAD_PROBE_INFO_DATA(info) = keep;
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+/* Ask our encoder for a keyframe (the far side sent a PLI or FIR). */
+static void sm_video_force_keyframe(void)
+{
+    GstElement *enc = g_v.tx_enc;
+    if (!enc)
+        return;
+    GstPad *src = gst_element_get_static_pad(enc, "src");
+    if (src) {
+        GstStructure *st = gst_structure_new("GstForceKeyUnit", "all-headers", G_TYPE_BOOLEAN, TRUE, NULL);
+        gst_pad_send_event(src, gst_event_new_custom(GST_EVENT_CUSTOM_UPSTREAM, st));
+        gst_object_unref(src);
+    }
+}
+
+static void sm_rx_rtcp_buffer(GstBuffer *buf)
+{
+    GstMapInfo m;
+    if (!gst_buffer_map(buf, &m, GST_MAP_READ))
+        return;
+    if (sv_rtcp_wants_keyframe(m.data, m.size, sv_video_ssrc(g_sm.is_caller)) == 1)
+        sm_video_force_keyframe();
+    gst_buffer_unmap(buf, &m);
+}
+
+/* On srtpdec's rtcp_src: the far side's RTCP, read for keyframe requests, then drained. */
+static GstPadProbeReturn sm_rx_rtcp_probe(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+{
+    (void)pad; (void)u;
+    if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
+        sm_rx_rtcp_buffer(GST_PAD_PROBE_INFO_BUFFER(info));
+    } else if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+        GstBufferList *list = GST_PAD_PROBE_INFO_BUFFER_LIST(info);
+        guint n = gst_buffer_list_length(list);
+        for (guint i = 0; i < n; i++)
+            sm_rx_rtcp_buffer(gst_buffer_list_get(list, i));
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+/* rtpvp8depay asks upstream for a keyframe (GstForceKeyUnit) when it lost data: send a PLI. */
+static GstPadProbeReturn sm_rx_keyframe_probe(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+{
+    (void)pad; (void)u;
+    GstEvent *ev = GST_PAD_PROBE_INFO_EVENT(info);
+    if (ev && GST_EVENT_TYPE(ev) == GST_EVENT_CUSTOM_UPSTREAM && gst_event_has_name(ev, "GstForceKeyUnit"))
+        g_atomic_int_set(&g_v.pli_wanted, 1);
+    return GST_PAD_PROBE_OK;
+}
+
+/* The first decoded frame on its way to the Phone app's socket: say where it is. */
+static GstPadProbeReturn sm_rx_first_frame_probe(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+{
+    (void)info; (void)u;
+    if (g_atomic_int_compare_and_exchange(&g_v.rx_announced, 0, 1)) {
+        GstElement *shm = gst_pad_get_parent_element(pad);
+        gchar *path = NULL;
+        if (shm) {
+            g_object_get(shm, "socket-path", &path, NULL);
+            gst_object_unref(shm);
+        }
+        sm_event("VSHM %s %d %d", path ? path : SM_VIDEO_SHM, SM_VIDEO_W, SM_VIDEO_H);
+        g_free(path);
+    }
+    return GST_PAD_PROBE_REMOVE;
+}
+
+/* A shmsink the Phone app reads, which must never hold the pipeline up: a reader that keeps its
+ * buffers fills the shm area, and a blocking shmsink would then stall everything upstream (the
+ * freeze seen with WhatsApp's second reader). Frames are dropped in the leaky queue before it. */
+static void sm_configure_shm(GstElement *queue, GstElement *shm, const char *path)
+{
+    g_object_set(queue, "leaky", 2 /* downstream */, "max-size-buffers", 2, "max-size-time", (guint64)0,
+                 "max-size-bytes", 0, NULL);
+    g_object_set(shm, "socket-path", path, "shm-size", (guint)SM_SHM_SIZE, "wait-for-connection", FALSE,
+                 "sync", FALSE, "async", FALSE, NULL);
+}
+
+/* The shm socket paths; SIGNAL_MEDIA_VIDEO_SHM / SIGNAL_MEDIA_PREVIEW_SHM override them (tests). */
+static const char *sm_shm_path(const char *env, const char *dflt)
+{
+    const char *p = g_getenv(env);
+    return p && *p ? p : dflt;
+}
+
+static GstCaps *sm_i420_caps(int w, int h, int fps)
+{
+    GstCaps *c = gst_caps_new_simple("video/x-raw",
+                                     "format", G_TYPE_STRING, "I420",
+                                     "width", G_TYPE_INT, w,
+                                     "height", G_TYPE_INT, h,
+                                     "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1, NULL);
+    if (fps > 0)
+        gst_caps_set_simple(c, "framerate", GST_TYPE_FRACTION, fps, 1, NULL);
+    return c;
+}
+
+/* Receive branch: appsrc (VP8 RTP from sm_rx_route) -> rtpjitterbuffer -> rtpvp8depay -> VP8
+ * decoder -> I420 640x480, letterboxed -> leaky queue -> shmsink. Built with the call; nothing
+ * runs until the far side sends video. Without one of its elements the call stays voice only. */
+static gboolean sm_video_rx_build(GstElement *pipeline)
+{
+    if (g_strcmp0(g_getenv("SIGNAL_MEDIA_VIDEO"), "0") == 0)
+        return FALSE;
+    static const char *const decoders[] = { "avdec_vp8", "vp8dec", "droidvdec", NULL };
+    const char *decname = sm_pick_factory("SIGNAL_MEDIA_VP8_DEC", decoders);
+    GstElement *e[9] = {
+        mk("appsrc", "rxv-src"), mk("rtpjitterbuffer", "rxv-jitterbuf"), mk("rtpvp8depay", "rxv-depay"),
+        decname ? mk(decname, "rxv-dec") : NULL, mk("videoconvert", "rxv-conv"),
+        mk("videoscale", "rxv-scale"), mk("capsfilter", "rxv-caps"), mk("queue", "rxv-queue"),
+        mk("shmsink", "rxv-shm"),
+    };
+    for (int i = 0; i < 9; i++) {
+        if (!e[i]) {
+            sm_drop_elements(e, 9);
+            sm_event("VIDEOERR rx-elements");
+            return FALSE;
+        }
+    }
+    GstElement *src = e[0], *jb = e[1], *depay = e[2], *caps = e[6], *q = e[7], *shm = e[8];
+
+    GstCaps *rc = gst_caps_new_simple("application/x-rtp",
+                                      "media", G_TYPE_STRING, "video",
+                                      "clock-rate", G_TYPE_INT, SV_VIDEO_CLOCK,
+                                      "encoding-name", G_TYPE_STRING, "VP8",
+                                      "payload", G_TYPE_INT, SV_PT_VP8, NULL);
+    g_object_set(src, "caps", rc, "is-live", TRUE, "format", GST_FORMAT_TIME, "do-timestamp", TRUE,
+                 "block", FALSE, "max-bytes", (guint64)(2u << 20), NULL);
+    gst_caps_unref(rc);
+    sm_try_set(src, "leaky-type", "downstream");
+    g_object_set(jb, "latency", 200, "do-lost", TRUE, NULL);
+    sm_try_set(depay, "request-keyframe", "true");
+    sm_try_set(depay, "wait-for-keyframe", "true");
+    GstCaps *vc = sm_i420_caps(SM_VIDEO_W, SM_VIDEO_H, 0);
+    g_object_set(caps, "caps", vc, NULL);
+    gst_caps_unref(vc);
+    sm_configure_shm(q, shm, sm_shm_path("SIGNAL_MEDIA_VIDEO_SHM", SM_VIDEO_SHM));
+
+    gst_bin_add_many(GST_BIN(pipeline), e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8], NULL);
+    if (!gst_element_link_many(e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8], NULL)) {
+        sm_event("VIDEOERR rx-link");
+        return FALSE;
+    }
+    GstPad *p = gst_element_get_static_pad(depay, "sink");
+    gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_EVENT_UPSTREAM, sm_rx_keyframe_probe, NULL, NULL);
+    gst_object_unref(p);
+    p = gst_element_get_static_pad(shm, "sink");
+    gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, sm_rx_first_frame_probe, NULL, NULL);
+    gst_object_unref(p);
+    g_v.rx_src = src;
+    g_v.rx_shm = shm;
+    g_message("signal_media: video receive branch up (%s)", decname);
+    return TRUE;
+}
+
+/* Our VP8 packets, on rtpvp8pay's src pad. Nothing leaves before the user answered an incoming call
+ * (the camera does not even start before that; this is the second line). The last packet of each
+ * frame carries the orientation (CVO), where WebRTC's receiver reads it. */
+static GstBuffer *sm_tx_add_cvo(GstBuffer *buf)
+{
+    GstMapInfo m;
+    if (!gst_buffer_map(buf, &m, GST_MAP_READ))
+        return buf;
+    if (m.size < 2 || !(m.data[1] & 0x80)) {
+        gst_buffer_unmap(buf, &m);
+        return buf;
+    }
+    guint8 cvo = (guint8)g_atomic_int_get(&g_v.tx_cvo);
+    gsize cap = m.size + 24;
+    GstBuffer *out = gst_buffer_new_allocate(NULL, cap, NULL);
+    GstMapInfo om;
+    size_t n = 0;
+    if (out && gst_buffer_map(out, &om, GST_MAP_WRITE)) {
+        n = sv_rtp_add_ext(m.data, m.size, SV_EXT_CVO, &cvo, 1, om.data, om.size);
+        gst_buffer_unmap(out, &om);
+    }
+    gst_buffer_unmap(buf, &m);
+    if (n == 0) {
+        if (out) gst_buffer_unref(out);
+        return buf;
+    }
+    gst_buffer_set_size(out, (gssize)n);
+    gst_buffer_copy_into(out, buf, GST_BUFFER_COPY_METADATA, 0, (gsize)-1);
+    gst_buffer_unref(buf);
+    return out;
+}
+
+static gboolean sm_tx_video_allowed(void)
+{
+    return g_sm.is_caller || g_accepted;
+}
+
+static GstPadProbeReturn sm_tx_video_probe(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+{
+    (void)pad; (void)u;
+    if (!sm_tx_video_allowed())
+        return GST_PAD_PROBE_DROP;
+    if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
+        GST_PAD_PROBE_INFO_DATA(info) = sm_tx_add_cvo(GST_PAD_PROBE_INFO_BUFFER(info));
+    } else if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+        GstBufferList *list = gst_buffer_list_make_writable(GST_PAD_PROBE_INFO_BUFFER_LIST(info));
+        guint n = gst_buffer_list_length(list);
+        for (guint i = 0; i < n; i++) {
+            GstBuffer *b = gst_buffer_list_get(list, i);
+            GstBuffer *nb = sm_tx_add_cvo(gst_buffer_ref(b));
+            if (nb != b) {
+                gst_buffer_list_remove(list, i, 1);
+                gst_buffer_list_insert(list, (gint)i, nb);
+            } else {
+                gst_buffer_unref(nb);
+            }
+        }
+        GST_PAD_PROBE_INFO_DATA(info) = list;
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+/* The persistent send tail: queue -> vp8enc -> rtpvp8pay (our fixed SSRC) -> srtpenc (our key) ->
+ * the audio's funnel. It lives as long as the call, so RTP sequence numbers and the SRTP index of
+ * our video SSRC only ever go forward: a fresh payloader and srtpenc for every camera start would
+ * restart them under the same key, i.e. reuse AES-GCM nonces. The camera part is added and removed
+ * in front of it (sm_video_tx_start/stop). Without vp8enc - the image does not build
+ * gstreamer1.0-plugins-good with vpx today - the call receives video but cannot send any. */
+static GstElement *g_tx_vqueue;   /* the tail's first element; a camera head links to its sink */
+
+static gboolean sm_video_tx_build(GstElement *pipeline, GstElement *funnel)
+{
+    if (g_strcmp0(g_getenv("SIGNAL_MEDIA_VIDEO"), "0") == 0)
+        return FALSE;
+    static const char *const encoders[] = { "vp8enc", NULL };
+    const char *encname = sm_pick_factory("SIGNAL_MEDIA_VP8_ENC", encoders);
+    GstElement *e[4] = {
+        mk("queue", "txv-queue"), encname ? mk(encname, "txv-enc") : NULL,
+        mk("rtpvp8pay", "txv-pay"), mk("srtpenc", "txv-srtpenc"),
+    };
+    for (int i = 0; i < 4; i++) {
+        if (!e[i]) {
+            sm_drop_elements(e, 4);
+            sm_event("VIDEOERR tx-encoder");
+            return FALSE;
+        }
+    }
+    GstElement *q = e[0], *enc = e[1], *pay = e[2], *senc = e[3];
+    g_object_set(q, "leaky", 2 /* downstream */, "max-size-buffers", 3, "max-size-time", (guint64)0,
+                 "max-size-bytes", 0, NULL);
+    /* Real time, constant rate, no look-ahead, keyframes only when asked for (as WebRTC does). */
+    sm_try_set(enc, "deadline", "1");
+    sm_try_set(enc, "cpu-used", "12");
+    sm_try_set(enc, "end-usage", "cbr");
+    sm_try_set(enc, "lag-in-frames", "0");
+    sm_try_set(enc, "keyframe-mode", "disabled");
+    sm_try_set(enc, "error-resilient", "default");
+    sm_try_set(enc, "threads", "2");
+    { gchar *br = g_strdup_printf("%d", SM_VIDEO_BITRATE); sm_try_set(enc, "target-bitrate", br); g_free(br); }
+    g_object_set(pay, "pt", SV_PT_VP8, "ssrc", sv_video_ssrc(g_sm.is_caller), "mtu", 1200, NULL);
+    sm_try_set(pay, "picture-id-mode", "15-bit");
+    GstBuffer *tx_master = g_sm.is_caller
+        ? master_key_buffer(g_sm.keys.offer_key,  g_sm.keys.offer_salt)
+        : master_key_buffer(g_sm.keys.answer_key, g_sm.keys.answer_salt);
+    configure_srtpenc(senc, tx_master);
+    gst_buffer_unref(tx_master);
+
+    gst_bin_add_many(GST_BIN(pipeline), q, enc, pay, senc, NULL);
+    if (!gst_element_link_many(q, enc, pay, senc, funnel, NULL)) {
+        sm_event("VIDEOERR tx-link");
+        return FALSE;
+    }
+    GstPad *p = gst_element_get_static_pad(pay, "src");
+    gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, sm_tx_video_probe, NULL, NULL);
+    gst_object_unref(p);
+    g_tx_vqueue = q;
+    g_v.tx_enc = enc;
+    return TRUE;
+}
+
+static GstElement *g_tx_head;     /* the camera part, while the camera is on */
+static GstElement *g_tx_cam;      /* the droidcamsrc in it, if any (for its sensor orientation) */
+
+/* The rotation we send: SIGNAL_MEDIA_VIDEO_ROTATION (quarter turns clockwise), else the camera's
+ * sensor orientation, as WebRTC's Android capturer reports a portrait phone's frames. */
+static gint sm_tx_rotation(void)
+{
+    const char *env = g_getenv("SIGNAL_MEDIA_VIDEO_ROTATION");
+    if (env && *env)
+        return (gint)(g_ascii_strtoll(env, NULL, 10) & 3);
+    if (g_tx_cam && g_object_class_find_property(G_OBJECT_GET_CLASS(g_tx_cam), "sensor-orientation")) {
+        gint deg = 0;
+        g_object_get(g_tx_cam, "sensor-orientation", &deg, NULL);
+        return ((deg + 45) / 90) & 3;
+    }
+    return 0;
+}
+
+/* The first self-view frame: the camera runs, so its orientation is known; say where the picture is. */
+static GstPadProbeReturn sm_tx_first_frame_probe(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+{
+    (void)info; (void)u;
+    if (g_atomic_int_compare_and_exchange(&g_v.tx_announced, 0, 1)) {
+        gint rot = sm_tx_rotation();
+        g_atomic_int_set(&g_v.tx_cvo, sv_cvo_from_clockwise_quarter_turns(rot));
+        GstElement *shm = gst_pad_get_parent_element(pad);
+        gchar *path = NULL;
+        if (shm) {
+            g_object_get(shm, "socket-path", &path, NULL);
+            gst_object_unref(shm);
+        }
+        sm_event("VPREVIEW %s %d %d %d %d", path ? path : SM_PREVIEW_SHM, SM_PREVIEW_W, SM_PREVIEW_H,
+                 sv_cvo_to_phone_quarter_turns((guint8)rot), g_v.tx_mirrored ? 1 : 0);
+        g_free(path);
+    }
+    return GST_PAD_PROBE_REMOVE;
+}
+
+/* The camera source: SIGNAL_MEDIA_VIDEO_SRC (a gst-launch description), else the front camera of
+ * the droid stack's viewfinder (plain NV21; the recorder path WhatsApp uses only gives H.264),
+ * else the first V4L2 device. */
+static const char *sm_camera_description(gboolean *mirrored)
+{
+    const char *env = g_getenv("SIGNAL_MEDIA_VIDEO_SRC");
+    const char *mir = g_getenv("SIGNAL_MEDIA_VIDEO_MIRROR");
+    if (env && *env) {
+        *mirrored = g_strcmp0(mir, "1") == 0;
+        return env;
+    }
+    GstElementFactory *f = gst_element_factory_find("droidcamsrc");
+    if (f) {
+        gst_object_unref(f);
+        *mirrored = g_strcmp0(mir, "0") != 0;
+        return "droidcamsrc camera-device=1 name=sigcam sigcam.vfsrc ! video/x-raw,format=NV21 ! queue "
+               "sigcam.imgsrc ! fakesink sigcam.vidsrc ! fakesink";
+    }
+    f = gst_element_factory_find("v4l2src");
+    if (f) {
+        gst_object_unref(f);
+        *mirrored = g_strcmp0(mir, "1") == 0;
+        return "v4l2src ! queue";
+    }
+    return NULL;
+}
+
+/* Turn the camera on (media thread): camera -> I420 640x480 at 15 fps -> tee -> the send tail, and
+ * -> 320x240 -> the self-view socket. */
+static gboolean sm_video_tx_start(gpointer data)
+{
+    (void)data;
+    if (g_tx_head || !g_v.tx_wanted || !g_tx_vqueue || !g_sm.pipeline || !sm_tx_video_allowed())
+        return G_SOURCE_REMOVE;
+    gboolean mirrored = FALSE;
+    const char *desc = sm_camera_description(&mirrored);
+    if (!desc) {
+        sm_event("VIDEOERR tx-camera");
+        return G_SOURCE_REMOVE;
+    }
+    GError *err = NULL;
+    GstElement *cam = gst_parse_bin_from_description(desc, TRUE, &err);
+    if (!cam) {
+        g_printerr("signal_media: camera '%s': %s\n", desc, err ? err->message : "?");
+        g_clear_error(&err);
+        sm_event("VIDEOERR tx-camera");
+        return G_SOURCE_REMOVE;
+    }
+    g_clear_error(&err);
+    GstElement *e[9] = {
+        cam, mk("videoconvert", "txv-conv"), mk("videoscale", "txv-scale"), mk("videorate", "txv-rate"),
+        mk("capsfilter", "txv-caps"), mk("tee", "txv-tee"), mk("queue", "txv-pvqueue"),
+        mk("videoscale", "txv-pvscale"), mk("capsfilter", "txv-pvcaps"),
+    };
+    GstElement *pshm = mk("shmsink", "txv-pvshm");
+    GstElement *pq = mk("queue", "txv-pvleak");
+    for (int i = 0; i < 9; i++) {
+        if (!e[i] || !pshm || !pq) {
+            sm_drop_elements(e, 9);
+            GstElement *rest[2] = { pshm, pq };
+            sm_drop_elements(rest, 2);
+            sm_event("VIDEOERR tx-elements");
+            return G_SOURCE_REMOVE;
+        }
+    }
+    GstElement *head = gst_bin_new("txv-head");
+    GstCaps *c = sm_i420_caps(SM_VIDEO_W, SM_VIDEO_H, SM_VIDEO_FPS);
+    g_object_set(e[4], "caps", c, NULL);
+    gst_caps_unref(c);
+    c = sm_i420_caps(SM_PREVIEW_W, SM_PREVIEW_H, 0);
+    g_object_set(e[8], "caps", c, NULL);
+    gst_caps_unref(c);
+    g_object_set(e[6], "leaky", 2, "max-size-buffers", 2, "max-size-time", (guint64)0, "max-size-bytes", 0, NULL);
+    sm_configure_shm(pq, pshm, sm_shm_path("SIGNAL_MEDIA_PREVIEW_SHM", SM_PREVIEW_SHM));
+    sm_try_set(e[3], "drop-only", "true");
+    gst_bin_add_many(GST_BIN(head), e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8], pq, pshm, NULL);
+    gboolean ok = gst_element_link_many(e[0], e[1], e[2], e[3], e[4], e[5], NULL) &&
+                  gst_element_link_many(e[5], e[6], e[7], e[8], pq, pshm, NULL);
+    GstPad *teesrc = ok ? gst_element_request_pad_simple(e[5], "src_%u") : NULL;
+    GstPad *ghost = teesrc ? gst_ghost_pad_new("src", teesrc) : NULL;
+    if (teesrc) gst_object_unref(teesrc);
+    if (ghost) ok = gst_element_add_pad(head, ghost);
+    else ok = FALSE;
+    if (!ok) {
+        gst_object_unref(gst_object_ref_sink(head));
+        sm_event("VIDEOERR tx-link");
+        return G_SOURCE_REMOVE;
+    }
+    GstPad *p = gst_element_get_static_pad(pshm, "sink");
+    gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, sm_tx_first_frame_probe, NULL, NULL);
+    gst_object_unref(p);
+
+    g_v.tx_mirrored = mirrored;
+    g_atomic_int_set(&g_v.tx_announced, 0);
+    g_tx_cam = GST_IS_BIN(cam) ? gst_bin_get_by_name(GST_BIN(cam), "sigcam") : NULL;
+    gst_bin_add(GST_BIN(g_sm.pipeline), head);
+    GstPad *qsink = gst_element_get_static_pad(g_tx_vqueue, "sink");
+    GstPadLinkReturn lr = gst_pad_link(ghost, qsink);
+    gst_object_unref(qsink);
+    if (lr != GST_PAD_LINK_OK || !gst_element_sync_state_with_parent(head)) {
+        gst_element_set_state(head, GST_STATE_NULL);
+        gst_bin_remove(GST_BIN(g_sm.pipeline), head);
+        if (g_tx_cam) { gst_object_unref(g_tx_cam); g_tx_cam = NULL; }
+        sm_event("VIDEOERR tx-camera");
+        return G_SOURCE_REMOVE;
+    }
+    g_tx_head = head;
+    g_atomic_int_set(&g_v.status_video, 1);
+    g_atomic_int_set(&g_v.status_known, 1);
+    sm_event("VTX 1");
+    g_message("signal_media: camera on (%s)", desc);
+    return G_SOURCE_REMOVE;
+}
+
+/* Turn the camera off (media thread): the camera part leaves the pipeline, the send tail stays. */
+static gboolean sm_video_tx_stop(gpointer data)
+{
+    (void)data;
+    if (!g_tx_head)
+        return G_SOURCE_REMOVE;
+    GstElement *head = g_tx_head;
+    g_tx_head = NULL;
+    gst_element_set_state(head, GST_STATE_NULL);
+    GstPad *ghost = gst_element_get_static_pad(head, "src");
+    GstPad *peer = ghost ? gst_pad_get_peer(ghost) : NULL;
+    if (peer) {
+        gst_pad_unlink(ghost, peer);
+        gst_object_unref(peer);
+    }
+    if (ghost) gst_object_unref(ghost);
+    gst_bin_remove(GST_BIN(g_sm.pipeline), head);
+    if (g_tx_cam) { gst_object_unref(g_tx_cam); g_tx_cam = NULL; }
+    g_atomic_int_set(&g_v.status_video, 0);
+    sm_event("VTX 0");
+    g_message("signal_media: camera off");
+    return G_SOURCE_REMOVE;
+}
+
+void signal_media_set_video(int on)
+{
+    g_v.tx_wanted = on ? TRUE : FALSE;
+    /* Said even before the camera runs, so a camera turned off reaches the far side as off. */
+    g_atomic_int_set(&g_v.status_known, 1);
+    if (!on)
+        g_atomic_int_set(&g_v.status_video, 0);
+    sm_on_media_thread(on ? sm_video_tx_start : sm_video_tx_stop, NULL);
+}
+
+void signal_media_set_call_id(unsigned long long call_id)
+{
+    /* Set once; the sender thread reads it after seeing have_call_id. */
+    if (g_atomic_int_get(&g_v.have_call_id))
+        return;
+    g_v.call_id = call_id;
+    g_atomic_int_set(&g_v.have_call_id, 1);
+}
+
+/* A new call: what IPC said before START (camera wanted, call id) is kept, the rest starts over. */
+static void sm_video_reset(void)
+{
+    SmVideo keep = g_v;
+    memset(&g_v, 0, sizeof g_v);
+    g_v.tx_wanted = keep.tx_wanted;
+    g_v.status_known = keep.status_known;
+    g_v.call_id = keep.call_id;
+    g_v.have_call_id = keep.have_call_id;
+    g_v.peer_rot = -1;
+    g_v.peer_video = -1;
+    g_tx_vqueue = NULL;
+    g_tx_head = NULL;
+    g_tx_cam = NULL;
 }
 
 /* ------------------------------------------------------------------ bus watch ------------------ */
@@ -807,9 +1526,25 @@ static gboolean build_pipeline(SignalMedia *sm)
     { GstPad *p = gst_element_get_static_pad(oenc, "src");
       gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, sm_tx_audio_gate_probe, NULL, NULL);
       gst_object_unref(p); }
+    /* Buffer lists too: video packets (rtpvp8pay, srtpenc) travel as lists. */
     { GstPad *p = gst_element_get_static_pad(txq, "src");
-      gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, sm_tx_gate_probe, NULL, NULL);
+      gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST,
+                        sm_tx_gate_probe, NULL, NULL);
       gst_object_unref(p); }
+
+    /* Received packets split by payload type (audio stays, VP8 to the video branch, the far
+     * side's rtp-data read), and its RTCP read for keyframe requests before it is drained. */
+    { GstPad *p = gst_element_get_static_pad(sdec, "rtp_src");
+      gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST,
+                        sm_rx_split_probe, NULL, NULL);
+      gst_object_unref(p); }
+    { GstPad *p = gst_element_get_static_pad(sdec, "rtcp_src");
+      gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST,
+                        sm_rx_rtcp_probe, NULL, NULL);
+      gst_object_unref(p); }
+    /* Video: both halves optional, the call works as voice without them. */
+    sm_video_rx_build(sm->pipeline);
+    sm_video_tx_build(sm->pipeline, funnel);
 
     GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(sm->pipeline));
     GSource *src = gst_bus_create_watch(bus);
@@ -856,6 +1591,7 @@ int signal_media_start(const unsigned char local_priv[32],
     signal_media_init(NULL, NULL);
 
     memset(&g_sm, 0, sizeof g_sm);
+    sm_video_reset();
     g_sm.is_caller = is_caller ? TRUE : FALSE;
     g_sm.cand_cb = cand_cb; g_sm.cand_user = user;
     g_sm.audiod_cb = audiod_cb; g_sm.audiod_user = aud_user;
@@ -887,6 +1623,10 @@ int signal_media_start(const unsigned char local_priv[32],
 
     g_sm.running = TRUE;
     g_sm.thread = g_thread_new("signal-media", media_thread, &g_sm);
+    g_atomic_int_set(&g_sender_run, 1);
+    g_sender_thread = g_thread_new("sig-sender", sender_thread_fn, NULL);
+    /* A camera asked for before START (an outgoing video call) starts now. */
+    if (g_v.tx_wanted) sm_on_media_thread(sm_video_tx_start, NULL);
     return 0;
 }
 
@@ -914,13 +1654,22 @@ void signal_media_stop(void)
     if (!g_sm.running) return;
     g_sm.running = FALSE;
 
-    /* stop + join the rtp-data resend thread BEFORE freeing the agent/srtp it uses (no use-after-free) */
+    /* stop + join the sender thread BEFORE freeing the agent/srtp it uses (no use-after-free) */
     g_accepted = FALSE;
-    if (g_accept_thread) { g_thread_join(g_accept_thread); g_accept_thread = NULL; }
+    g_atomic_int_set(&g_sender_run, 0);
+    if (g_sender_thread) { g_thread_join(g_sender_thread); g_sender_thread = NULL; }
     g_datasrc = NULL;   /* owned by the pipeline (freed below); thread is joined so no more pushes */
     if (g_data_srtp) { srtp_dealloc(g_data_srtp); g_data_srtp = NULL; }
 
     if (g_sm.pipeline) gst_element_set_state(g_sm.pipeline, GST_STATE_NULL);
+    /* The streaming threads are stopped: nothing reaches the video elements any more. They are
+     * the pipeline's and go with it below. */
+    g_v.rx_src = NULL;
+    g_v.rx_shm = NULL;
+    g_v.tx_enc = NULL;
+    g_tx_vqueue = NULL;
+    g_tx_head = NULL;
+    if (g_tx_cam) { gst_object_unref(g_tx_cam); g_tx_cam = NULL; }
     if (g_sm.audiod_on && g_sm.audiod_cb) g_sm.audiod_cb(0, g_sm.audiod_user);
     g_sm.audiod_on = FALSE;
 
@@ -963,7 +1712,7 @@ static GstCaps *loopback_request_key(GstElement *dec, guint ssrc, gpointer user)
                                         "srtcp-cipher", G_TYPE_STRING, SRTP_CIPHER_GCM256,
                                         "srtcp-auth",   G_TYPE_STRING, SRTP_AUTH_NULL,
                                         NULL);
-    gst_caps_set_simple(caps, "srtp-key", GST_TYPE_BUFFER, gst_buffer_ref(lc->master), NULL);
+    gst_caps_set_simple(caps, "srtp-key", GST_TYPE_BUFFER, lc->master, NULL);
     return caps;
 }
 
@@ -1110,12 +1859,15 @@ int signal_media_loopback_selftest(void)
  *     START <priv_hex64> <pub_hex64> <callerid_hex> <calleeid_hex> <ourufrag> <ourpwd> <remufrag> <rempwd>
  *     RCAND <candidate:... sdp line>      (peer IceUpdate, may repeat / trickle)
  *     ACCEPT <call_id>                    (the user answered: send RingRTC's Accepted, open the mic)
+ *     CALLID <call_id>                    (our outgoing call's id, for the video SenderStatus)
+ *     VIDEO <0|1>                         (the user turned our camera off / on; may precede START)
  *     STOP                                (or EOF on stdin)
  *   us -> presage (stdout, line-buffered):
  *     PUB <pub_hex64>                     (our X25519 public key)
  *     CAND <candidate:... sdp line>       (our local candidate to send as an IceUpdate)
  *     AUDIOD <0|1>                        (media pipeline up / down)
  *     READY                               (engine started ok)
+ *     VSHM / VPREVIEW / VTX / PEERVIDEO / PEERROT / VIDEOERR ...   (video, see signal_media.h)
  *     ERR <msg>                           (fatal; we exit non-zero)
  *
  * Keys/ids are lowercase hex. ufrag/pwd are single whitespace-free tokens (ICE creds never contain
@@ -1135,6 +1887,19 @@ static void emit(const char *fmt, ...)
 
 static void ipc_candidate_cb(const char *sdp, void *user) { (void)user; emit("CAND %s\n", sdp); }
 static void ipc_audiod_cb(int active, void *user)         { (void)user; emit("AUDIOD %d\n", active ? 1 : 0); }
+static void ipc_event_cb(const char *line, void *user)    { (void)user; emit("%s\n", line); }
+
+/* "<n>" with nothing after it, as an unsigned 64-bit number. */
+static gboolean ipc_u64(const char *s, guint64 *out)
+{
+    gchar *end = NULL;
+    if (!s || !g_ascii_isdigit(*s)) return FALSE;
+    errno = 0;
+    guint64 v = g_ascii_strtoull(s, &end, 10);
+    if (errno || !end || *end != '\0') return FALSE;
+    *out = v;
+    return TRUE;
+}
 
 /* hex -> bytes; returns byte count, or -1 on bad/odd input. out must hold len(hex)/2 bytes. */
 static int unhex(const char *h, unsigned char *out, size_t out_max)
@@ -1173,6 +1938,7 @@ static int run_ipc(int is_caller)
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     g_mutex_init(&g_out_lock);
+    signal_media_set_event_cb(ipc_event_cb, NULL);
 
     while (fgets(line, sizeof line, stdin)) {
         char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
@@ -1253,6 +2019,13 @@ static int run_ipc(int is_caller)
             /* user tapped Answer -> start emitting the RingRTC rtp-data Accepted (stops caller ringing) */
             if (!started) { emit("ERR accept-before-start\n"); continue; }
             signal_media_accept(g_ascii_strtoull(line + 7, NULL, 10));
+        } else if (strncmp(line, "CALLID ", 7) == 0) {
+            guint64 id;
+            if (!ipc_u64(line + 7, &id)) { emit("ERR bad-callid\n"); continue; }
+            signal_media_set_call_id(id);
+        } else if (strncmp(line, "VIDEO ", 6) == 0) {
+            if (strcmp(line + 6, "0") != 0 && strcmp(line + 6, "1") != 0) { emit("ERR bad-video\n"); continue; }
+            signal_media_set_video(line[6] == '1');
         } else if (strcmp(line, "STOP") == 0) {
             break;
         } else {

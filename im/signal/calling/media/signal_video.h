@@ -1,0 +1,107 @@
+/*
+ * signal_video.h - byte-level helpers for the video half of a 1:1 Signal call: RTP headers and
+ * their one-byte extensions (the video orientation, CVO), RTCP keyframe requests, and RingRTC's
+ * rtp-data messages. No GStreamer and no GLib, so they can be tested on their own
+ * (tests/test_signal_video.c).
+ *
+ * What RingRTC puts on the wire (signalapp/ringrtc v2.73.0 and its webrtc tag 8037a,
+ * ringrtc/rffi/src/peer_connection.cc Rust_sessionDescriptionFromV4Legacy, constants.h):
+ *   - VP8 on payload type 108, its RTX on 118; Opus on 102; rtp-data on 101 with SSRC 0xD.
+ *   - Fixed SSRCs: the caller sends audio 1002 and video 1003, the callee 2002 and 2003.
+ *   - Header extensions: transport-cc id 1, video orientation (urn:3gpp:video-orientation) id 4,
+ *     abs-send-time id 12. With the orientation extension negotiated, WebRTC sends frames as the
+ *     camera took them and the rotation beside them.
+ */
+#ifndef SIGNAL_VIDEO_H
+#define SIGNAL_VIDEO_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define SV_PT_OPUS       102
+#define SV_PT_DATA       101
+#define SV_PT_VP8        108
+#define SV_PT_VP8_RTX    118
+#define SV_EXT_CVO       4
+#define SV_SSRC_DATA     0x0000000Du
+#define SV_VIDEO_CLOCK   90000
+
+/* Our video SSRC: the caller's side is 1003, the callee's 2003. */
+uint32_t sv_video_ssrc(int is_caller);
+/* The far side's video SSRC. */
+uint32_t sv_peer_video_ssrc(int is_caller);
+
+typedef struct {
+    uint8_t  pt;
+    int      marker;
+    uint16_t seq;
+    uint32_t ts;
+    uint32_t ssrc;
+    size_t   header_len;     /* fixed header + CSRCs + extension block: where the payload starts */
+    size_t   ext_off;        /* the extension block's data (after its 4-byte header), 0 if none */
+    size_t   ext_len;        /* its length in bytes */
+    uint16_t ext_profile;    /* 0xBEDE one-byte, 0x100x two-byte, 0 if none */
+} SvRtp;
+
+/* Parse an RTP header (version 2). Returns 0, or -1 when p is not a whole RTP header. Padding is
+ * not checked: the payload is not looked at. */
+int sv_rtp_parse(const uint8_t *p, size_t n, SvRtp *out);
+
+/* Find header extension element `id` in a parsed packet (one-byte or two-byte form). On success
+ * returns 0 and points *data and *len at its bytes in p. -1 if there is none. */
+int sv_rtp_find_ext(const uint8_t *p, size_t n, const SvRtp *rtp, unsigned id,
+                    const uint8_t **data, size_t *len);
+
+/* Copy RTP packet in[0..n) to out with the one-byte extension element id/data (1..16 bytes) added:
+ * appended to an existing one-byte extension block, or a new block when the packet has none.
+ * Returns the new length, or 0 when the packet is not RTP, already has a two-byte block, the
+ * element does not fit the one-byte form, or out (cap bytes) is too small. in and out may not
+ * overlap. */
+size_t sv_rtp_add_ext(const uint8_t *in, size_t n, unsigned id, const uint8_t *data, size_t dlen,
+                      uint8_t *out, size_t cap);
+
+/* The CVO byte |0 0 0 0 C F R1 R0|: R1R0 is how far the picture has to be turned CLOCKWISE, in
+ * quarter turns, to be upright (webrtc rtp_cvo.h, VideoRotation "enum for clockwise rotation").
+ * The Phone app's incomingVideoOrientation turns the picture back by its value COUNTER-clockwise
+ * (RemoteVideo.qml rotation: -90 * quarterTurns), so the two are each other's complement. */
+int     sv_cvo_to_phone_quarter_turns(uint8_t cvo);
+uint8_t sv_cvo_from_clockwise_quarter_turns(int quarter_turns);
+
+/* 1 if the compound RTCP packet p asks `media_ssrc` for a keyframe (a PLI, PSFB FMT 1, naming
+ * it, or a FIR, PSFB FMT 4, with an entry for it), 0 if not, -1 if p is not RTCP. */
+int sv_rtcp_wants_keyframe(const uint8_t *p, size_t n, uint32_t media_ssrc);
+
+/* A PLI from sender_ssrc about media_ssrc into out (12 bytes). Returns 12. */
+size_t sv_rtcp_build_pli(uint32_t sender_ssrc, uint32_t media_ssrc, uint8_t out[12]);
+
+/* RingRTC's rtp_data.Message, the parts a 1:1 call uses (protobuf/rtp_data.proto). */
+typedef struct {
+    int      has_accepted;
+    uint64_t accepted_id;
+    int      has_hangup;
+    uint64_t hangup_id;
+    uint32_t hangup_type;
+    int      has_status;
+    uint64_t status_id;
+    int      video_enabled;  /* -1 not said, 0 off, 1 on */
+    int      audio_enabled;  /* -1 not said, 0 off, 1 on */
+    int      has_seqnum;
+    uint64_t seqnum;
+} SvDataMsg;
+
+void sv_data_msg_init(SvDataMsg *m);
+/* Serialize m into out (cap bytes); fields in field-number order, as prost writes them. Returns
+ * the length, or 0 if it does not fit. */
+size_t sv_data_msg_encode(const SvDataMsg *m, uint8_t *out, size_t cap);
+/* Parse a message; unknown fields are skipped. Returns 0, or -1 on malformed input. */
+int    sv_data_msg_decode(const uint8_t *p, size_t n, SvDataMsg *m);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SIGNAL_VIDEO_H */
