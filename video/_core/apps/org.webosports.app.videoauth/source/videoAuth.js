@@ -8,6 +8,7 @@
  *   peertube  an instance: typed, or picked from the healthy, non-NSFW instances the directory
  *             (instances.joinpeertube.org) lists, searchable by name
  *   upnp      nothing: one tap adds the media servers on the local network
+ *   archive   nothing: one tap adds the Internet Archive's public films, TV and cartoons
  *   plex      a code from plex.tv (plexPin), entered at plex.tv/link on any device; the app asks
  *             login until the code is linked or runs out. Or, for a server that lets the network
  *             in without signing in, its address and, if wanted, a token.
@@ -54,6 +55,12 @@ enyo.kind({
 			fields: [],
 			text: "Videos will show every UPnP/DLNA media server on this network (MiniDLNA, a NAS, Plex or Jellyfin " +
 				"with DLNA on, ...). There is nothing to sign in to.",
+			button: "Add"
+		},
+		archive: {
+			fields: [],
+			text: "Watch the Internet Archive's public collections in Videos: feature films, classic TV, cartoons, " +
+				"silent films and more from archive.org. There is nothing to sign in to.",
 			button: "Add"
 		},
 		m3u: {

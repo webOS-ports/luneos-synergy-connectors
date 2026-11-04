@@ -8,7 +8,7 @@ and plugs a network or service into the stock apps.
 | `cloud/` | box, dropbox, flickr, google (Drive), hidrive, kdrive, koofr, mega, onedrive, pcloud, immich, photoprism, pigallery2, s3, smugmug, webdav (Nextcloud, ownCloud, any WebDAV server), yandex | Documents (DOCUMENTS) and Photos (PHOTO.UPLOAD) |
 | `im/` | discord, facebook (E2EE), googlechat, signal, teams, telegram, whatsapp | Messaging, through `imlibpurpleservice` and libpurple |
 | `music/` | apple, archive, deezer, jamendo, qobuz, soundcloud, spotify, tidal, youtube | Music, through the streaming daemon |
-| `video/` | emby, jellyfin, m3u (IPTV and other playlists of web streams), mediathek (ARD, ZDF, Arte, 3sat and the other public broadcasters of Germany, Austria and Switzerland), peertube, plex, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Kodi, or Plex and Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
+| `video/` | archive (the Internet Archive's films, TV and cartoons), emby, jellyfin, m3u (IPTV and other playlists of web streams), mediathek (ARD, ZDF, Arte, 3sat and the other public broadcasters of Germany, Austria and Switzerland), peertube, plex, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Kodi, or Plex and Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
 
 ## Layout
 
@@ -111,6 +111,18 @@ than `prefer.maxHeight`, by the size the link names where it names one; ARD's su
 WebVTT. The film list does not say where an item plays, so the CDNs' marks in the links (`/de/`,
 `/dach/`, `geo`, ORF's `cms-austria`, ...) are read and such items say "Only in its own country".
 Requests name the client (`User-Agent: LuneOS-Videos/1.0`), and answers are kept a minute.
+
+An Internet Archive account has nothing to sign in to. Its sections are archive.org
+collections (Feature Films, Classic TV, Animation & Cartoons, Silent Films, Sci-Fi / Horror, Film
+Noir, Comedy Films, Short Films, Prelinger Archives, News & Public Affairs), most downloaded first,
+through `advancedsearch.php`; search looks in the titles, creators and subjects of every
+moving-image item. Items that archive.org only lends or keeps back (`access-restricted-item`, the
+lending collections, `stream_only`) and items with no MP4 are left out. An item with a runtime is
+one video; one without (a series, a box of cartoons) opens as a folder of its videos, read from
+`/metadata/<identifier>`. A video plays from `/download/<identifier>/<file>`: the tallest MP4 no
+taller than asked, with the item's `.srt`/`.vtt` files (the speech-recognised `.asr.srt` as
+"Automatic captions"). Requests say `User-Agent: LuneOS-Videos/1.0`, and an item's metadata is
+kept 10 minutes.
 
 UPnP searches with SSDP from UDP port 41900 and keeps only servers on private,
 link-local or loopback addresses. The replies come from each server's own
