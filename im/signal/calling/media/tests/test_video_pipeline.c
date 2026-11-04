@@ -544,6 +544,43 @@ static void test_rx_route(void)
     g_print("rx route: VP8, RED, ULPFEC, RTX ok\n");
 }
 
+/* shmsink, as the engine configures it, offers no allocator upstream: its shm area must not
+ * hold the decoder's frames. A shmsink without that refusal does (the control). */
+static guint shm_allocators(GstElement *shm)
+{
+    GstCaps *c = sm_i420_caps(SM_VIDEO_W, SM_VIDEO_H, 15);
+    GstQuery *q = gst_query_new_allocation(c, TRUE);
+    GstPad *p = gst_element_get_static_pad(shm, "sink");
+    gst_pad_query(p, q);
+    guint n = gst_query_get_n_allocation_params(q);
+    gst_object_unref(p);
+    gst_query_unref(q);
+    gst_caps_unref(c);
+    return n;
+}
+
+static void test_shm_allocation(const char *dir)
+{
+    gchar *path = g_build_filename(dir, "alloc.sock", NULL);
+    GstElement *q = el("queue", NULL), *shm = el("shmsink", NULL);
+    sm_configure_shm(q, shm, path);
+    CHECK(gst_element_set_state(shm, GST_STATE_PAUSED) != GST_STATE_CHANGE_FAILURE);
+    CHECK(shm_allocators(shm) == 0);
+    gst_element_set_state(shm, GST_STATE_NULL);
+
+    GstElement *plain = el("shmsink", NULL);
+    g_object_set(plain, "socket-path", path, "wait-for-connection", FALSE, "sync", FALSE, "async", FALSE, NULL);
+    CHECK(gst_element_set_state(plain, GST_STATE_PAUSED) != GST_STATE_CHANGE_FAILURE);
+    CHECK(shm_allocators(plain) > 0);
+    gst_element_set_state(plain, GST_STATE_NULL);
+
+    gst_object_unref(gst_object_ref_sink(q));
+    gst_object_unref(gst_object_ref_sink(shm));
+    gst_object_unref(gst_object_ref_sink(plain));
+    g_free(path);
+    g_print("shm: no allocator offered upstream\n");
+}
+
 static GstPadProbeReturn run_probe(GstPadProbeInfo *info)
 {
     return sm_tx_video_probe(NULL, info, NULL);
@@ -716,6 +753,7 @@ int main(int argc, char **argv)
     test_sender_role(TRUE);
     test_pli_rate();
     test_rx_route();
+    test_shm_allocation(dir);
     test_tx_probe();
     test_tx_head(dir);
 

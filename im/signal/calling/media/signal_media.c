@@ -913,12 +913,30 @@ static GstPadProbeReturn sm_rx_first_frame_probe(GstPad *pad, GstPadProbeInfo *i
 /* A shmsink the Phone app reads, which must never hold the pipeline up: a reader that keeps its
  * buffers fills the shm area, and a blocking shmsink would then stall everything upstream (the
  * freeze seen with WhatsApp's second reader). Frames are dropped in the leaky queue before it. */
+/* Refuses the allocation query at shmsink. shmsink offers its shm area as the allocator, and
+ * through the queue that offer reaches the elements before it: when the picture needs no
+ * scaling, the decoder then keeps its reference frames in the shm area, the area runs full, and
+ * the allocation blocks the whole receive chain ahead of the leaky queue (a live call froze for
+ * good ~25 s in, the jitter buffer holding every packet). Without the offer they allocate plain
+ * memory and only shmsink copies into the area. */
+static GstPadProbeReturn sm_no_shm_allocation_probe(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+{
+    (void)pad; (void)u;
+    GstQuery *q = GST_PAD_PROBE_INFO_QUERY(info);
+    return q && GST_QUERY_TYPE(q) == GST_QUERY_ALLOCATION ? GST_PAD_PROBE_DROP : GST_PAD_PROBE_OK;
+}
+
 static void sm_configure_shm(GstElement *queue, GstElement *shm, const char *path)
 {
     g_object_set(queue, "leaky", 2 /* downstream */, "max-size-buffers", 2, "max-size-time", (guint64)0,
                  "max-size-bytes", 0, NULL);
     g_object_set(shm, "socket-path", path, "shm-size", (guint)SM_SHM_SIZE, "wait-for-connection", FALSE,
                  "sync", FALSE, "async", FALSE, NULL);
+    GstPad *p = gst_element_get_static_pad(shm, "sink");
+    if (p) {
+        gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM, sm_no_shm_allocation_probe, NULL, NULL);
+        gst_object_unref(p);
+    }
 }
 
 /* The shm socket paths; SIGNAL_MEDIA_VIDEO_SHM / SIGNAL_MEDIA_PREVIEW_SHM override them (tests). */
