@@ -176,6 +176,7 @@ func main() {
 	if (&appleProvider{}).Available() {
 		registerProvider(&appleProvider{})
 	}
+	loadSubsonic() // the user's own Subsonic server, once signed in (subsonic.go)
 
 	startMediaSession()     // before librespot starts (mediasession.go)
 	restoreLibrespotToken() // before restoreSession, which starts librespot
@@ -208,6 +209,9 @@ func main() {
 	mux.HandleFunc("/appleauth/done", withCORS(handleAppleAuthDone))         // post-login landing page
 	mux.HandleFunc("/qobuzauth/login", withCORS(handleQobuzAuthLogin))       // Qobuz email+password
 	mux.HandleFunc("/dzauth/save", withCORS(handleDeezerAuthSave))           // Deezer ARL cookie (fallback)
+	mux.HandleFunc("/subsonicauth/login", withCORS(handleSubsonicAuthLogin)) // Subsonic server + username + password
+	mux.HandleFunc("/subsonicstream", handleSubsonicStream)                  // a song, the sign-in added (gst/Qt only)
+	mux.HandleFunc("/subsonicart", handleSubsonicArt)                        // a cover, the sign-in added
 	mux.HandleFunc("/dzauth/login", withCORS(handleDeezerAuthLogin))         // Deezer email+password -> ARL
 	mux.HandleFunc("/auth/login", withCORS(handleAuthLogin))
 	mux.HandleFunc("/auth/callback", handleAuthCallback) // browser redirect target (no CORS)

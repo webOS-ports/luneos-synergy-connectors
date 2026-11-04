@@ -82,6 +82,9 @@ type providerTrack struct {
 	// Published is a relative-time label ("2 weeks ago") for providers that have one
 	// (currently just YouTube search results, straight from InnerTube's publishedTimeText).
 	Published string `json:"published,omitempty"`
+	// Track and Disc: its place on its album, from providers that say (Subsonic).
+	Track int `json:"track,omitempty"`
+	Disc  int `json:"disc,omitempty"`
 	// Path the app should hand to playback. For Spotify: spotify:track:<id>.
 	// For stream-URL providers: provider:<id>:<trackid> (the app calls
 	// /provider/<id>/play to actually start it).
@@ -123,11 +126,14 @@ func providerReady(id string) bool {
 	return true
 }
 
-// GET /providers -> [{id,name,available}]
+// GET /providers -> {providers: [{id, name, browse?}]}
 func handleProviders(w http.ResponseWriter, r *http.Request) {
 	type row struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
+		// Browse: the provider has a library to walk, artists to albums to
+		// tracks (libraryBrowser, browse.go). Left out when it has none.
+		Browse bool `json:"browse,omitempty"`
 	}
 	out := []row{}
 	providersMu.RLock()
@@ -135,7 +141,8 @@ func handleProviders(w http.ResponseWriter, r *http.Request) {
 		if !providerReady(p.ID()) {
 			continue
 		}
-		out = append(out, row{ID: p.ID(), Name: p.Name()})
+		_, browse := p.(libraryBrowser)
+		out = append(out, row{ID: p.ID(), Name: p.Name(), Browse: browse})
 	}
 	providersMu.RUnlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -228,6 +235,8 @@ func handleProviderRoute(w http.ResponseWriter, r *http.Request) {
 			Format  string   `json:"format,omitempty"`
 			Formats []string `json:"formats,omitempty"`
 		}{url, formats.format, formats.formats})
+	case "artists", "artist", "album", "albums":
+		handleBrowseRoute(w, r, p, action)
 	case "playlists", "playlist":
 		handlePlaylistRoute(w, r, p, action)
 	case "resolveVideo":
