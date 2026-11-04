@@ -20,12 +20,12 @@ function loadProvider(name) {
 	return require(fs.existsSync(installed) ? installed : path.join(__dirname, "../../../" + name + "/provider"));
 }
 
-function start({ palmbus, fetch, ssdp, exit, idleMs, log = console, timeouts = {}, random } = {}) {
+function start({ palmbus, fetch, ssdp, exit, idleMs, log = console, timeouts = {}, random, fanOutMs } = {}) {
 	const bus = core.createBus({ palmbus, name: Config.SERVICE_NAME, exit, idleMs, log });
 	const http = core.createHttp(Object.assign({ fetch, errorCode: "VIDEO_SERVER_ERROR" }, timeouts));
 	const providers = Config.PROVIDERS.map(loadProvider);
 	const methods = createVideos({ config: Config, providers, call: bus.call, http,
-		ssdp: ssdp || createSsdp({ log }), log, random });
+		ssdp: ssdp || createSsdp({ log }), log, random, fanOutMs });
 	bus.serve(methods);
 	log.log(Config.SERVICE_NAME + ": up (" + Object.keys(methods).length + " methods, node " + process.version + ")");
 	return { bus, methods, http, providers };

@@ -4,6 +4,7 @@
  * org.webosports.service.videos serves to Videos. What it asks for depends on the template:
  *
  *   jellyfin  server address, user name, password
+ *   emby      the same, for an Emby server
  *   peertube  an instance: typed, or picked from the healthy, non-NSFW instances the directory
  *             (instances.joinpeertube.org) lists, searchable by name
  *   upnp      nothing: one tap adds the media servers on the local network
@@ -33,6 +34,12 @@ enyo.kind({
 			fields: ["server", "username", "password"],
 			text: "Watch your Jellyfin server's films and series in Videos. Enter the address you open Jellyfin at " +
 				"(for example jellyfin.example.org or 192.168.1.10:8096) and your Jellyfin user.",
+			button: "Sign In"
+		},
+		emby: {
+			fields: ["server", "username", "password"],
+			text: "Watch your Emby server's films and series in Videos. Enter the address you open Emby at " +
+				"(for example emby.example.org or 192.168.1.10:8096) and your Emby user.",
 			button: "Sign In"
 		},
 		peertube: {
@@ -161,6 +168,7 @@ enyo.kind({
 		this.$.nameGroup.setShowing(k.fields.indexOf("name") >= 0);
 		if (this.kindId === "peertube") { this.$.server.setHint("peertube.example.org"); }
 		if (this.kindId === "jellyfin") { this.$.server.setHint("jellyfin.example.org or 192.168.1.10:8096"); }
+		if (this.kindId === "emby") { this.$.server.setHint("emby.example.org or 192.168.1.10:8096"); }
 		if (this.kindId === "plex") { this.$.server.setHint("192.168.1.10 or plex.example.org:32400"); }
 		this.$.addressLink.setShowing(!!k.pin);
 		this.addressMode = false;

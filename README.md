@@ -8,7 +8,7 @@ and plugs a network or service into the stock apps.
 | `cloud/` | box, dropbox, flickr, google (Drive), hidrive, kdrive, koofr, mega, onedrive, pcloud, immich, photoprism, pigallery2, s3, smugmug, webdav (Nextcloud, ownCloud, any WebDAV server), yandex | Documents (DOCUMENTS) and Photos (PHOTO.UPLOAD) |
 | `im/` | discord, facebook (E2EE), googlechat, signal, teams, telegram, whatsapp | Messaging, through `imlibpurpleservice` and libpurple |
 | `music/` | apple, archive, deezer, jamendo, qobuz, soundcloud, spotify, tidal, youtube | Music, through the streaming daemon |
-| `video/` | jellyfin, m3u (IPTV and other playlists of web streams), peertube, plex, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Kodi, or Plex and Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
+| `video/` | emby, jellyfin, m3u (IPTV and other playlists of web streams), peertube, plex, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Kodi, or Plex and Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
 
 ## Layout
 
@@ -69,8 +69,10 @@ Videos (org.webosports.app.videoplayer) lists every account with the capability
 | `listItems` | `sourceId`, `sectionId` or `parentId`, `cursor`, `limit` | `items`, `nextCursor` |
 | `getItem` | `sourceId`, `itemId` | `item`, with `seasons` (a show) or `children` (a season, a folder) |
 | `search` | `sourceId`, `query`, `cursor`, `limit` | `items`, `nextCursor` |
+| `searchAll` | `query`, `limit` (per source, 10), `sourceIds` (else every source) | `results`: `{sourceId, items, nextCursor}` for each source that can search and found something, in source order; `failed`: `{sourceId, errorCode, errorText}` |
+| `continueWatching` | `limit` (20), `sourceIds` (else every source) | `items`: what was being watched on the sources that keep a place, each with its `sourceId`, the last watched (`lastPlayedAt`) first; `failed` as above |
 | `resolve` | `sourceId`, `itemId`, `prefer {maxHeight, codecs, audioCodecs}` | `stream {url, protocol, subtitles, startMs, session, drm: null}` |
-| `reportProgress` | `sourceId`, `itemId`, `positionMs`, `durationMs`, `state`, `session` | – (Jellyfin and Plex keep their place) |
+| `reportProgress` | `sourceId`, `itemId`, `positionMs`, `durationMs`, `state`, `session` | – (Emby, Jellyfin and Plex keep their place) |
 | `login` | `templateId` and what the sign-in app asked for | the account (the validator) |
 | `searchPeerTubeInstances` | `query` | healthy, non-NSFW instances from instances.joinpeertube.org |
 | `plexPin` | – | `pinId`, `code`, `clientId`, `expiresIn`, `linkUrl`: a code to enter at plex.tv/link; `login` with `pinId` and `clientId` then signs in |
@@ -79,9 +81,12 @@ Videos (org.webosports.app.videoplayer) lists every account with the capability
 Only Videos may browse (`allow`); `login`, `plexPin`, `m3uCatalogs` and the instance list are open, as for the
 other sign-in apps. Every reply is cut to the shapes in `contract.js`; links are
 http(s) only, and a stream's link can carry the server's token (Jellyfin's
-`ApiKey`, Plex's `X-Plex-Token`, an IPTV list's user name and password) - the service never logs links or credentials. Errors: `AUTH_EXPIRED`,
+`ApiKey`, Emby's `api_key`, Plex's `X-Plex-Token`, an IPTV list's user name and password) - the service never logs links or credentials. Errors: `AUTH_EXPIRED`,
 `NOT_FOUND`, `SERVER_UNREACHABLE`, `SERVER_ERROR`, `NO_SOURCE`, `DRM_REQUIRED`,
 `GEO_BLOCKED`, besides _cloudcore's.
+
+`searchAll` and `continueWatching` ask the sources at once, each within 8 seconds; one that fails
+or is slow is answered in `failed`, and the others still come.
 
 An M3U account is one playlist at an http(s) address, kept as the account's credential since
 IPTV services put the user name and password in it; the account is named by the host and file
