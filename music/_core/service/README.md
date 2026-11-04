@@ -107,7 +107,7 @@ and `/providers` marks it `"browse": true` (left out for the others):
 |---|---|
 | `GET /provider/<id>/artists` | `{artists: [{id, provider, name, thumbnail, albums}]}` |
 | `GET /provider/<id>/artist?id=` | `{albums: [{id, provider, name, artist, artist_id, year, thumbnail, tracks}]}` |
-| `GET /provider/<id>/album?id=` | `{tracks: [providerTrack]}`, in the album's order |
+| `GET /provider/<id>/album?id=` | `{tracks: [providerTrack]}`, in the album's order, with `track` and `disc` |
 | `GET /provider/<id>/albums?list=` | `{albums}`: `newest` (the default), `recent`, `frequent`, `random`, `alphabetical` |
 
 Subsonic answers them from getArtists, getArtist, getAlbum and getAlbumList2;

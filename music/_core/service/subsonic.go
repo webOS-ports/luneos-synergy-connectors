@@ -245,6 +245,8 @@ type subsonicSong struct {
 	Album    string `json:"album"`
 	CoverArt string `json:"coverArt"`
 	Duration int    `json:"duration"` // seconds
+	Track    int    `json:"track"`
+	Disc     int    `json:"discNumber"`
 	IsDir    bool   `json:"isDir"`
 	IsVideo  bool   `json:"isVideo"`
 }
@@ -265,6 +267,7 @@ func subsonicTracks(songs []subsonicSong, max int) []providerTrack {
 		out = append(out, providerTrack{
 			ID: s.ID, Provider: "subsonic", Title: s.Title, Artist: s.Artist, Album: s.Album,
 			Thumbnail: subsonicArtURL(s.CoverArt), DurationMs: s.Duration * 1000, Path: "subsonic:" + s.ID,
+			Track: s.Track, Disc: s.Disc,
 		})
 		if len(out) == max {
 			break

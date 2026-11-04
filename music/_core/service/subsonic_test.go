@@ -135,8 +135,8 @@ func (f *fakeSubsonic) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ssReply(w, map[string]interface{}{"album": map[string]interface{}{"id": "al1", "song": []map[string]interface{}{
-			{"id": "s1", "title": "Morning Tone", "album": "First Album", "duration": 40, "coverArt": "al-1"},
-			{"id": "s4", "title": "Evening Tone", "album": "First Album", "duration": 35},
+			{"id": "s1", "title": "Morning Tone", "album": "First Album", "duration": 40, "coverArt": "al-1", "track": 1, "discNumber": 1},
+			{"id": "s4", "title": "Evening Tone", "album": "First Album", "duration": 35, "track": 2, "discNumber": 2},
 		}}})
 	case "/rest/getAlbumList2.view":
 		albums := []map[string]interface{}{{"id": "al2", "name": "Second Album", "artist": "Other Band", "artistId": "ar2", "songCount": 2}}
@@ -675,6 +675,14 @@ func TestSubsonicBrowsesTheLibrary(t *testing.T) {
 	tracks, err := p.AlbumTracks(ctx, "al1")
 	if err != nil || len(tracks) != 2 || tracks[0].Path != "subsonic:s1" || tracks[1].Title != "Evening Tone" || tracks[0].DurationMs != 40000 {
 		t.Errorf("tracks %+v %v", tracks, err)
+	}
+	if tracks[0].Track != 1 || tracks[1].Track != 2 || tracks[1].Disc != 2 {
+		t.Errorf("places on the album %+v", tracks)
+	}
+	// Without them (a search result here) the fields are left out.
+	b, _ := json.Marshal(providerTrack{ID: "x"})
+	if strings.Contains(string(b), "track") || strings.Contains(string(b), "disc") {
+		t.Errorf("empty place: %s", b)
 	}
 	if _, err := p.ArtistAlbums(ctx, "nope"); err == nil || err.Error() != "not found on the server" {
 		t.Errorf("a missing artist: %v", err)

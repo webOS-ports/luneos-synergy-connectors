@@ -82,6 +82,9 @@ type providerTrack struct {
 	// Published is a relative-time label ("2 weeks ago") for providers that have one
 	// (currently just YouTube search results, straight from InnerTube's publishedTimeText).
 	Published string `json:"published,omitempty"`
+	// Track and Disc: its place on its album, from providers that say (Subsonic).
+	Track int `json:"track,omitempty"`
+	Disc  int `json:"disc,omitempty"`
 	// Path the app should hand to playback. For Spotify: spotify:track:<id>.
 	// For stream-URL providers: provider:<id>:<trackid> (the app calls
 	// /provider/<id>/play to actually start it).
