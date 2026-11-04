@@ -135,6 +135,14 @@ typedef struct {
     gint64      last_pli_us;    /* sender thread only */
     guint64     call_id;        /* RingRTC call id for SenderStatus (CALLID, or ACCEPT's) */
     gint        have_call_id;   /* atomic */
+    /* receive statistics (atomic), logged by the sender thread while they change */
+    gint        st_vp8;         /* VP8 packets routed to the video branch */
+    gint        st_push_fail;   /* of them refused by the appsrc */
+    gint        st_other;       /* packets of another payload type, not audio or data */
+    gint        st_depay;       /* VP8 frames out of the depayloader */
+    gint        st_dec;         /* decoded frames */
+    gint        st_pli;         /* keyframe requests sent */
+    gint        st_last_pt;     /* last "other" payload type seen */
 } SmVideo;
 
 static SmVideo g_v;
@@ -408,6 +416,22 @@ static void sm_push_pli(void)
     srtp_err_status_t st = srtp_protect_rtcp(g_data_srtp, pkt, &len);
     if (st != srtp_err_status_ok) { g_message("signal_media: srtp_protect_rtcp(pli) failed %d", (int)st); return; }
     sm_push_protected(pkt, len, "keyframe request");
+    g_atomic_int_inc(&g_v.st_pli);
+}
+
+/* One line of receive statistics, when anything changed since the last one. Sender thread only. */
+static void sm_log_rx_stats(void)
+{
+    static gint last[6];
+    gint now[6] = {
+        g_atomic_int_get(&g_v.st_vp8), g_atomic_int_get(&g_v.st_push_fail), g_atomic_int_get(&g_v.st_other),
+        g_atomic_int_get(&g_v.st_depay), g_atomic_int_get(&g_v.st_dec), g_atomic_int_get(&g_v.st_pli),
+    };
+    if (memcmp(now, last, sizeof now) == 0)
+        return;
+    memcpy(last, now, sizeof last);
+    g_message("signal_media: rx video vp8=%d refused=%d other=%d (pt %d) depay=%d decoded=%d pli=%d",
+              now[0], now[1], now[2], g_atomic_int_get(&g_v.st_last_pt), now[3], now[4], now[5]);
 }
 
 /* Dedicated sender thread, for the whole call. CRITICAL: nice_agent_send() must NOT be called from
@@ -438,6 +462,8 @@ static gpointer sender_thread_fn(gpointer u)
     (void)u;
     guint tick = 0;
     while (g_atomic_int_get(&g_sender_run)) {
+        if (tick % 20 == 0)
+            sm_log_rx_stats();
         if (tick++ % 5 == 0)
             sm_push_data_message();
         if (sm_pli_take(g_get_monotonic_time()))
@@ -631,9 +657,14 @@ static gboolean sm_rx_route(GstBuffer *buf)
                 sm_event("PEERROT %d", q);
             }
         }
-        if (g_v.rx_src)
-            gst_app_src_push_buffer(GST_APP_SRC(g_v.rx_src), gst_buffer_ref(buf));
-    } else if (r.pt == SV_PT_DATA && r.ssrc == SV_SSRC_DATA) {
+        g_atomic_int_inc(&g_v.st_vp8);
+        if (g_v.rx_src &&
+            gst_app_src_push_buffer(GST_APP_SRC(g_v.rx_src), gst_buffer_ref(buf)) != GST_FLOW_OK)
+            g_atomic_int_inc(&g_v.st_push_fail);
+    } else if (r.pt != SV_PT_DATA) {
+        g_atomic_int_inc(&g_v.st_other);
+        g_atomic_int_set(&g_v.st_last_pt, r.pt);
+    } else if (r.ssrc == SV_SSRC_DATA) {
         size_t plen = m.size - r.header_len;
         if ((m.data[0] & 0x20) && plen > 0)           /* padding: its count is the last byte */
             plen = m.data[m.size - 1] <= plen ? plen - m.data[m.size - 1] : 0;
@@ -719,6 +750,14 @@ static GstPadProbeReturn sm_rx_keyframe_probe(GstPad *pad, GstPadProbeInfo *info
     GstEvent *ev = GST_PAD_PROBE_INFO_EVENT(info);
     if (ev && GST_EVENT_TYPE(ev) == GST_EVENT_CUSTOM_UPSTREAM && gst_event_has_name(ev, "GstForceKeyUnit"))
         g_atomic_int_set(&g_v.pli_wanted, 1);
+    return GST_PAD_PROBE_OK;
+}
+
+/* Counts buffers on a pad into the int at u (receive statistics). */
+static GstPadProbeReturn sm_count_probe(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+{
+    (void)pad; (void)info;
+    g_atomic_int_inc((gint *)u);
     return GST_PAD_PROBE_OK;
 }
 
@@ -817,6 +856,12 @@ static gboolean sm_video_rx_build(GstElement *pipeline)
     }
     GstPad *p = gst_element_get_static_pad(depay, "sink");
     gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_EVENT_UPSTREAM, sm_rx_keyframe_probe, NULL, NULL);
+    gst_object_unref(p);
+    p = gst_element_get_static_pad(depay, "src");
+    gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, sm_count_probe, &g_v.st_depay, NULL);
+    gst_object_unref(p);
+    p = gst_element_get_static_pad(e[3], "src");
+    gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, sm_count_probe, &g_v.st_dec, NULL);
     gst_object_unref(p);
     p = gst_element_get_static_pad(shm, "sink");
     gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, sm_rx_first_frame_probe, NULL, NULL);
