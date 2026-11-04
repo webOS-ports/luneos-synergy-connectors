@@ -25,7 +25,7 @@ function control(value) {
 	c.setActive = () => {};
 	c.setDisabled = () => {};
 	c.setHint = () => {};
-	c.setSrc = () => {};
+	c.setSrc = (v) => { c.src = v; };
 	c.getValue = () => c.value;
 	c.setItems = (v) => { c.items = v; };
 	// As enyo's ListSelector: a value not among the items is not taken.
@@ -141,4 +141,23 @@ test("other kinds have no lists to pick from", () => {
 	assert.strictEqual(card.$.catalogGroup.showing, false);
 	assert.strictEqual(card.$.catalogs.calls.length, 0);
 	assert.strictEqual(card.$.prefs.calls.length, 0);
+});
+
+test("Emby asks for the server, user name and password, and signs in with its own templateId", () => {
+	const card = load({ template: { templateId: "org.webosports.video.emby", loc_name: "Emby" } });
+	assert.strictEqual(card.$.title.content, "Emby");
+	assert.match(card.$.bodyText.content, /Emby server/);
+	assert.deepStrictEqual([card.$.serverGroup.showing, card.$.usernameGroup.showing, card.$.passwordGroup.showing, card.$.urlGroup.showing],
+		[true, true, true, false]);
+	assert.strictEqual(card.$.headerIcon.src, "images/connectors/emby.png");
+	assert.ok(fs.existsSync(path.join(__dirname, "../../video/_core/apps/org.webosports.app.videoauth", card.$.headerIcon.src)));
+	for (const n of ["emby-32x32.png", "emby-48x48.png"]) {
+		assert.ok(fs.existsSync(path.join(__dirname, "../../video/emby/account/org.webosports.video.emby/images", n)), n);
+	}
+	card.$.server.value = " emby.example.org ";
+	card.$.username.value = "alice";
+	card.$.password.value = "pw";
+	card.primaryTap();
+	assert.deepStrictEqual(JSON.parse(JSON.stringify(card.$.svc.calls.map((c) => [c.opts.method, c.params]))), [["login",
+		{ templateId: "org.webosports.video.emby", server: "emby.example.org", username: "alice", password: "pw" }]]);
 });

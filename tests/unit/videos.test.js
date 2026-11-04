@@ -454,7 +454,7 @@ test("Jellyfin: sign-in finds the server as typed and returns the account", asyn
 test("Jellyfin: a bare host is tried on https, then http, then http on 8096", async () => {
 	const tried = [];
 	const t = start({ routes: [
-		["GET", /\/System\/Info\/Public$/, (r) => { tried.push(new URL(r.url).origin); if (!r.url.startsWith("http://nas.example.test:8096")) { throw new Error("refused"); } return { body: { Id: "s", ServerName: "NAS" } }; }],
+		["GET", /\/System\/Info\/Public$/, (r) => { tried.push(new URL(r.url).origin); if (!r.url.startsWith("http://nas.example.test:8096")) { throw new Error("refused"); } return { body: { Id: "s", ServerName: "NAS", ProductName: "Jellyfin Server" } }; }],
 		["POST", /AuthenticateByName/, () => ({ body: { AccessToken: "t", User: { Id: "u" } } })],
 	] });
 	const r = await t.call("login", { templateId: "org.webosports.video.jellyfin", server: "nas.example.test", username: "bob", password: "" }, AUTH);

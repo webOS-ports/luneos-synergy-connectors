@@ -227,6 +227,7 @@ function toItem(s, j) {
 		progress: { positionMs: typeof j.viewOffset === "number" ? j.viewOffset : 0, watched },
 		webUrl: s.machineId ? "https://app.plex.tv/desktop/#!/server/" + encodeURIComponent(s.machineId) +
 			"/details?key=" + encodeURIComponent("/library/metadata/" + id) : undefined,
+		lastPlayedAt: typeof j.lastViewedAt === "number" && j.lastViewedAt > 0 ? j.lastViewedAt * 1000 : undefined,
 	};
 	if (kind === "episode") {
 		it.seriesTitle = j.grandparentTitle;

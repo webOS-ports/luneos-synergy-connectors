@@ -7,7 +7,7 @@
  *   section { id, title, layout: "row" | "grid" }
  *   item    { id, kind, title, subtitle?, description?, artwork: { poster?, thumb?, backdrop? },
  *             durationMs?, year?, seriesTitle?, season?, episode?, progress?: { positionMs, watched },
- *             playable, hasChildren, webUrl? }
+ *             playable, hasChildren, webUrl?, lastPlayedAt? (ISO time the user last watched it) }
  *   stream  { url, protocol: "hls" | "dash" | "progressive", mime?, subtitles: [{ url, label, lang,
  *             format: "srt" | "vtt", default }], startMs?, expiresAt?, session?, drm: null }
  *
@@ -86,7 +86,15 @@ function item(raw) {
 	out.playable = typeof raw.playable === "boolean" ? raw.playable : !folder;
 	out.hasChildren = typeof raw.hasChildren === "boolean" ? raw.hasChildren : folder;
 	if (isLink(raw.webUrl)) { out.webUrl = raw.webUrl; }
+	pick(out, "lastPlayedAt", when(raw.lastPlayedAt));
 	return out;
+}
+
+// A time a server gave (ISO text, or ms since 1970) as ISO text; nothing for what is not one, or
+// for 1970 and before (servers send 0 or "0001-01-01T00:00:00" for never).
+function when(v) {
+	const t = typeof v === "number" ? v : (typeof v === "string" && v.length <= 64 ? Date.parse(v) : NaN);
+	return isFinite(t) && t > 0 && t < 8.64e15 ? new Date(t).toISOString() : undefined;
 }
 
 function items(list) {
@@ -136,4 +144,4 @@ function features(raw) {
 }
 
 module.exports = { KINDS, LAYOUTS, PROTOCOLS, ERRORS, isLink, text, count, section, item, items, page, stream,
-	features, cursor };
+	features, cursor, when };

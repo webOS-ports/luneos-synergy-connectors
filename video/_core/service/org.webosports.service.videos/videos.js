@@ -14,6 +14,7 @@
  *     listItems(ctx, { sectionId, parentId, cursor, limit }) -> { items, nextCursor }
  *     getItem(ctx, { itemId })             -> item, with children (items) for a show or season
  *     search?(ctx, { query, cursor, limit }) -> { items, nextCursor }
+ *     continueWatching?(ctx, { limit })    -> { items }  (default: listItems of section "continue")
  *     resolve(ctx, { itemId, prefer })     -> stream
  *     reportProgress?(ctx, { itemId, positionMs, durationMs, state, session })
  *     extraMethods?: { name: { handler(params, deps), allow? } } }
@@ -24,6 +25,10 @@
  * A source is what Videos lists in its libraries panel: an account, or for UPnP one server the
  * account found on the network. Its id is the account id, or "<account id>|<sub>" (sub chosen by
  * the provider). Every catalogue method takes it as `sourceId`.
+ *
+ * continueWatching and searchAll ask many sources at once (those given as `sourceIds`, else every
+ * source), each with its own time limit; a source that fails or is slow is answered in `failed`
+ * and the others still come.
  *
  * What a provider returns is cut to the contract (contract.js) before it is answered. What it
  * throws is answered as the service's error codes: a 401 is AUTH_EXPIRED, a 404 NOT_FOUND, no
@@ -41,6 +46,9 @@ const SEP = "|";
 const MAX_LIMIT = 200;
 const DEFAULT_LIMIT = 50;
 const ACCOUNTS_TTL_MS = 5000;
+// continueWatching and searchAll: how long one source may take, and how many are asked.
+const FAN_OUT_MS = 8000;
+const MAX_FAN_OUT = 50;
 
 function sourceIdOf(accountId, sub) {
 	return sub ? accountId + SEP + sub : accountId;
@@ -76,7 +84,7 @@ function limitOf(v) {
 	return Math.max(1, Math.min(MAX_LIMIT, n));
 }
 
-function createVideos({ config, providers, call, http, ssdp = null, log = console, random = crypto.randomBytes }) {
+function createVideos({ config, providers, call, http, ssdp = null, log = console, random = crypto.randomBytes, fanOutMs = FAN_OUT_MS }) {
 	const byTemplate = new Map(providers.map((p) => [p.templateId, p]));
 	const appIds = config.APP_IDS;
 	const deps = { http, ssdp, log, random };
@@ -169,6 +177,74 @@ function createVideos({ config, providers, call, http, ssdp = null, log = consol
 		};
 	}
 
+	// Every source, as listSources answers them.
+	async function allSources() {
+		const sources = [];
+		for (const account of await accounts()) {
+			const provider = byTemplate.get(account.templateId);
+			if (!provider) { continue; }
+			const base = { accountId: account._id, templateId: account.templateId, provider: provider.id,
+				icon: iconOf(account) };
+			let subs = [{ id: "", name: nameOf(account, provider) }];
+			const ctx = { accountId: account._id, sub: "", account, creds: {}, http, ssdp, log, save: async () => false };
+			if (typeof provider.sources === "function") {
+				// A provider whose sources come from its sign-in (Plex: the servers the
+				// account reaches) needs the credentials, and may store a fresher list.
+				ctx.creds = await credentialsOf(account._id);
+				ctx.save = async (common) => { ctx.creds = common; return saveCredentials(account._id, common); };
+				try { subs = await provider.sources(ctx); }
+				catch (e) { log.error(config.SERVICE_NAME + ": sources of " + provider.id + " failed: " + ((e && e.errorCode) || e)); subs = []; }
+			}
+			for (const s of subs || []) {
+				const name = C.text(s && s.name, 200);
+				if (!name) { continue; }
+				sources.push(Object.assign({ sourceId: sourceIdOf(account._id, s.id || ""), name, label: labelOf(name, provider) },
+					base, { features: C.features(provider.features(Object.assign({}, ctx, { sub: s.id || "" }))) }));
+			}
+		}
+		return sources;
+	}
+
+	// run(provider, ctx) on each source given (else every source) whose features want(features,
+	// provider) says yes, all at once, each within fanOutMs. -> { results: [{ sourceId, value }]
+	// in the order given, failed: [{ sourceId, errorCode, errorText }] }.
+	async function fanOut(sourceIds, want, run) {
+		let ids;
+		if (Array.isArray(sourceIds)) {
+			ids = Array.from(new Set(sourceIds.filter((id) => typeof id === "string" && id && id.length <= 1024)));
+		} else {
+			ids = (await allSources()).map((s) => s.sourceId);
+		}
+		ids = ids.slice(0, MAX_FAN_OUT);
+		const settled = await Promise.all(ids.map(async (sourceId) => {
+			let timer = null;
+			try {
+				const job = (async () => {
+					const { provider, ctx } = await context(sourceId);
+					if (!want(C.features(provider.features(ctx)), provider)) { return { skip: true }; }
+					return { value: await run(provider, ctx) };
+				})();
+				const late = new Promise((resolve, reject) => {
+					timer = setTimeout(() => reject(new CloudError(C.ERRORS.SERVER_UNREACHABLE, "The server took too long.")), fanOutMs);
+				});
+				return Object.assign({ sourceId }, await Promise.race([job, late]));
+			} catch (e) {
+				// A provider's own bug (no errorCode) is logged by its name only and answered as a server error.
+				const err = asServiceError(e);
+				const known = !!(err && err.errorCode);
+				log.error(config.SERVICE_NAME + ": " + sourceId.split(SEP)[0] + " failed: " + (known ? err.errorCode : (e && e.name) || "error"));
+				return { sourceId, error: { sourceId, errorCode: known ? err.errorCode : C.ERRORS.SERVER_ERROR,
+					errorText: (known && C.text(err.message, 300)) || "" } };
+			} finally {
+				clearTimeout(timer);
+			}
+		}));
+		return {
+			results: settled.filter((r) => !r.skip && !r.error).map((r) => ({ sourceId: r.sourceId, value: r.value })),
+			failed: settled.filter((r) => r.error).map((r) => r.error),
+		};
+	}
+
 	const methods = {
 		// -> { sources: [{ sourceId, accountId, templateId, provider, name, label, icon, features }] }
 		listSources: {
@@ -176,30 +252,45 @@ function createVideos({ config, providers, call, http, ssdp = null, log = consol
 			timeoutMs: 20000,
 			handler: async () => {
 				accountsCache = null;
-				const sources = [];
-				for (const account of await accounts()) {
-					const provider = byTemplate.get(account.templateId);
-					if (!provider) { continue; }
-					const base = { accountId: account._id, templateId: account.templateId, provider: provider.id,
-						icon: iconOf(account) };
-					let subs = [{ id: "", name: nameOf(account, provider) }];
-					const ctx = { accountId: account._id, sub: "", account, creds: {}, http, ssdp, log, save: async () => false };
-					if (typeof provider.sources === "function") {
-						// A provider whose sources come from its sign-in (Plex: the servers the
-						// account reaches) needs the credentials, and may store a fresher list.
-						ctx.creds = await credentialsOf(account._id);
-						ctx.save = async (common) => { ctx.creds = common; return saveCredentials(account._id, common); };
-						try { subs = await provider.sources(ctx); }
-						catch (e) { log.error(config.SERVICE_NAME + ": sources of " + provider.id + " failed: " + ((e && e.errorCode) || e)); subs = []; }
-					}
-					for (const s of subs || []) {
-						const name = C.text(s && s.name, 200);
-						if (!name) { continue; }
-						sources.push(Object.assign({ sourceId: sourceIdOf(account._id, s.id || ""), name, label: labelOf(name, provider) },
-							base, { features: C.features(provider.features(Object.assign({}, ctx, { sub: s.id || "" }))) }));
-					}
-				}
-				return { sources };
+				return { sources: await allSources() };
+			},
+		},
+
+		// { limit?, sourceIds? } -> { items: [item + sourceId], failed: [{ sourceId, errorCode }] }
+		// What the user was watching on every source that keeps a place, the last watched first
+		// (those a server gives no time for after, in the order of the sources).
+		continueWatching: {
+			allow: appIds,
+			timeoutMs: fanOutMs + 10000,
+			handler: async (params) => {
+				const limit = Math.min(limitOf(params.limit === undefined ? 20 : params.limit), MAX_FAN_OUT);
+				const { results, failed } = await fanOut(params.sourceIds, (f) => f.continueWatching, async (p, ctx) =>
+					C.page(typeof p.continueWatching === "function" ? await p.continueWatching(ctx, { limit })
+						: await p.listItems(ctx, { sectionId: "continue", parentId: "", cursor: null, limit })).items);
+				const all = [];
+				results.forEach((r, rank) => r.value.forEach((it, i) => all.push({ it: Object.assign(it, { sourceId: r.sourceId }), rank, i })));
+				const t = (x) => (x.it.lastPlayedAt ? Date.parse(x.it.lastPlayedAt) : -1);
+				all.sort((a, b) => (t(b) - t(a)) || (a.rank - b.rank) || (a.i - b.i));
+				return { items: all.slice(0, limit).map((x) => x.it), failed };
+			},
+		},
+
+		// { query, limit? (per source), sourceIds? } -> { results: [{ sourceId, items, nextCursor }], failed }
+		// The sources that can search, in the order of the sources; those with nothing found are left out.
+		searchAll: {
+			allow: appIds,
+			timeoutMs: fanOutMs + 10000,
+			handler: async (params) => {
+				const query = C.text(params.query, 200);
+				if (!query) { throw new CloudError("MISSING_ARGS", "need query"); }
+				const limit = Math.min(limitOf(params.limit === undefined ? 10 : params.limit), MAX_FAN_OUT);
+				const { results, failed } = await fanOut(params.sourceIds, (f, p) => f.search && typeof p.search === "function",
+					async (p, ctx) => C.page(await p.search(ctx, { query, cursor: null, limit })));
+				return {
+					results: results.filter((r) => r.value.items.length > 0)
+						.map((r) => ({ sourceId: r.sourceId, items: r.value.items, nextCursor: r.value.nextCursor })),
+					failed,
+				};
 			},
 		},
 
@@ -287,4 +378,4 @@ function createVideos({ config, providers, call, http, ssdp = null, log = consol
 	return methods;
 }
 
-module.exports = { createVideos, sourceIdOf, splitSourceId, asServiceError, limitOf };
+module.exports = { createVideos, sourceIdOf, splitSourceId, asServiceError, limitOf, FAN_OUT_MS };
