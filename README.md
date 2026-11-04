@@ -8,7 +8,7 @@ and plugs a network or service into the stock apps.
 | `cloud/` | box, dropbox, flickr, google (Drive), hidrive, kdrive, koofr, mega, onedrive, pcloud, immich, photoprism, pigallery2, s3, smugmug, webdav (Nextcloud, ownCloud, any WebDAV server), yandex | Documents (DOCUMENTS) and Photos (PHOTO.UPLOAD) |
 | `im/` | discord, facebook (E2EE), googlechat, signal, teams, telegram, whatsapp | Messaging, through `imlibpurpleservice` and libpurple |
 | `music/` | apple, archive, deezer, jamendo, qobuz, soundcloud, spotify, tidal, youtube | Music, through the streaming daemon |
-| `video/` | archive (the Internet Archive's films, TV and cartoons), emby, jellyfin, m3u (IPTV and other playlists of web streams), mediathek (ARD, ZDF, Arte, 3sat and the other public broadcasters of Germany, Austria and Switzerland), peertube, plex, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Kodi, or Plex and Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
+| `video/` | archive (the Internet Archive's films, TV and cartoons), emby, jellyfin, m3u (IPTV and other playlists of web streams), mediathek (ARD, ZDF, Arte, 3sat and the other public broadcasters of Germany, Austria and Switzerland), owncast (self-hosted live streams), peertube, plex, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Kodi, or Plex and Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
 
 ## Layout
 
@@ -123,6 +123,16 @@ one video; one without (a series, a box of cartoons) opens as a folder of its vi
 taller than asked, with the item's `.srt`/`.vtt` files (the speech-recognised `.asr.srt` as
 "Automatic captions"). Requests say `User-Agent: LuneOS-Videos/1.0`, and an item's metadata is
 kept 10 minutes.
+
+An Owncast account is one server, or the Owncast Directory (directory.owncast.online). A
+server is checked with `/api/config` and `/api/status` (a bare host is tried on https, http, then
+http on 8080); its one section holds the stream while it is live ("Live Now"), and is an empty
+"Not Live Right Now" while it is not. The directory's live servers, NSFW ones left out, are
+"Live Now", then its categories that have something live, then "All Live Streams", and can be
+searched. Every stream is `live`, and plays from `<server>/hls/stream.m3u8` once the server's
+`/api/status` says it is on; from the directory, only a server it lists as live is played. The
+directory is read at most every two minutes, a server's status every 20 seconds, as
+`LuneOS-Videos/1.0`. Owncast calls these APIs internal, so every field is taken as optional.
 
 UPnP searches with SSDP from UDP port 41900 and keeps only servers on private,
 link-local or loopback addresses. The replies come from each server's own

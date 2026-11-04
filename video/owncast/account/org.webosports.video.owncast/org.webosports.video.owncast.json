@@ -1,0 +1,43 @@
+[
+    {
+        "templateId": "org.webosports.video.owncast",
+        "loc_name": "Owncast",
+        "icon": {
+            "loc_32x32": "images/owncast-32x32.png",
+            "loc_48x48": "images/owncast-48x48.png"
+        },
+        "__comment": "Live streams from Owncast (owncast.online), self-hosted live streaming, in Videos: one server by its address, or the Owncast Directory (directory.owncast.online) of the servers that are live now. The customUI app org.webosports.app.videoauth asks which, and calls org.webosports.service.videos/login with this templateId, which checks the server (/api/config, /api/status) or reads the directory before Accounts stores the account. Nothing is signed in to.",
+        "validator": {
+            "customUI": {
+                "appId": "org.webosports.app.videoauth",
+                "name": "validator.html"
+            },
+            "address": "palm://org.webosports.service.videos/login"
+        },
+        "loc_usernameLabel": "SERVER",
+        "__comment2": "org.webosports.app.videoauth MUST be in write/readPermissions: createAccount runs as the customUI app. org.webosports.service.videos reads the credentials for every catalogue call.",
+        "readPermissions": [
+            "org.webosports.service.videos",
+            "org.webosports.app.videoauth"
+        ],
+        "writePermissions": [
+            "org.webosports.service.videos",
+            "org.webosports.app.videoauth"
+        ],
+        "capabilityProviders": [
+            {
+                "capability": "Video",
+                "capabilitySubtype": "STREAMING",
+                "id": "org.webosports.video.owncast.streaming",
+                "alwaysOn": true,
+                "implementation": "palm://org.webosports.service.videos/",
+                "loc_shortName": "Owncast",
+                "icon": {
+                    "loc_32x32": "images/owncast-32x32.png",
+                    "loc_48x48": "images/owncast-48x48.png",
+                    "splitter": "images/owncast-32x32.png"
+                }
+            }
+        ]
+    }
+]
