@@ -752,10 +752,10 @@ static int run_ipc(int is_caller)
              * nice_agent_restart_stream(): per libnice's nice_component_restart(), this clears the
              * component's stale remote-candidate list (nice_stream_restart -> component_restart)
              * and restores RFC7675 local consent, WITHOUT touching our already-bound local
-             * candidates (no re-gather needed - same sockets are still valid). It DOES regenerate
-             * our own local ice-ufrag/pwd though (nice_stream_initialize_credentials), so we must
-             * re-emit them - same UFRAG/PWD lines teams_calling.c already parses at START - before
-             * the caller can build a next answer with matching local creds.
+             * candidates (no re-gather needed - same sockets are still valid). It also regenerates
+             * our own local ice-ufrag/pwd (nice_stream_initialize_credentials); we put the old
+             * ones back (below) and still re-emit them - same UFRAG/PWD lines teams_calling.c
+             * parses at START - before the caller builds the next answer.
              * RESTART <rxkey_b64|-> <rem_ufrag> <rem_pwd> */
             char *sp = NULL;
             char *rxk = strtok_r(line + 8, " ", &sp);
@@ -770,10 +770,23 @@ static int run_ipc(int is_caller)
                 GstBuffer *nb = master_buffer_from_b64(rxk);
                 if (nb) { set_rx_master(&g_tm, nb); new_key = TRUE; }
             }
+            /* Keep our own ufrag/pwd across the restart. Teams goes on signing its checks with
+             * the password from our first answer, even after an updated answer carries new
+             * ones: with the regenerated credentials every one of its checks failed the
+             * integrity check, it never got to nominate a pair, ICE failed and Teams ended the
+             * call as MediaError 410. RFC 8445 asks the answerer to change them on a restart,
+             * but nothing here needs that, and keeping them matches either answer the peer uses. */
+            gchar *keep_uf = NULL, *keep_pw = NULL;
+            nice_agent_get_local_credentials(g_tm.agent, g_tm.stream_id, &keep_uf, &keep_pw);
             if (!nice_agent_restart_stream(g_tm.agent, g_tm.stream_id)) {
+                g_free(keep_uf); if (keep_pw) { wipe(keep_pw, strlen(keep_pw)); g_free(keep_pw); }
                 wipe(line, sizeof line);
                 emit("ERR restart-stream-failed\n"); continue;
             }
+            if (keep_uf && keep_pw &&
+                !nice_agent_set_local_credentials(g_tm.agent, g_tm.stream_id, keep_uf, keep_pw))
+                g_warning("teams_media: could not keep the local ICE credentials over the restart");
+            g_free(keep_uf); if (keep_pw) { wipe(keep_pw, strlen(keep_pw)); g_free(keep_pw); }
             { gchar *uf = NULL, *pw = NULL;
               nice_agent_get_local_credentials(g_tm.agent, g_tm.stream_id, &uf, &pw);
               emit("UFRAG %s\n", uf ? uf : "");
