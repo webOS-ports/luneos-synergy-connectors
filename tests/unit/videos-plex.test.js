@@ -444,6 +444,15 @@ test("progress: a timeline report while playing; at the end the timeline, the sc
 	t.stop();
 });
 
+test("progress: a position past the end is reported as the end, which Plex accepts", async () => {
+	const t = start();
+	await t.call("reportProgress", { sourceId: home, itemId: "2", positionMs: 96000, durationMs: 90023, state: "playing", session: {} });
+	await t.call("reportProgress", { sourceId: home, itemId: "2", positionMs: 4000, durationMs: 0, state: "playing", session: { durationMs: 3000 } });
+	const times = t.requests.filter((q) => q.url.includes("/:/timeline")).map((q) => new URL(q.url).searchParams.get("time"));
+	assert.deepStrictEqual(times, ["90023", "3000"]);
+	t.stop();
+});
+
 test("progress: a direct play stops without a conversion to stop, and a failed stop is no error", async () => {
 	const t = start({ routes: allRoutes({ lan: { stop: () => ({ status: 500, body: "" }) } }) });
 	await t.call("reportProgress", { sourceId: home, itemId: "2", positionMs: 5000, durationMs: 90023, state: "stopped", session: { id: "luneos-a", method: "directplay" } });

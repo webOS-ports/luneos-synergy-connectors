@@ -494,9 +494,11 @@ module.exports = {
 		const s = await serverOf(ctx);
 		const headers = plexHeaders(ctx.creds.clientId, s.token);
 		if (typeof ses.id === "string" && ses.id) { headers["X-Plex-Session-Identifier"] = ses.id; }
+		// Plex answers 400 to a time past the duration, which a player can report at the very end.
+		const duration = Math.round(durationMs || ses.durationMs || 0);
+		const time = duration > 0 ? Math.min(Math.round(positionMs), duration) : Math.round(positionMs);
 		await ctx.http.json({ url: s.base + "/:/timeline?" + query({
-			ratingKey: itemId, key: "/library/metadata/" + itemId, state: done ? "stopped" : state,
-			time: Math.round(positionMs), duration: Math.round(durationMs || ses.durationMs || 0), hasMDE: 1,
+			ratingKey: itemId, key: "/library/metadata/" + itemId, state: done ? "stopped" : state, time, duration, hasMDE: 1,
 		}), headers });
 		if (state === "ended") {
 			await ctx.http.json({ url: s.base + "/:/scrobble?" + query({ key: itemId, identifier: "com.plexapp.plugins.library" }), headers });
