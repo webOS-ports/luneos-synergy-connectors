@@ -10,8 +10,8 @@ var Config = {
 	APP_IDS: ["org.webosports.app.videoplayer", "org.webosports.app.videoplayer-*"],
 	// The providers, by the folder they are installed in (providers/<name>.js on the device,
 	// video/<name>/provider/ in the repository).
-	PROVIDERS: ["jellyfin", "upnp", "peertube"],
-	// How Jellyfin hears of this client.
+	PROVIDERS: ["jellyfin", "upnp", "peertube", "plex"],
+	// How Jellyfin and Plex hear of this client.
 	CLIENT_NAME: "LuneOS Videos",
 	CLIENT_VERSION: "1.0.0",
 };

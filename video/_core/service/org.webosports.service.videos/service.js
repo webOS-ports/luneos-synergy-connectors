@@ -1,5 +1,5 @@
 /* service.js - org.webosports.service.videos: the video services of Synergy (Jellyfin, UPnP/DLNA,
- * PeerTube) for Videos, on _cloudcore/node's bus and HTTP.
+ * PeerTube, Plex) for Videos, on _cloudcore/node's bus and HTTP.
  *
  * The launcher (run-js-service -> jsservicelauncher/bootstrap-node.js) requires this directory, as
  * it has a package.json, and calls run(). Nothing starts on require, so a test can start() the

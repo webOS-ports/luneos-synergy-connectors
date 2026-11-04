@@ -7,6 +7,9 @@
  *   peertube  an instance: typed, or picked from the healthy, non-NSFW instances the directory
  *             (instances.joinpeertube.org) lists, searchable by name
  *   upnp      nothing: one tap adds the media servers on the local network
+ *   plex      a code from plex.tv (plexPin), entered at plex.tv/link on any device; the app asks
+ *             login until the code is linked or runs out. Or, for a server that lets the network
+ *             in without signing in, its address and, if wanted, a token.
  *
  * Every kind calls org.webosports.service.videos/login with the templateId and what was typed; the
  * service checks it against the server and answers the account (username, alias, credentials),
@@ -40,8 +43,17 @@ enyo.kind({
 			text: "Videos will show every UPnP/DLNA media server on this network (MiniDLNA, a NAS, Plex or Jellyfin " +
 				"with DLNA on, ...). There is nothing to sign in to.",
 			button: "Add"
+		},
+		plex: {
+			fields: [],
+			pin: true,
+			text: "Watch the films and series of your Plex servers, and of the servers shared with you, in Videos. " +
+				"Tap Get a Code, then go to plex.tv/link on a computer or another phone, sign in to Plex and enter the code.",
+			button: "Get a Code"
 		}
 	},
+	// How often to ask whether the Plex code was entered.
+	pinPollMs: 3000,
 
 	components: [
 		{ kind: "Toolbar", className: "enyo-toolbar-light accounts-header", pack: "center", components: [
@@ -66,11 +78,20 @@ enyo.kind({
 				{ name: "passwordGroup", kind: "RowGroup", caption: "PASSWORD", className: "accounts-group", showing: false, components: [
 					{ kind: "PasswordInput", name: "password", autoWordComplete: false, hint: "Password (may be empty)" }
 				]},
+				{ name: "tokenGroup", kind: "RowGroup", caption: "TOKEN (OPTIONAL)", className: "accounts-group", showing: false, components: [
+					{ kind: "PasswordInput", name: "token", autoWordComplete: false, hint: "Only if the server asks for one" }
+				]},
+				{ name: "pinBox", showing: false, className: "videoauth-pin", components: [
+					{ name: "pinCode", className: "videoauth-pin-code" },
+					{ name: "pinText", className: "videoauth-note" }
+				]},
 				{ name: "errorBox", showing: false, style: "padding:8px 16px;", components: [
 					{ name: "errorMessage", className: "enyo-text-error" }
 				]},
 				{ name: "primaryButton", kind: "ActivityButton", caption: "Sign In", className: "enyo-button-dark accounts-btn",
 					onclick: "primaryTap" },
+				{ name: "addressLink", showing: false, className: "videoauth-link", content: "Enter a server address instead",
+					onclick: "addressTap" },
 				{ name: "removeAccountButton", kind: "Accounts.RemoveAccount", className: "accounts-btn", showing: false,
 					style: "padding-top:6px;", onAccountsRemove_Done: "removeDone" },
 				{ name: "instanceGroup", kind: "RowGroup", caption: "PEERTUBE INSTANCES", className: "accounts-group", showing: false, components: [
@@ -111,6 +132,9 @@ enyo.kind({
 		this.$.passwordGroup.setShowing(k.fields.indexOf("password") >= 0);
 		if (this.kindId === "peertube") { this.$.server.setHint("peertube.example.org"); }
 		if (this.kindId === "jellyfin") { this.$.server.setHint("jellyfin.example.org or 192.168.1.10:8096"); }
+		if (this.kindId === "plex") { this.$.server.setHint("192.168.1.10 or plex.example.org:32400"); }
+		this.$.addressLink.setShowing(!!k.pin);
+		this.addressMode = false;
 		var account = p.account;
 		if (account && (account._id || account.id)) {
 			try { this.$.removeAccountButton.init(account); this.$.removeAccountButton.show(); } catch (e) { this.log("videoauth: no remove button: " + e); }
@@ -153,15 +177,99 @@ enyo.kind({
 		if (it) { this.$.server.setValue(it.host); this.primaryTap(); }
 	},
 
+	// --- Plex: a code from plex.tv, or an address ---
+	addressTap: function () {
+		if (this.busy || this.done) { return; }
+		this.stopPin();
+		this.addressMode = true;
+		this.$.addressLink.hide();
+		this.$.pinBox.hide();
+		this.$.serverGroup.show();
+		this.$.tokenGroup.show();
+		this.$.bodyText.setContent("For a Plex server that lets this network in without signing in " +
+			"(Settings, Network, \"allowed without auth\"). Enter its address, and a token only if it needs one.");
+		this.$.primaryButton.setCaption("Add");
+		this.showError("");
+	},
+	getPin: function () {
+		this.stopPin();
+		this.busy = true;
+		this.$.primaryButton.setActive(true);
+		this.$.primaryButton.setDisabled(true);
+		this.showError("");
+		this.$.svc.call({}, { method: "plexPin", onSuccess: "gotPin", onFailure: "pinFailure" });
+	},
+	gotPin: function (inSender, r) {
+		if (this.done) { return; }
+		this.busy = false;
+		this.$.primaryButton.setActive(false);
+		this.$.primaryButton.setDisabled(false);
+		this.$.primaryButton.setCaption("Get a New Code");
+		this.pin = { pinId: r.pinId, clientId: r.clientId, until: Date.now() + (r.expiresIn || 900) * 1000 };
+		this.$.pinCode.setContent(esc(r.code));
+		this.$.pinText.setContent("Go to " + esc(r.linkUrl || "plex.tv/link") + ", sign in to Plex and enter this code. " +
+			"This screen goes on by itself once you have.");
+		this.$.pinBox.show();
+		this.schedulePinCheck();
+	},
+	pinFailure: function (inSender, r) {
+		this.busy = false;
+		this.$.primaryButton.setActive(false);
+		this.$.primaryButton.setDisabled(false);
+		this.showError((r && r.errorText) || "plex.tv cannot be reached. Check the network.");
+	},
+	schedulePinCheck: function () {
+		this.pinTimer = window.setTimeout(enyo.bind(this, "checkPin"), this.pinPollMs);
+	},
+	checkPin: function () {
+		this.pinTimer = null;
+		if (this.done || !this.pin) { return; }
+		if (Date.now() > this.pin.until) {
+			this.stopPin();
+			this.$.pinBox.hide();
+			this.$.primaryButton.setCaption("Get a Code");
+			this.showError("The code ran out before it was entered. Get a new one.");
+			return;
+		}
+		this.$.svc.call({ templateId: this.templateId, pinId: this.pin.pinId, clientId: this.pin.clientId },
+			{ method: "login", onSuccess: "pinLinked", onFailure: "pinNotYet" });
+	},
+	pinLinked: function (inSender, r) {
+		this.stopPin();
+		this.loginSuccess(inSender, r);
+	},
+	// Not entered yet, or a network hiccup while waiting: keep asking. Anything else is the answer.
+	pinNotYet: function (inSender, r) {
+		if (this.done || !this.pin) { return; }
+		if (!r || r.errorCode === "NOT_LINKED" || r.errorCode === "SERVER_UNREACHABLE" || r.errorCode === "TIMEOUT") {
+			this.schedulePinCheck();
+			return;
+		}
+		this.stopPin();
+		this.showError(r.errorText || "Plex did not sign you in.");
+		this.log("videoauth: plex login failed " + r.errorCode);
+	},
+	stopPin: function () {
+		if (this.pinTimer) { window.clearTimeout(this.pinTimer); }
+		this.pinTimer = null;
+		this.pin = null;
+	},
+
 	// --- sign-in ---
 	primaryTap: function () {
 		if (this.done || this.busy) { return; }
+		if (this.k.pin && !this.addressMode) { this.getPin(); return; }
 		var trim = function (s) { return (s || "").replace(/^\s+|\s+$/g, ""); };
 		var payload = { templateId: this.templateId };
 		var f = this.k.fields;
 		if (f.indexOf("server") >= 0) { payload.server = trim(this.$.server.getValue()); }
 		if (f.indexOf("username") >= 0) { payload.username = trim(this.$.username.getValue()); }
 		if (f.indexOf("password") >= 0) { payload.password = this.$.password.getValue() || ""; }
+		if (this.addressMode) {
+			f = ["server"];
+			payload.server = trim(this.$.server.getValue());
+			payload.token = trim(this.$.token.getValue());
+		}
 		if ((f.indexOf("server") >= 0 && !payload.server) || (f.indexOf("username") >= 0 && !payload.username)) {
 			this.showError(f.indexOf("username") >= 0 ? "Enter the server's address and your user name." : "Enter the address.");
 			return;
@@ -201,6 +309,7 @@ enyo.kind({
 	finish: function (result) {
 		if (this.done) { return; }
 		this.done = true;
+		this.stopPin();
 		// The result holds credentials: log only how it ended.
 		this.log("videoauth: result returnValue=" + (result && result.returnValue));
 		try { this.$.crossAppResult.sendResult(result); } catch (e) { this.log("videoauth: sendResult threw " + e); }

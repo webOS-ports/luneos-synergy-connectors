@@ -1,0 +1,43 @@
+[
+    {
+        "templateId": "org.webosports.video.plex",
+        "loc_name": "Plex",
+        "icon": {
+            "loc_32x32": "images/plex-32x32.png",
+            "loc_48x48": "images/plex-48x48.png"
+        },
+        "__comment": "The films and series of your Plex servers, and those shared with you, in Videos. Signs in through plex.tv/link with a code, or takes a server's address; Videos and Plex keep each other's place. The customUI app org.webosports.app.videoauth asks for what the provider needs and calls org.webosports.service.videos/login with this templateId, which checks it before Accounts stores the account.",
+        "validator": {
+            "customUI": {
+                "appId": "org.webosports.app.videoauth",
+                "name": "validator.html"
+            },
+            "address": "palm://org.webosports.service.videos/login"
+        },
+        "loc_usernameLabel": "PLEX",
+        "__comment2": "org.webosports.app.videoauth MUST be in write/readPermissions: createAccount runs as the customUI app. org.webosports.service.videos reads the credentials for every catalogue call.",
+        "readPermissions": [
+            "org.webosports.service.videos",
+            "org.webosports.app.videoauth"
+        ],
+        "writePermissions": [
+            "org.webosports.service.videos",
+            "org.webosports.app.videoauth"
+        ],
+        "capabilityProviders": [
+            {
+                "capability": "Video",
+                "capabilitySubtype": "STREAMING",
+                "id": "org.webosports.video.plex.streaming",
+                "alwaysOn": true,
+                "implementation": "palm://org.webosports.service.videos/",
+                "loc_shortName": "Plex",
+                "icon": {
+                    "loc_32x32": "images/plex-32x32.png",
+                    "loc_48x48": "images/plex-48x48.png",
+                    "splitter": "images/plex-32x32.png"
+                }
+            }
+        ]
+    }
+]

@@ -174,6 +174,10 @@ function createVideos({ config, providers, call, http, ssdp = null, log = consol
 					let subs = [{ id: "", name: nameOf(account, provider) }];
 					const ctx = { accountId: account._id, sub: "", account, creds: {}, http, ssdp, log, save: async () => false };
 					if (typeof provider.sources === "function") {
+						// A provider whose sources come from its sign-in (Plex: the servers the
+						// account reaches) needs the credentials, and may store a fresher list.
+						ctx.creds = await credentialsOf(account._id);
+						ctx.save = async (common) => { ctx.creds = common; return saveCredentials(account._id, common); };
 						try { subs = await provider.sources(ctx); }
 						catch (e) { log.error(config.SERVICE_NAME + ": sources of " + provider.id + " failed: " + ((e && e.errorCode) || e)); subs = []; }
 					}

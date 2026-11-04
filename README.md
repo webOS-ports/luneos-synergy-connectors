@@ -8,7 +8,7 @@ and plugs a network or service into the stock apps.
 | `cloud/` | box, dropbox, flickr, google (Drive), hidrive, kdrive, koofr, mega, onedrive, pcloud, immich, photoprism, s3, smugmug, webdav (Nextcloud, ownCloud, any WebDAV server), yandex | Documents (DOCUMENTS) and Photos (PHOTO.UPLOAD) |
 | `im/` | discord, facebook (E2EE), googlechat, signal, teams, telegram, whatsapp | Messaging, through `imlibpurpleservice` and libpurple |
 | `music/` | apple, archive, deezer, jamendo, qobuz, soundcloud, spotify, tidal, youtube | Music, through the streaming daemon |
-| `video/` | jellyfin, peertube, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Plex or Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
+| `video/` | jellyfin, peertube, plex, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Kodi, or Plex and Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
 
 ## Layout
 
@@ -64,20 +64,21 @@ Videos (org.webosports.app.videoplayer) lists every account with the capability
 
 | Method | Takes | Answers |
 |---|---|---|
-| `listSources` | – | `sources`: one per account; one per media server found for UPnP (`sourceId` = account id, or `<account id>\|<UDN>`) |
+| `listSources` | – | `sources`: one per account; one per media server found for UPnP, and one per server a plex.tv account reaches (`sourceId` = account id, or `<account id>\|<UDN or Plex server id>`) |
 | `listSections` | `sourceId` | `sections`: `{id, title, layout: row\|grid}` |
 | `listItems` | `sourceId`, `sectionId` or `parentId`, `cursor`, `limit` | `items`, `nextCursor` |
 | `getItem` | `sourceId`, `itemId` | `item`, with `seasons` (a show) or `children` (a season, a folder) |
 | `search` | `sourceId`, `query`, `cursor`, `limit` | `items`, `nextCursor` |
 | `resolve` | `sourceId`, `itemId`, `prefer {maxHeight, codecs, audioCodecs}` | `stream {url, protocol, subtitles, startMs, session, drm: null}` |
-| `reportProgress` | `sourceId`, `itemId`, `positionMs`, `durationMs`, `state`, `session` | – (Jellyfin keeps its place) |
+| `reportProgress` | `sourceId`, `itemId`, `positionMs`, `durationMs`, `state`, `session` | – (Jellyfin and Plex keep their place) |
 | `login` | `templateId` and what the sign-in app asked for | the account (the validator) |
 | `searchPeerTubeInstances` | `query` | healthy, non-NSFW instances from instances.joinpeertube.org |
+| `plexPin` | – | `pinId`, `code`, `clientId`, `expiresIn`, `linkUrl`: a code to enter at plex.tv/link; `login` with `pinId` and `clientId` then signs in |
 
-Only Videos may browse (`allow`); `login` and the instance list are open, as for the
+Only Videos may browse (`allow`); `login`, `plexPin` and the instance list are open, as for the
 other sign-in apps. Every reply is cut to the shapes in `contract.js`; links are
 http(s) only, and a stream's link can carry the server's token (Jellyfin's
-`ApiKey`) - the service never logs links or credentials. Errors: `AUTH_EXPIRED`,
+`ApiKey`, Plex's `X-Plex-Token`) - the service never logs links or credentials. Errors: `AUTH_EXPIRED`,
 `NOT_FOUND`, `SERVER_UNREACHABLE`, `SERVER_ERROR`, `NO_SOURCE`, `DRM_REQUIRED`,
 `GEO_BLOCKED`, besides _cloudcore's.
 
