@@ -27,7 +27,8 @@
  *        START [pt]                                              (--caller)
  *        ANSWER <rx_master_b64> <remote_ufrag> <remote_pwd>       (--caller, the peer's answer)
  *        RELAY turn <ip> <port> <user> <pass> <udp|tcp|tls>   (optional; MS-TURN relay)
- *        RELAY stun <host> <port>                             (optional)
+ *        RELAY stun <host|ip> <port>                          (optional; a name is resolved here,
+ *                                                               libnice takes only an address)
  *        RCAND <candidate:... sdp line>                       (a remote ICE candidate; repeatable)
  *        RESTART <rx_master_b64|-> <remote_ufrag> <remote_pwd> (mid-call renegotiation: peer swapped
  *                                                               to a new media leg - new remote ICE
@@ -41,6 +42,7 @@
  *        TXKEY <tx_master_b64>                                (our a=crypto inline key for the answer)
  *        CAND <candidate:... sdp line>                        (our local ICE candidate)
  *        AUDIOD <0|1>
+ *        GATHERED                                             (local candidates complete)
  *        READY | ANSWERED | RESTARTED | ERR <msg>
  *
  * Diagnostics go to stderr (g_message/g_printerr), which the plugin's process passes through. The
@@ -59,6 +61,9 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <sys/random.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 
 /* Opus RTP: 48 kHz. PT is dictated by the peer's offer (Teams uses 102); parsed from START. */
 #define TM_OPUS_CLOCKRATE 48000
@@ -90,6 +95,7 @@ typedef struct {
     int           pt;           /* opus payload type from the offer */
 
     void (*cand_cb)(const char *sdp);
+    void (*gathered_cb)(void);
     void (*audiod_cb)(int active);
 
     gboolean      audiod_on;
@@ -261,7 +267,12 @@ static void on_nice_candidate(NiceAgent *agent, NiceCandidate *cand, gpointer us
 }
 
 static void on_nice_gathering_done(NiceAgent *agent, guint stream_id, gpointer user)
-{ (void)agent;(void)stream_id;(void)user; g_message("teams_media: ICE gathering done"); }
+{
+    TeamsMedia *tm = (TeamsMedia *)user;
+    (void)agent; (void)stream_id;
+    g_message("teams_media: ICE gathering done");
+    if (tm->gathered_cb) tm->gathered_cb();
+}
 
 static void on_nice_state(NiceAgent *agent, guint stream_id, guint cid, guint state, gpointer user)
 {
@@ -507,6 +518,8 @@ static int tm_run_pipeline(void)
  *                         emit them for our OFFER, but DEFER the pipeline until tm_apply_answer().
  * Our TX key is returned via *out_txkey_b64 and our libnice-generated local creds via
  * *out_ufrag and *out_pwd; the caller frees them. */
+static void ipc_gathered(void);
+
 static int tm_start(int is_caller, const char *rx_master_b64, const char *remote_ufrag,
                     const char *remote_pwd, int pt,
                     void (*cand_cb)(const char*), void (*audiod_cb)(int),
@@ -516,6 +529,7 @@ static int tm_start(int is_caller, const char *rx_master_b64, const char *remote
     memset(&g_tm, 0, sizeof g_tm);
     g_mutex_init(&g_tm.key_lock);
     g_tm.cand_cb = cand_cb; g_tm.audiod_cb = audiod_cb;
+    g_tm.gathered_cb = ipc_gathered;
     g_tm.pt = pt > 0 ? pt : TM_DEFAULT_PT;
 
     if (!is_caller) {
@@ -615,6 +629,28 @@ static void emit(const char *fmt, ...)
 }
 static void ipc_cand(const char *sdp)  { emit("CAND %s\n", sdp); }
 static void ipc_audiod(int active)     { emit("AUDIOD %d\n", active ? 1 : 0); }
+static void ipc_gathered(void)         { emit("GATHERED\n"); }
+
+/* The IPv4 address of a STUN server given by name or address, into out. libnice's stun-server
+ * property takes an address only; a name was silently never asked, which left a call with host
+ * candidates alone and no way through the NAT. */
+static gboolean resolve_stun_host(const char *host, char *out, size_t outlen)
+{
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    int rc = getaddrinfo(host, NULL, &hints, &res);
+    if (rc != 0 || !res) {
+        g_printerr("teams_media: STUN server %s: %s\n", host, gai_strerror(rc));
+        if (res) freeaddrinfo(res);
+        return FALSE;
+    }
+    const struct sockaddr_in *sin = (const struct sockaddr_in *)res->ai_addr;
+    gboolean ok = inet_ntop(AF_INET, &sin->sin_addr, out, (socklen_t)outlen) != NULL;
+    freeaddrinfo(res);
+    return ok;
+}
 
 /* Wipe a line or string that carried key material. explicit_bzero, because a plain memset right
  * before a free can be dropped as a dead store. */
@@ -638,7 +674,12 @@ static int run_ipc(int is_caller)
             char *ports= strtok_r(NULL, " ", &sp);
             if (kind && host && ports) {
                 int port = atoi(ports);
-                if (!strcmp(kind, "stun")) { snprintf(g_stun_host, sizeof g_stun_host, "%s", host); g_stun_port = port; }
+                if (!strcmp(kind, "stun")) {
+                    if (resolve_stun_host(host, g_stun_host, sizeof g_stun_host)) {
+                        g_stun_port = port;
+                        g_message("teams_media: STUN server %s:%d", host, port);
+                    }
+                }
                 else if (!strcmp(kind, "turn") && g_n_turn < TM_MAX_TURN) {
                     char *u = strtok_r(NULL, " ", &sp), *p = strtok_r(NULL, " ", &sp), *tr = strtok_r(NULL, " ", &sp);
                     TmTurn *t = &g_turn[g_n_turn++];
