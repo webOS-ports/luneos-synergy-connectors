@@ -102,7 +102,17 @@ typedef struct {
     gboolean      running;
 
     GstElement   *rx_audio_caps;    /* rx-rtpcaps: ptdemux routing target for the audio PT */
+
+    /* Call statistics, logged every TM_STATS_SECONDS (tm_stats_tick), so a log of a call with
+     * one-way audio shows which side loses it. Written by the streaming threads' pad probes. */
+    struct {
+        gint tx_pkts, tx_bytes, tx_ssrc, rx_pkts, mic_peak;
+        gint rr_reports, rr_ssrc, rr_frac, rr_cum_lost, rr_hseq;
+    } stats;
+    GSource      *stats_src;
 } TeamsMedia;
+
+#define TM_STATS_SECONDS 5
 
 static TeamsMedia g_tm;
 static gsize      g_inited = 0;
@@ -201,6 +211,142 @@ static void set_rx_master(TeamsMedia *tm, GstBuffer *master)
     tm->rx_master = master;
     g_mutex_unlock(&tm->key_lock);
     if (old) gst_buffer_unref(old);
+}
+
+/* ------------------------------------------------------------------ call statistics ----------- */
+
+/* A second RTP header byte of 192..223 is an RTCP packet type (rtcp-mux, RFC 5761). */
+static gboolean tm_is_rtcp(const guint8 *p, gsize len)
+{
+    return len >= 2 && p[1] >= 192 && p[1] <= 223;
+}
+
+/* The report block about ssrc (0: the first one) in a decrypted compound RTCP packet. TRUE, with
+ * the block's ssrc, fraction lost (of 256), cumulative loss and extended highest sequence number,
+ * if one of its SR or RR packets carries it. */
+static gboolean tm_rtcp_find_report(const guint8 *p, gsize len, guint32 ssrc, guint32 *got_ssrc,
+                                    guint *frac, gint *cum_lost, guint32 *hseq)
+{
+    while (len >= 4) {
+        guint rc = p[0] & 0x1fu, pt = p[1];
+        gsize plen = ((gsize)(((guint)p[2] << 8) | p[3]) + 1) * 4;
+        if ((p[0] >> 6) != 2 || plen > len) return FALSE;
+        if (pt == 200 || pt == 201) {
+            gsize off = pt == 200 ? 28 : 8;   /* SR: ssrc + 20 bytes of sender info; RR: ssrc */
+            for (guint i = 0; i < rc && off + 24 <= plen; i++, off += 24) {
+                const guint8 *b = p + off;
+                guint32 s = GST_READ_UINT32_BE(b);
+                if (!ssrc || s == ssrc) {
+                    guint32 cl = ((guint32)b[5] << 16) | ((guint32)b[6] << 8) | b[7];
+                    *got_ssrc = s;
+                    *frac = b[4];
+                    *cum_lost = (cl & 0x800000u) ? (gint)cl - 0x1000000 : (gint)cl;
+                    *hseq = GST_READ_UINT32_BE(b + 8);
+                    return TRUE;
+                }
+            }
+        }
+        p += plen; len -= plen;
+    }
+    return FALSE;
+}
+
+/* What leaves for the network: packet count and size, and our RTP SSRC. */
+static void tm_count_tx(TeamsMedia *tm, GstBuffer *b)
+{
+    GstMapInfo m;
+    g_atomic_int_inc(&tm->stats.tx_pkts);
+    if (!gst_buffer_map(b, &m, GST_MAP_READ)) return;
+    g_atomic_int_add(&tm->stats.tx_bytes, (gint)m.size);
+    if (m.size >= 12 && (m.data[0] >> 6) == 2 && !tm_is_rtcp(m.data, m.size))
+        g_atomic_int_set(&tm->stats.tx_ssrc, (gint)GST_READ_UINT32_BE(m.data + 8));
+    gst_buffer_unmap(b, &m);
+}
+
+static GstPadProbeReturn tm_probe_tx(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    (void)pad;
+    if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
+        tm_count_tx(tm, GST_PAD_PROBE_INFO_BUFFER(info));
+    } else if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+        GstBufferList *l = GST_PAD_PROBE_INFO_BUFFER_LIST(info);
+        for (guint i = 0; i < gst_buffer_list_length(l); i++) tm_count_tx(tm, gst_buffer_list_get(l, i));
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn tm_probe_rx(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    (void)pad; (void)info;
+    g_atomic_int_inc(&tm->stats.rx_pkts);
+    return GST_PAD_PROBE_OK;
+}
+
+/* The loudest S16 sample the microphone gave since the last stats line: 0 means silence. */
+static GstPadProbeReturn tm_probe_mic(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    GstBuffer *b = GST_PAD_PROBE_INFO_BUFFER(info);
+    GstMapInfo m;
+    gint peak = g_atomic_int_get(&tm->stats.mic_peak);
+    (void)pad;
+    if (!b || !gst_buffer_map(b, &m, GST_MAP_READ)) return GST_PAD_PROBE_OK;
+    for (gsize i = 0; i + 1 < m.size; i += 2) {
+        gint v = (gint16)GST_READ_UINT16_LE(m.data + i);
+        if (v < 0) v = -v;
+        if (v > peak) peak = v;
+    }
+    gst_buffer_unmap(b, &m);
+    g_atomic_int_set(&tm->stats.mic_peak, peak);
+    return GST_PAD_PROBE_OK;
+}
+
+/* The peer's RTCP reports: what it says it receives from us. */
+static GstPadProbeReturn tm_probe_rtcp(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    GstBuffer *b = GST_PAD_PROBE_INFO_BUFFER(info);
+    GstMapInfo m;
+    guint32 got = 0, hseq = 0; guint frac = 0; gint lost = 0;
+    (void)pad;
+    if (!b || !gst_buffer_map(b, &m, GST_MAP_READ)) return GST_PAD_PROBE_OK;
+    if (tm_rtcp_find_report(m.data, m.size, (guint32)g_atomic_int_get(&tm->stats.tx_ssrc),
+                            &got, &frac, &lost, &hseq)) {
+        g_atomic_int_inc(&tm->stats.rr_reports);
+        g_atomic_int_set(&tm->stats.rr_ssrc, (gint)got);
+        g_atomic_int_set(&tm->stats.rr_frac, (gint)frac);
+        g_atomic_int_set(&tm->stats.rr_cum_lost, lost);
+        g_atomic_int_set(&tm->stats.rr_hseq, (gint)hseq);
+    }
+    gst_buffer_unmap(b, &m);
+    return GST_PAD_PROBE_OK;
+}
+
+static gboolean tm_stats_tick(gpointer user)
+{
+    TeamsMedia *tm = user;
+    gint mic = g_atomic_int_get(&tm->stats.mic_peak);
+    g_atomic_int_set(&tm->stats.mic_peak, 0);
+    g_message("teams_media: stats tx=%d pkts/%d B ssrc=%u mic_peak=%d rx=%d pkts "
+              "peer_reports_about_us=%d (last: ssrc=%u lost=%d frac=%d/256 hseq=%u)",
+              g_atomic_int_get(&tm->stats.tx_pkts), g_atomic_int_get(&tm->stats.tx_bytes),
+              (guint)g_atomic_int_get(&tm->stats.tx_ssrc), mic, g_atomic_int_get(&tm->stats.rx_pkts),
+              g_atomic_int_get(&tm->stats.rr_reports), (guint)g_atomic_int_get(&tm->stats.rr_ssrc),
+              g_atomic_int_get(&tm->stats.rr_cum_lost), g_atomic_int_get(&tm->stats.rr_frac),
+              (guint)g_atomic_int_get(&tm->stats.rr_hseq));
+    return G_SOURCE_CONTINUE;
+}
+
+/* A buffer probe on el's pad. */
+static void tm_add_probe(GstElement *el, const char *pad_name, GstPadProbeType type,
+                         GstPadProbeCallback cb, TeamsMedia *tm)
+{
+    GstPad *pad = gst_element_get_static_pad(el, pad_name);
+    if (!pad) return;
+    gst_pad_add_probe(pad, type, cb, tm, NULL);
+    gst_object_unref(pad);
 }
 
 static GstCaps *opus_rtp_caps(int pt)
@@ -474,6 +620,14 @@ static gboolean build_pipeline(TeamsMedia *tm)
     if (!gst_element_link_many(asrc, tconv, tres, tcap, oenc, pay, senc, txq, nsink, NULL)) {
         g_printerr("teams_media: TX audio link failed\n"); return FALSE; }
 
+    tm_add_probe(nsink, "sink", GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, tm_probe_tx, tm);
+    tm_add_probe(nsrc, "src", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_rx, tm);
+    tm_add_probe(tcap, "src", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_mic, tm);
+    tm_add_probe(sdec, "rtcp_src", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_rtcp, tm);
+    tm->stats_src = g_timeout_source_new_seconds(TM_STATS_SECONDS);
+    g_source_set_callback(tm->stats_src, tm_stats_tick, tm, NULL);
+    g_source_attach(tm->stats_src, tm->ctx);
+
     GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(tm->pipeline));
     GSource *src = gst_bus_create_watch(bus);
     g_source_set_callback(src, G_SOURCE_FUNC(on_bus), tm, NULL);
@@ -607,6 +761,7 @@ static void tm_stop(void)
     g_tm.audiod_on = FALSE;
     if (g_tm.loop) g_main_loop_quit(g_tm.loop);
     if (g_tm.thread) { g_thread_join(g_tm.thread); g_tm.thread = NULL; }
+    if (g_tm.stats_src) { g_source_destroy(g_tm.stats_src); g_source_unref(g_tm.stats_src); g_tm.stats_src = NULL; }
     if (g_tm.pipeline) { gst_object_unref(g_tm.pipeline); g_tm.pipeline = NULL; }
     if (g_tm.agent) { g_object_unref(g_tm.agent); g_tm.agent = NULL; }
     set_rx_master(&g_tm, NULL);
