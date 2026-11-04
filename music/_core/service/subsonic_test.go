@@ -30,6 +30,8 @@ type fakeSubsonic struct {
 	requests   []url.Values
 	paths      []string
 	streamBody []byte
+	// manyArtists and manyAlbums pad getArtists and getAlbumList2, to reach the caps.
+	manyArtists, manyAlbums int
 }
 
 func newFakeSubsonic(t *testing.T) *fakeSubsonic {
@@ -104,6 +106,44 @@ func (f *fakeSubsonic) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		http.ServeContent(w, r, "a.mp3", time.Unix(0, 0), bytes.NewReader(f.streamBody))
+	case "/rest/getArtists.view":
+		many := []map[string]interface{}{}
+		for i := 0; i < f.manyArtists; i++ {
+			many = append(many, map[string]interface{}{"id": fmt.Sprintf("x%d", i), "name": "X"})
+		}
+		ssReply(w, map[string]interface{}{"artists": map[string]interface{}{"index": []map[string]interface{}{
+			{"name": "O", "artist": []map[string]interface{}{
+				{"id": "ar2", "name": "Other Band", "albumCount": 1, "coverArt": "ar-2",
+					"artistImageUrl": "http://server/share/img/SIGNED?size=600"},
+				{"id": "", "name": "broken"}}},
+			{"name": "T", "artist": []map[string]interface{}{{"id": "ar1", "name": "Test Artist", "albumCount": 2}}},
+			{"name": "X", "artist": many},
+		}}})
+	case "/rest/getArtist.view":
+		if q.Get("id") != "ar1" {
+			ssFail(w, 70, "Artist not found")
+			return
+		}
+		ssReply(w, map[string]interface{}{"artist": map[string]interface{}{"id": "ar1", "name": "Test Artist", "album": []map[string]interface{}{
+			{"id": "al1", "name": "First Album", "artist": "Test Artist", "artistId": "ar1", "year": 2024, "coverArt": "al-1", "songCount": 2},
+			{"id": "", "name": "broken"},
+			{"id": "al3", "name": "Third Album", "artist": "Test Artist", "artistId": "ar1", "songCount": 1},
+		}}})
+	case "/rest/getAlbum.view":
+		if q.Get("id") != "al1" {
+			ssFail(w, 70, "Album not found")
+			return
+		}
+		ssReply(w, map[string]interface{}{"album": map[string]interface{}{"id": "al1", "song": []map[string]interface{}{
+			{"id": "s1", "title": "Morning Tone", "album": "First Album", "duration": 40, "coverArt": "al-1"},
+			{"id": "s4", "title": "Evening Tone", "album": "First Album", "duration": 35},
+		}}})
+	case "/rest/getAlbumList2.view":
+		albums := []map[string]interface{}{{"id": "al2", "name": "Second Album", "artist": "Other Band", "artistId": "ar2", "songCount": 2}}
+		for i := 0; i < f.manyAlbums; i++ {
+			albums = append(albums, map[string]interface{}{"id": fmt.Sprintf("y%d", i), "name": "Y"})
+		}
+		ssReply(w, map[string]interface{}{"albumList2": map[string]interface{}{"album": albums}})
 	case "/rest/getCoverArt.view":
 		w.Header().Set("Content-Type", "image/jpeg")
 		_, _ = w.Write([]byte("jpeg:" + q.Get("id") + ":" + q.Get("size")))
@@ -603,5 +643,173 @@ func TestSubsonicThroughTheProviderRoutes(t *testing.T) {
 	handleProviderRoute(rec, httptest.NewRequest("POST", "/provider/subsonic/resolve", strings.NewReader(`{"trackId":"s1"}`)))
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"url":"http://127.0.0.1:8730/subsonicstream?id=s1"`) {
 		t.Errorf("resolve: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSubsonicBrowsesTheLibrary(t *testing.T) {
+	f := newFakeSubsonic(t)
+	p := useSubsonic(t, f)
+	ctx := context.Background()
+	artists, err := p.Artists(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []providerArtist{
+		{ID: "ar2", Provider: "subsonic", Name: "Other Band", Thumbnail: "http://127.0.0.1:8730/subsonicart?id=ar-2", Albums: 1},
+		{ID: "ar1", Provider: "subsonic", Name: "Test Artist", Albums: 2},
+	}
+	if fmt.Sprint(artists) != fmt.Sprint(want) {
+		t.Errorf("artists %+v\nwant %+v", artists, want)
+	}
+	albums, err := p.ArtistAlbums(ctx, "ar1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(albums) != 2 || albums[0] != (providerAlbum{ID: "al1", Provider: "subsonic", Name: "First Album", Artist: "Test Artist",
+		ArtistID: "ar1", Year: 2024, Thumbnail: "http://127.0.0.1:8730/subsonicart?id=al-1", Tracks: 2}) || albums[1].Thumbnail != "" {
+		t.Errorf("albums %+v", albums)
+	}
+	if f.requests[1].Get("id") != "ar1" {
+		t.Errorf("getArtist asked %v", f.requests[1])
+	}
+	tracks, err := p.AlbumTracks(ctx, "al1")
+	if err != nil || len(tracks) != 2 || tracks[0].Path != "subsonic:s1" || tracks[1].Title != "Evening Tone" || tracks[0].DurationMs != 40000 {
+		t.Errorf("tracks %+v %v", tracks, err)
+	}
+	if _, err := p.ArtistAlbums(ctx, "nope"); err == nil || err.Error() != "not found on the server" {
+		t.Errorf("a missing artist: %v", err)
+	}
+	if _, err := p.AlbumTracks(ctx, "nope"); err == nil || err.Error() != "not found on the server" {
+		t.Errorf("a missing album: %v", err)
+	}
+}
+
+func TestSubsonicAlbumLists(t *testing.T) {
+	f := newFakeSubsonic(t)
+	p := useSubsonic(t, f)
+	for list, typ := range map[string]string{"newest": "newest", "recent": "recent", "frequent": "frequent",
+		"random": "random", "alphabetical": "alphabeticalByName"} {
+		f.requests = nil
+		albums, err := p.Albums(context.Background(), list)
+		if err != nil || len(albums) != 1 || albums[0].Name != "Second Album" {
+			t.Errorf("%s: %+v %v", list, albums, err)
+		}
+		if q := f.requests[0]; q.Get("type") != typ || q.Get("size") != "60" {
+			t.Errorf("%s asked %v", list, q)
+		}
+	}
+	f.requests = nil
+	if _, err := p.Albums(context.Background(), "starred"); err == nil || len(f.requests) != 0 {
+		t.Errorf("an unknown list: %v, %d requests", err, len(f.requests))
+	}
+}
+
+func TestSubsonicBrowsingIsBounded(t *testing.T) {
+	f := newFakeSubsonic(t)
+	f.manyArtists, f.manyAlbums = maxArtists+3, maxAlbums+3
+	p := useSubsonic(t, f)
+	if a, err := p.Artists(context.Background()); err != nil || len(a) != maxArtists {
+		t.Errorf("artists: %d %v", len(a), err)
+	}
+	if a, err := p.Albums(context.Background(), "newest"); err != nil || len(a) != maxAlbums {
+		t.Errorf("albums: %d %v", len(a), err)
+	}
+}
+
+// useJamendo puts Jamendo, a provider with no library to browse, in the registry.
+func useJamendo(t *testing.T) {
+	t.Helper()
+	providersMu.Lock()
+	old, had := providers["jamendo"]
+	providers["jamendo"] = newJamendoProvider()
+	providersMu.Unlock()
+	t.Cleanup(func() {
+		providersMu.Lock()
+		if had {
+			providers["jamendo"] = old
+		} else {
+			delete(providers, "jamendo")
+		}
+		providersMu.Unlock()
+	})
+}
+
+func TestBrowseRoutes(t *testing.T) {
+	f := newFakeSubsonic(t)
+	useSubsonic(t, f)
+	useJamendo(t)
+	get := func(path string) (int, map[string]json.RawMessage) {
+		rec := httptest.NewRecorder()
+		handleProviderRoute(rec, httptest.NewRequest("GET", path, nil))
+		var m map[string]json.RawMessage
+		_ = json.Unmarshal(rec.Body.Bytes(), &m)
+		return rec.Code, m
+	}
+	for path, key := range map[string]string{
+		"/provider/subsonic/artists":            "artists",
+		"/provider/subsonic/artist?id=ar1":      "albums",
+		"/provider/subsonic/album?id=al1":       "tracks",
+		"/provider/subsonic/albums":             "albums",
+		"/provider/subsonic/albums?list=random": "albums",
+	} {
+		code, m := get(path)
+		if code != 200 || len(m[key]) < 3 {
+			t.Errorf("%s: %d %v", path, code, m)
+		}
+		for _, raw := range m {
+			if strings.Contains(string(raw), "SIGNED") || strings.Contains(string(raw), "t=") {
+				t.Errorf("%s gives a server URL: %s", path, raw)
+			}
+		}
+	}
+	f.requests = nil
+	if code, _ := get("/provider/subsonic/albums"); code != 200 || f.requests[0].Get("type") != "newest" {
+		t.Errorf("no list named: %d, asked %v", code, f.requests)
+	}
+	for path, want := range map[string]int{
+		"/provider/subsonic/artist":              http.StatusBadRequest,
+		"/provider/subsonic/album":               http.StatusBadRequest,
+		"/provider/subsonic/albums?list=starred": http.StatusBadRequest,
+		"/provider/subsonic/artist?id=nope":      http.StatusBadGateway,
+		"/provider/jamendo/artists":              http.StatusConflict,
+	} {
+		if code, m := get(path); code != want {
+			t.Errorf("%s: %d %v", path, code, m)
+		}
+	}
+	if f.requests[len(f.requests)-1].Get("id") != "nope" {
+		t.Errorf("the refused requests reached the server")
+	}
+}
+
+func TestProvidersSayWhichBrowse(t *testing.T) {
+	f := newFakeSubsonic(t)
+	useSubsonic(t, f)
+	useJamendo(t)
+	rec := httptest.NewRecorder()
+	handleProviders(rec, httptest.NewRequest("GET", "/providers", nil))
+	var r struct {
+		Providers []map[string]interface{} `json:"providers"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &r); err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	for _, p := range r.Providers {
+		switch p["id"] {
+		case "subsonic":
+			seen++
+			if p["browse"] != true {
+				t.Errorf("subsonic: %v", p)
+			}
+		case "jamendo":
+			seen++
+			if _, there := p["browse"]; there {
+				t.Errorf("jamendo says browse: %v", p)
+			}
+		}
+	}
+	if seen != 2 {
+		t.Errorf("providers %v", r.Providers)
 	}
 }

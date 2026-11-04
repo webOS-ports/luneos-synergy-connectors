@@ -502,3 +502,117 @@ func handleSubsonicAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]interface{}{"ok": true, "username": user + "@" + host})
 }
+
+// --- browsing (libraryBrowser, browse.go) ------------------------------------
+
+// subsonicAlbum is an album ("AlbumID3") as getArtist and getAlbumList2 give it.
+type subsonicAlbum struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Artist    string `json:"artist"`
+	ArtistID  string `json:"artistId"`
+	Year      int    `json:"year"`
+	CoverArt  string `json:"coverArt"`
+	SongCount int    `json:"songCount"`
+}
+
+func subsonicAlbums(in []subsonicAlbum) []providerAlbum {
+	out := []providerAlbum{}
+	for _, a := range in {
+		if a.ID == "" {
+			continue
+		}
+		out = append(out, providerAlbum{ID: a.ID, Provider: "subsonic", Name: a.Name, Artist: a.Artist, ArtistID: a.ArtistID,
+			Year: a.Year, Thumbnail: subsonicArtURL(a.CoverArt), Tracks: a.SongCount})
+		if len(out) == maxAlbums {
+			break
+		}
+	}
+	return out
+}
+
+// Artists is the ID3 artist index (getArtists), the server's own order kept:
+// it sorts as its users set it up (articles ignored and the like).
+func (p *subsonicProvider) Artists(ctx context.Context) ([]providerArtist, error) {
+	var r struct {
+		Artists struct {
+			Index []struct {
+				Artist []struct {
+					ID         string `json:"id"`
+					Name       string `json:"name"`
+					AlbumCount int    `json:"albumCount"`
+					CoverArt   string `json:"coverArt"`
+				} `json:"artist"`
+			} `json:"index"`
+		} `json:"artists"`
+	}
+	if err := p.cl.call(ctx, "getArtists", nil, &r); err != nil {
+		return nil, err
+	}
+	out := []providerArtist{}
+	for _, ix := range r.Artists.Index {
+		for _, a := range ix.Artist {
+			if a.ID == "" {
+				continue
+			}
+			out = append(out, providerArtist{ID: a.ID, Provider: "subsonic", Name: a.Name,
+				Thumbnail: subsonicArtURL(a.CoverArt), Albums: a.AlbumCount})
+			if len(out) == maxArtists {
+				return out, nil
+			}
+		}
+	}
+	return out, nil
+}
+
+func (p *subsonicProvider) ArtistAlbums(ctx context.Context, artistID string) ([]providerAlbum, error) {
+	v := url.Values{}
+	v.Set("id", artistID)
+	var r struct {
+		Artist struct {
+			Album []subsonicAlbum `json:"album"`
+		} `json:"artist"`
+	}
+	if err := p.cl.call(ctx, "getArtist", v, &r); err != nil {
+		return nil, err
+	}
+	return subsonicAlbums(r.Artist.Album), nil
+}
+
+func (p *subsonicProvider) AlbumTracks(ctx context.Context, albumID string) ([]providerTrack, error) {
+	v := url.Values{}
+	v.Set("id", albumID)
+	var r struct {
+		Album struct {
+			Song []subsonicSong `json:"song"`
+		} `json:"album"`
+	}
+	if err := p.cl.call(ctx, "getAlbum", v, &r); err != nil {
+		return nil, err
+	}
+	return subsonicTracks(r.Album.Song, maxAlbumTracks), nil
+}
+
+// subsonicListTypes names albumLists in getAlbumList2's words.
+var subsonicListTypes = map[string]string{
+	"newest": "newest", "recent": "recent", "frequent": "frequent", "random": "random", "alphabetical": "alphabeticalByName",
+}
+
+func (p *subsonicProvider) Albums(ctx context.Context, list string) ([]providerAlbum, error) {
+	typ, ok := subsonicListTypes[list]
+	if !ok {
+		return nil, fmt.Errorf("subsonic: no album list %q", list)
+	}
+	v := url.Values{}
+	v.Set("type", typ)
+	v.Set("size", strconv.Itoa(albumListSize))
+	var r struct {
+		List struct {
+			Album []subsonicAlbum `json:"album"`
+		} `json:"albumList2"`
+	}
+	if err := p.cl.call(ctx, "getAlbumList2", v, &r); err != nil {
+		return nil, err
+	}
+	return subsonicAlbums(r.List.Album), nil
+}

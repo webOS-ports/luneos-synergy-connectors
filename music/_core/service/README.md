@@ -97,3 +97,19 @@ and it never expires; so the app never sees a server URL: tracks play from
 `/subsonicstream?id=` and covers come from `/subsonicart?id=[&size=]`, which
 add the sign-in and pass Range on for seeking. Errors never carry the URL
 they failed on.
+
+## Browsing a library
+
+A provider with a library to walk implements `libraryBrowser` (`browse.go`),
+and `/providers` marks it `"browse": true` (left out for the others):
+
+| Route | Returns |
+|---|---|
+| `GET /provider/<id>/artists` | `{artists: [{id, provider, name, thumbnail, albums}]}` |
+| `GET /provider/<id>/artist?id=` | `{albums: [{id, provider, name, artist, artist_id, year, thumbnail, tracks}]}` |
+| `GET /provider/<id>/album?id=` | `{tracks: [providerTrack]}`, in the album's order |
+| `GET /provider/<id>/albums?list=` | `{albums}`: `newest` (the default), `recent`, `frequent`, `random`, `alphabetical` |
+
+Subsonic answers them from getArtists, getArtist, getAlbum and getAlbumList2;
+its covers come through `/subsonicart` as everywhere else (Navidrome's
+`artistImageUrl` is a signed link to the server, and is not used).
