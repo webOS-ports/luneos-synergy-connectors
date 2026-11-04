@@ -83,3 +83,17 @@ A pause - a key, or `/player/pause` - holds librespot's output still at once
 (SIGSTOP of its gst-launch) besides pausing it through the Web API, so it is
 silent without a network too (`librespotcontrol.go`); play, next and previous
 let it go.
+
+## Subsonic (your own server)
+
+`subsonic.go`: a server that speaks the Subsonic API (Navidrome, Airsonic,
+Gonic...). The sign-in app posts `{server, username, password}` to
+`/subsonicauth/login`, which pings the server before keeping them in
+`subsonic-auth` (and keymanager). Search, playlists and playback go through
+the provider routes as for any other service.
+
+The sign-in is a token (md5 of password and a fresh salt) on every request,
+and it never expires; so the app never sees a server URL: tracks play from
+`/subsonicstream?id=` and covers come from `/subsonicart?id=[&size=]`, which
+add the sign-in and pass Range on for seeking. Errors never carry the URL
+they failed on.

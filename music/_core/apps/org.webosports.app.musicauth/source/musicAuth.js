@@ -11,6 +11,8 @@
  *   tidal   -> device-code, shown WhatsApp "link-code" style (code + instructions);
  *              polls /tidalauth/poll, then names the account with the real username.
  *   qobuz   -> email + password -> /qobuzauth/login.
+ *   subsonic -> server + username + password -> /subsonicauth/login (Navidrome,
+ *              Airsonic, Gonic... - any server that speaks the Subsonic API).
  *   deezer  -> email + password -> /dzauth/login (pulls the ARL for you); if Deezer
  *              blocks the login it reveals an ARL field -> /dzauth/save.
  *   youtube/soundcloud/jamendo/archive -> no credentials, just add.
@@ -67,6 +69,14 @@ enyo.kind({
 		{ kind: "Scroller", flex: 1, components: [
 			// ------- credential / info entry -------
 			{ name: "entryBox", className: "box-center", components: [
+				{ name: "serverGroup", showing: false, kind: "RowGroup", caption: "SERVER", className: "accounts-group", components: [
+					{ kind: "Input", name: "server", hint: "nas.local:4533", spellcheck: false,
+					  autocorrect: false, autoWordComplete: false, autoCapitalize: "lowercase", oninput: "validateInput" }
+				]},
+				{ name: "userGroup", showing: false, kind: "RowGroup", caption: "USERNAME", className: "accounts-group", components: [
+					{ kind: "Input", name: "user", hint: "Username", spellcheck: false,
+					  autocorrect: false, autoWordComplete: false, autoCapitalize: "lowercase", oninput: "validateInput" }
+				]},
 				{ name: "emailGroup", showing: false, kind: "RowGroup", caption: "EMAIL", className: "accounts-group", components: [
 					{ kind: "Input", name: "email", hint: "you@example.com", spellcheck: false,
 					  autocorrect: false, autoWordComplete: false, autoCapitalize: "lowercase", oninput: "validateInput" }
@@ -145,6 +155,7 @@ enyo.kind({
 		if (id === "spotify") { return "spotify"; }
 		if (id === "tidal") { return "tidal"; }
 		if (id === "qobuz") { return "qobuz"; }
+		if (id === "subsonic") { return "subsonic"; }
 		if (id === "deezer") { return "deezer"; }
 		if (id === "apple") { return "apple"; }
 		return "noauth";
@@ -157,6 +168,14 @@ enyo.kind({
 				this.$.emailGroup.setShowing(true);
 				this.$.passwordGroup.setShowing(true);
 				this.$.bodyText.setContent("Sign in to <b>" + this.serviceName + "</b> with your account email and password.");
+				this.$.signInButton.setCaption("Sign In");
+				this.$.signInButton.setDisabled(true);
+				break;
+			case "subsonic":
+				this.$.serverGroup.setShowing(true);
+				this.$.userGroup.setShowing(true);
+				this.$.passwordGroup.setShowing(true);
+				this.$.bodyText.setContent("Sign in to your music server: <b>Navidrome</b>, Airsonic, Gonic or any other that speaks the Subsonic API. The address is the one you open it at in a browser.");
 				this.$.signInButton.setCaption("Sign In");
 				this.$.signInButton.setDisabled(true);
 				break;
@@ -199,6 +218,10 @@ enyo.kind({
 				ok = this.trim(this.$.email.getValue()).length > 0 && this.trim(this.$.password.getValue()).length > 0;
 			}
 			this.$.signInButton.setDisabled(!ok);
+		} else if (this.mode === "subsonic") {
+			// The password as typed: spaces in it are its own.
+			this.$.signInButton.setDisabled(!(this.trim(this.$.server.getValue()) && this.trim(this.$.user.getValue()) &&
+				this.$.password.getValue()));
 		}
 	},
 
@@ -217,6 +240,7 @@ enyo.kind({
 		this.showError("");
 		switch (this.mode) {
 			case "qobuz": this.doQobuz(); break;
+			case "subsonic": this.doSubsonic(); break;
 			case "deezer": this._deezerFallback ? this.doDeezerArl() : this.doDeezer(); break;
 			case "spotify": this.attemptFinish(true); break;
 			default: this.finishService(this.serviceName); // noauth
@@ -232,6 +256,17 @@ enyo.kind({
 			this.busy(false);
 			if (ok && j && j.ok) { this.finishService(j.username || email); }
 			else { this.showError((j && j.error) || "Qobuz sign-in failed — check your credentials."); }
+		}));
+	},
+
+	doSubsonic: function () {
+		var server = this.trim(this.$.server.getValue()), user = this.trim(this.$.user.getValue()), pw = this.$.password.getValue();
+		if (!server || !user || !pw) { return; }
+		this.busy(true);
+		this.post(BACKEND + "/subsonicauth/login", { server: server, username: user, password: pw }, enyo.bind(this, function (ok, j) {
+			this.busy(false);
+			if (ok && j && j.ok) { this.finishService(j.username || user); }
+			else { this.showError((j && j.error) || "Could not sign in to the server - check its address, your username and password."); }
 		}));
 	},
 
