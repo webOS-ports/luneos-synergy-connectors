@@ -21,13 +21,13 @@ override CFLAGS += -fPIC $(WARN) $(PKG_CFLAGS)
 
 H264_DIR = ../tdlib-purple
 
-SRCS = audio_pipeline.cpp call_engine.cpp crypto_helper.cpp dtls_transport.cpp \
+SRCS = audio_pipeline.cpp call_engine.cpp content_negotiation.cpp crypto_helper.cpp dtls_transport.cpp \
        encrypted_connection.cpp ice_session.cpp media_session.cpp signaling_message.cpp \
        srtp_session.cpp
 OBJS = $(SRCS:.cpp=.o) h264_rtp.o
 
 # The tests that run anywhere: no ALSA device, no network beyond loopback.
-TESTS = spike/codec_crypto_smoke spike/srtp_e2e_smoke spike/dtls_loopback_smoke \
+TESTS = spike/codec_crypto_smoke spike/negotiation_smoke spike/srtp_e2e_smoke spike/dtls_loopback_smoke \
         spike/ice_loopback_smoke spike/media_session_e2e_smoke spike/call_engine_e2e_smoke \
         spike/nice_srtp_smoke
 # opus_codec_smoke opens real ALSA devices; it is built but not run by "make check".

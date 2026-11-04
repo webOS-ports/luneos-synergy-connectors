@@ -1,5 +1,6 @@
 #include "call_engine.h"
 #include "signaling_message.h"
+#include "rtp_header.h"
 #include "../tdlib-purple/h264_rtp.h"
 
 #include <cstdio>
@@ -9,7 +10,7 @@ namespace tgcalls_lite {
 
 namespace {
 
-constexpr uint8_t kOpusPayloadType = 111;  // near-universal WebRTC/tgcalls default
+constexpr uint8_t kOpusPayloadType = 111;  // what we offer; the peer's answer keeps our ids
 constexpr uint32_t kOpusClockRate = 48000;
 constexpr uint8_t kH264PayloadType = 100;  // matches voipkit.cpp's kRtpPayloadType convention
 constexpr uint32_t kH264ClockRate = 90000;
@@ -50,6 +51,8 @@ MediaContent build_audio_content(uint32_t ssrc) {
 	opus.channels = 2; // RFC 7587: Opus is always declared as 2 channels in SDP regardless of the
 	                    // actual encoded channel count (a real per-packet property, not fixed by
 	                    // the payload type) -- matches every real WebRTC/tgcalls implementation.
+	opus.parameters.push_back({"minptime", "10"});
+	opus.parameters.push_back({"useinbandfec", "1"});
 	c.payloadTypes.push_back(opus);
 	return c;
 }
@@ -71,16 +74,33 @@ MediaContent build_video_content(uint32_t ssrc) {
 	h264.feedbackTypes.push_back(nack);
 	FeedbackType pli; pli.type = "nack"; pli.subtype = "pli";
 	h264.feedbackTypes.push_back(pli);
+	FeedbackType fir; fir.type = "ccm"; fir.subtype = "fir";
+	h264.feedbackTypes.push_back(fir);
 	c.payloadTypes.push_back(h264);
 	return c;
+}
+
+uint32_t random_exchange_id() {
+	uint32_t id;
+	do {
+		id = g_random_int();
+	} while (id == 0);
+	return id;
 }
 
 } // namespace
 
 CallEngine::CallEngine(GMainContext *ctx, const uint8_t *key256, bool isOutgoing, bool isVideo)
-	: _enc(key256, isOutgoing), _media(ctx, isOutgoing), _isVideo(isVideo) {
+	: _enc(key256, isOutgoing), _media(ctx, isOutgoing), _isOutgoing(isOutgoing), _isVideo(isVideo) {
 	_localAudioSsrc = random_ssrc();
-	_localVideoSsrc = random_ssrc();
+	do {
+		_localVideoSsrc = random_ssrc();
+	} while (_localVideoSsrc == _localAudioSsrc);
+
+	std::vector<MediaContent> local;
+	local.push_back(build_audio_content(_localAudioSsrc));
+	if (_isVideo) local.push_back(build_video_content(_localVideoSsrc));
+	_negotiator = std::make_unique<ContentNegotiator>(isOutgoing, std::move(local));
 
 	auto *depkt = new h264_depacketizer();
 	h264_depacketizer_init(depkt);
@@ -88,7 +108,8 @@ CallEngine::CallEngine(GMainContext *ctx, const uint8_t *key256, bool isOutgoing
 
 	_media.onGatheringDone = [this]() {
 		sendInitialSetupAndCandidates();
-		sendNegotiateChannels();
+		// As in tgcalls, the caller offers first; the callee offers once it has answered.
+		if (_isOutgoing) sendOfferIfNeeded();
 	};
 	_media.onStateChanged = [this](MediaSessionState s) {
 		if (s == MediaSessionState::Ready && onMediaReady) onMediaReady();
@@ -96,9 +117,11 @@ CallEngine::CallEngine(GMainContext *ctx, const uint8_t *key256, bool isOutgoing
 	_media.onRtpReceived = [this](const uint8_t *payload, int len) { handleIncomingRtp(payload, len); };
 
 	_audio.onEncodedFrame = [this](const uint8_t *opusPacket, int len) {
+		const int pt = _negotiator->codecs().outgoingAudioPt;
+		if (pt < 0 || len <= 0) return; // the peer has not accepted our audio yet
 		uint8_t pkt[kRtpHeaderLen + 1500];
 		if ((size_t)len > sizeof(pkt) - kRtpHeaderLen) return; // implausibly large Opus packet, drop
-		build_rtp_header(pkt, kOpusPayloadType, _audioSeq++, _audioTimestamp, _localAudioSsrc, 1);
+		build_rtp_header(pkt, (uint8_t)pt, _audioSeq++, _audioTimestamp, _localAudioSsrc, 1);
 		_audioTimestamp += kOpusTimestampPerFrame;
 		memcpy(pkt + kRtpHeaderLen, opusPacket, len);
 		int totalLen = (int)(kRtpHeaderLen + len);
@@ -112,6 +135,10 @@ CallEngine::~CallEngine() {
 		h264_depacketizer_free(depkt);
 		delete depkt;
 	}
+}
+
+size_t CallEngine::setServers(const std::vector<RtcServer> &servers) {
+	return _media.setServers(servers);
 }
 
 void CallEngine::start() {
@@ -146,9 +173,11 @@ void CallEngine::handleParsedMessage(const SignalingMessage &msg) {
 			const auto &setup = msg.initialSetup;
 			_media.setRemoteIceCredentials(setup.ufrag, setup.pwd);
 			if (!setup.fingerprints.empty()) {
-				// Only sha-256/single-fingerprint handled for now -- matches the one profile
-				// DtlsTransport offers (see its header comment on SRTP_AES128_CM_SHA1_80 being
-				// the only cipher suite currently wired up).
+				// tgcalls sends one sha-256 fingerprint. Our DTLS role is fixed (caller = client),
+				// which is what a tgcalls peer's "actpass" (caller) or "passive" (callee) gives.
+				const std::string &peerSetup = setup.fingerprints[0].setup;
+				if (peerSetup == (_isOutgoing ? "active" : "passive"))
+					g_warning("tgcalls-lite: peer DTLS setup \"%s\" conflicts with our role", peerSetup.c_str());
 				_media.setRemoteDtlsFingerprint(setup.fingerprints[0].fingerprint);
 			}
 			break;
@@ -162,20 +191,16 @@ void CallEngine::handleParsedMessage(const SignalingMessage &msg) {
 			break;
 		}
 		case SignalingMessageType::NegotiateChannels: {
-			// NOT full codec negotiation: we log what the peer offered but keep using our own
-			// fixed PT/clockrate assumptions (kOpusPayloadType/kH264PayloadType above) rather than
-			// adopting the peer's numbers, even if they differ. Real interop against a live peer
-			// may require tracking the peer's own declared payload type per content instead of
-			// assuming symmetry -- not resolvable further without one.
-			for (const auto &c : msg.negotiateChannels.contents) {
-				const char *typeName = (c.type == MediaContent::Type::Video) ? "video" : "audio";
-				fprintf(stderr, "tgcalls-lite: peer offered %s content, ssrc=%u, %zu payload type(s)\n",
-				        typeName, c.ssrc, c.payloadTypes.size());
-				for (const auto &pt : c.payloadTypes) {
-					fprintf(stderr, "tgcalls-lite:   payloadType id=%u name=%s clockrate=%u\n",
-					        pt.id, pt.name.c_str(), pt.clockrate);
-				}
+			if (auto answer = _negotiator->handleRemote(msg.negotiateChannels)) {
+				SignalingMessage reply;
+				reply.type = SignalingMessageType::NegotiateChannels;
+				reply.negotiateChannels = std::move(*answer);
+				emitEncrypted(reply);
 			}
+			sendOfferIfNeeded();
+			const auto &c = _negotiator->codecs();
+			g_message("tgcalls-lite: negotiated audio in=%d out=%d, video in=%d out=%d",
+			          c.incomingAudioPt, c.outgoingAudioPt, c.incomingVideoPt, c.outgoingVideoPt);
 			break;
 		}
 		case SignalingMessageType::MediaState:
@@ -200,9 +225,7 @@ void CallEngine::sendInitialSetupAndCandidates() {
 	setupMsg.initialSetup.supportsRenomination = false;
 	DtlsFingerprint fp;
 	fp.hash = "sha-256";
-	fp.setup = "actpass"; // matches tgcalls' own InitialSetupMessage -- see MediaSession's header
-	                       // comment on the fixed caller=server/callee=client convention this
-	                       // engine uses instead of actually respecting a peer's explicit setup.
+	fp.setup = _isOutgoing ? "actpass" : "passive"; // as tgcalls' sendInitialSetup()
 	fp.fingerprint = _media.getLocalDtlsFingerprint();
 	setupMsg.initialSetup.fingerprints.push_back(fp);
 	emitEncrypted(setupMsg);
@@ -217,17 +240,12 @@ void CallEngine::sendInitialSetupAndCandidates() {
 	emitEncrypted(candMsg);
 }
 
-void CallEngine::sendNegotiateChannels() {
-	if (_sentNegotiateChannels) return;
-	_sentNegotiateChannels = true;
-
+void CallEngine::sendOfferIfNeeded() {
+	auto offer = _negotiator->takeOffer(random_exchange_id());
+	if (!offer) return;
 	SignalingMessage msg;
 	msg.type = SignalingMessageType::NegotiateChannels;
-	msg.negotiateChannels.exchangeId = 1;
-	msg.negotiateChannels.contents.push_back(build_audio_content(_localAudioSsrc));
-	if (_isVideo) {
-		msg.negotiateChannels.contents.push_back(build_video_content(_localVideoSsrc));
-	}
+	msg.negotiateChannels = std::move(*offer);
 	emitEncrypted(msg);
 }
 
@@ -241,29 +259,30 @@ void CallEngine::emitEncrypted(const SignalingMessage &msg) {
 	if (onOutgoingSignalingData) onOutgoingSignalingData(encrypted);
 }
 
-void CallEngine::handleIncomingRtp(const uint8_t *payload, int len) {
-	if (len < (int)kRtpHeaderLen) return;
-	uint8_t pt = payload[1] & 0x7f;
-	const uint8_t *rtpPayload = payload + kRtpHeaderLen;
-	size_t rtpPayloadLen = (size_t)len - kRtpHeaderLen;
-	int marker = (payload[1] & 0x80) ? 1 : 0;
+void CallEngine::handleIncomingRtp(const uint8_t *packet, int len) {
+	RtpPacketInfo rtp;
+	if (len <= 0 || !parse_rtp_header(packet, (size_t)len, rtp)) return;
+	const uint8_t *payload = packet + rtp.payloadOffset;
+	const auto &codecs = _negotiator->codecs();
 
-	if (pt == kOpusPayloadType) {
-		_audio.receiveEncodedFrame(rtpPayload, (int)rtpPayloadLen);
-	} else if (pt == kH264PayloadType) {
+	if (rtp.payloadType == codecs.incomingAudioPt) {
+		if (rtp.payloadLength > 0) _audio.receiveEncodedFrame(payload, (int)rtp.payloadLength);
+	} else if (rtp.payloadType == codecs.incomingVideoPt) {
 		auto *depkt = static_cast<h264_depacketizer *>(_h264Depacketizer);
 		const unsigned char *au = nullptr;
 		size_t auLen = 0;
-		if (h264_depacketizer_feed(depkt, rtpPayload, rtpPayloadLen, marker, &au, &auLen)) {
+		if (h264_depacketizer_feed(depkt, payload, rtp.payloadLength, rtp.marker ? 1 : 0, &au, &auLen)) {
 			if (onVideoAccessUnit) onVideoAccessUnit(au, (unsigned int)auLen);
 		}
 	}
-	// Unknown payload type (e.g. RTCP that slipped through, or a codec we don't recognize): drop.
+	// Anything else (not negotiated, or not yet): drop.
 }
 
 void CallEngine::sendVideoAccessUnit(const uint8_t *accessUnit, size_t len) {
-	struct Ctx { CallEngine *self; };
-	Ctx ctx{this};
+	const int pt = _negotiator->codecs().outgoingVideoPt;
+	if (pt < 0) return; // the peer has not accepted our video
+	struct Ctx { CallEngine *self; uint8_t pt; };
+	Ctx ctx{this, (uint8_t)pt};
 	_videoTimestamp += kH264TimestampPerFrame;
 	h264_packetize(accessUnit, len, kVideoRtpMtu,
 		[](void *vctx, const unsigned char *rtpPayload, size_t payloadLen, int marker) {
@@ -271,7 +290,7 @@ void CallEngine::sendVideoAccessUnit(const uint8_t *accessUnit, size_t len) {
 			CallEngine *self = c->self;
 			uint8_t pkt[kRtpHeaderLen + kVideoRtpMtu];
 			if (payloadLen > kVideoRtpMtu) return; // h264_packetize already respects mtu; defensive only
-			build_rtp_header(pkt, kH264PayloadType, self->_videoSeq++, self->_videoTimestamp,
+			build_rtp_header(pkt, c->pt, self->_videoSeq++, self->_videoTimestamp,
 			                  self->_localVideoSsrc, marker);
 			memcpy(pkt + kRtpHeaderLen, rtpPayload, payloadLen);
 			int totalLen = (int)(kRtpHeaderLen + payloadLen);

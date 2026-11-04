@@ -29,19 +29,16 @@ enum class MediaSessionState {
 
 class MediaSession {
 public:
-	// isOutgoing: true for the call's initiator (caller). Controls both the ICE controlling role
-	// (caller = controlling, matching ICE's usual offerer convention) and the DTLS role: by
-	// convention here the caller is the DTLS server ("passive") and the callee is the DTLS client
-	// ("active") -- the common WebRTC/JSEP default when the offerer advertises "actpass" (which is
-	// all tgcalls' own InitialSetupMessage ever does -- see its own `setup` field, always
-	// "actpass" today; a real peer conventionally responds "active"). If a real peer's fingerprint
-	// message ever specifies a concrete "active"/"passive" setup instead, this fixed convention
-	// will need to respect that instead -- not yet handled, tracked as a Phase 4 interop detail.
+	// isOutgoing: true for the call's initiator (caller). As in tgcalls, the caller is ICE
+	// controlling and the DTLS client; the callee is ICE controlled and the DTLS server.
 	MediaSession(GMainContext *ctx, bool isOutgoing);
 	~MediaSession();
 
 	MediaSession(const MediaSession &) = delete;
 	MediaSession &operator=(const MediaSession &) = delete;
+
+	// STUN/TURN servers for ICE; call before start(). Returns how many were applied.
+	size_t setServers(const std::vector<RtcServer> &servers);
 
 	void start(); // begins ICE candidate gathering
 
@@ -69,6 +66,7 @@ public:
 private:
 	void handleIceData(const uint8_t *data, size_t len);
 	void setState(MediaSessionState s);
+	void finishHandshake();
 
 	bool _isOutgoing;
 	std::unique_ptr<IceSession> _ice;
@@ -76,6 +74,7 @@ private:
 	std::unique_ptr<SrtpSession> _srtp;
 	std::string _remoteFingerprint;
 	bool _iceConnected = false;
+	bool _dtlsDone = false;
 	MediaSessionState _state = MediaSessionState::Gathering;
 };
 

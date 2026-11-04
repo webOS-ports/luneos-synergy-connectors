@@ -25,6 +25,34 @@ IceSession::~IceSession() {
 	}
 }
 
+size_t IceSession::setServers(const std::vector<RtcServer> &servers) {
+	size_t applied = 0;
+	bool haveStun = false;
+	for (const auto &s : servers) {
+		NiceAddress addr;
+		nice_address_init(&addr);
+		if (s.port == 0 || !nice_address_set_from_string(&addr, s.host.c_str())) {
+			g_warning("tgcalls-lite: skipping a call server whose address is not a literal IP");
+			continue;
+		}
+		if (!s.isTurn) {
+			if (haveStun) continue;
+			g_object_set(G_OBJECT(_agent), "stun-server", s.host.c_str(),
+			             "stun-server-port", (guint)s.port, nullptr);
+			haveStun = true;
+			applied++;
+		} else if (!s.login.empty() && !s.password.empty()) {
+			if (nice_agent_set_relay_info(_agent, _streamId, kComponentId, s.host.c_str(), s.port,
+			                              s.login.c_str(), s.password.c_str(),
+			                              s.isTcp ? NICE_RELAY_TYPE_TURN_TCP : NICE_RELAY_TYPE_TURN_UDP))
+				applied++;
+			else
+				g_warning("tgcalls-lite: libnice rejected a TURN server");
+		}
+	}
+	return applied;
+}
+
 void IceSession::gatherCandidates() {
 	nice_agent_gather_candidates(_agent, _streamId);
 }

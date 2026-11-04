@@ -12,11 +12,8 @@
 // code voipkit.cpp already uses for its own LOCAL RTP framing to mediaserver -- reused here for
 // the REAL peer-facing RTP instead).
 //
-// Fixed payload-type/clockrate assumptions (NOT yet negotiated against a real peer's own numbers --
-// see handleParsedMessage's NegotiateChannels case): Opus PT 111 @ 48000Hz (the near-universal
-// WebRTC/tgcalls default), H.264 PT 100 @ 90000Hz. Real interop may need these to track a peer's
-// own declared numbers instead of assuming symmetry -- a live-peer-testing concern, not something
-// resolvable further without one.
+// Payload types: we offer Opus (111) and H.264 (100); what is actually sent and accepted comes from
+// the NegotiateChannels exchange (content_negotiation.h).
 #ifndef TGCALLS_LITE_CALL_ENGINE_H
 #define TGCALLS_LITE_CALL_ENGINE_H
 
@@ -31,6 +28,7 @@
 #include "media_session.h"
 #include "signaling_message.h"
 #include "audio_pipeline.h"
+#include "content_negotiation.h"
 
 namespace tgcalls_lite {
 
@@ -45,6 +43,9 @@ public:
 
 	CallEngine(const CallEngine &) = delete;
 	CallEngine &operator=(const CallEngine &) = delete;
+
+	// STUN/TURN servers from callStateReady; call before start(). Returns how many were applied.
+	size_t setServers(const std::vector<RtcServer> &servers);
 
 	// Begins ICE gathering only (safe to call unconditionally -- no hardware resource contention).
 	// Once gathering completes, sends our InitialSetupMessage + CandidatesMessage +
@@ -82,17 +83,18 @@ public:
 
 private:
 	void sendInitialSetupAndCandidates();
-	void sendNegotiateChannels();
+	void sendOfferIfNeeded();
 	void handleParsedMessage(const SignalingMessage &msg);
 	void emitEncrypted(const SignalingMessage &msg);
-	void handleIncomingRtp(const uint8_t *payload, int len);
+	void handleIncomingRtp(const uint8_t *packet, int len);
 
 	EncryptedConnection _enc;
 	MediaSession _media;
 	AudioPipeline _audio;
+	bool _isOutgoing;
 	bool _isVideo;
 	bool _sentInitialSetup = false;
-	bool _sentNegotiateChannels = false;
+	std::unique_ptr<ContentNegotiator> _negotiator;
 
 	uint32_t _localAudioSsrc;
 	uint32_t _localVideoSsrc;

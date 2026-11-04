@@ -14,6 +14,9 @@
 #include <atomic>
 #include <vector>
 #include "../call_engine.h"
+#include "../encrypted_connection.h"
+#include "../signaling_message.h"
+#include <string>
 
 using namespace tgcalls_lite;
 
@@ -28,12 +31,32 @@ int main() {
 	CallEngine caller(ctx, callKey, /*isOutgoing=*/true, /*isVideo=*/true);
 	CallEngine callee(ctx, callKey, /*isOutgoing=*/false, /*isVideo=*/true);
 
+	// Decrypt a copy of each direction on the side, as the receiving peer would, to check the
+	// DTLS setup each side announces: tgcalls' caller says "actpass", its callee "passive".
+	EncryptedConnection spyAtCallee(callKey, /*isOutgoing=*/false);
+	EncryptedConnection spyAtCaller(callKey, /*isOutgoing=*/true);
+	std::string callerSetup, calleeSetup;
+	int firstOfferFrom = 0; // 1 = caller, 2 = callee
+	uint32_t callerOfferId = 0, calleeFirstNegotiateId = 0;
+	auto spy = [&](EncryptedConnection &conn, const std::vector<uint8_t> &data, std::string &setup, int who) {
+		auto plain = conn.decrypt(data);
+		SignalingMessage m;
+		if (!plain || !signaling_message_parse(plain->data(), plain->size(), &m)) return;
+		if (m.type == SignalingMessageType::InitialSetup && !m.initialSetup.fingerprints.empty())
+			setup = m.initialSetup.fingerprints[0].setup;
+		if (m.type != SignalingMessageType::NegotiateChannels) return;
+		if (firstOfferFrom == 0) firstOfferFrom = who;
+		if (who == 1 && callerOfferId == 0) callerOfferId = m.negotiateChannels.exchangeId;
+		if (who == 2 && calleeFirstNegotiateId == 0) calleeFirstNegotiateId = m.negotiateChannels.exchangeId;
+	};
 	caller.onOutgoingSignalingData = [&](const std::vector<uint8_t> &data) {
 		fprintf(stderr, "spike: caller->callee signaling, %zu bytes\n", data.size());
+		spy(spyAtCallee, data, callerSetup, 1);
 		callee.handleIncomingSignalingData(data);
 	};
 	callee.onOutgoingSignalingData = [&](const std::vector<uint8_t> &data) {
 		fprintf(stderr, "spike: callee->caller signaling, %zu bytes\n", data.size());
+		spy(spyAtCaller, data, calleeSetup, 2);
 		caller.handleIncomingSignalingData(data);
 	};
 
@@ -49,8 +72,14 @@ int main() {
 		calleeGotVideo = true;
 	};
 
-	caller.start();
+	// The callee gathers first, so it is ready before any offer arrives: it must still wait for
+	// the caller's offer instead of offering itself.
+	int calleeSent = 0;
+	auto calleeSend = callee.onOutgoingSignalingData;
+	callee.onOutgoingSignalingData = [&](const std::vector<uint8_t> &data) { calleeSent++; calleeSend(data); };
 	callee.start();
+	for (int i = 0; i < 2000 && calleeSent == 0; i++) g_main_context_iteration(ctx, TRUE);
+	caller.start();
 
 	for (int i = 0; i < 8000 && !(callerReady && calleeReady); i++) {
 		g_main_context_iteration(ctx, TRUE);
@@ -59,6 +88,17 @@ int main() {
 
 	if (!callerReady || !calleeReady) {
 		fprintf(stderr, "FAIL: never reached Ready (caller=%d callee=%d)\n", (int)callerReady, (int)calleeReady);
+		return 1;
+	}
+
+	if (callerSetup != "actpass" || calleeSetup != "passive") {
+		fprintf(stderr, "FAIL: DTLS setup caller=\"%s\" callee=\"%s\", tgcalls expects actpass/passive\n",
+		        callerSetup.c_str(), calleeSetup.c_str());
+		return 1;
+	}
+	// The callee's first NegotiateChannels must be its answer to the caller's offer, as in tgcalls.
+	if (firstOfferFrom != 1 || calleeFirstNegotiateId != callerOfferId) {
+		fprintf(stderr, "FAIL: the first NegotiateChannels came from side %d, not the caller\n", firstOfferFrom);
 		return 1;
 	}
 

@@ -35,10 +35,8 @@ struct SrtpKeyingMaterial {
 class DtlsTransport {
 public:
 	// isClient: DTLS role (who sends ClientHello first). Matches the "setup" attribute in the
-	// signaled DtlsFingerprint: "active" = DTLS client, "passive" = DTLS server. "actpass" (what
-	// we always advertise, matching tgcalls' own InitialSetupMessage) lets the peer choose; by
-	// convention the ICE-controlled side (callee, non-initiator) decides and is typically the
-	// DTLS server ("passive") -- see start_engine.cpp's role assignment once that's wired up.
+	// signaled DtlsFingerprint: "active" = DTLS client, "passive" = DTLS server. tgcalls' caller
+	// sends "actpass" and its callee "passive", so the caller ends up the client (see MediaSession).
 	explicit DtlsTransport(bool isClient);
 	~DtlsTransport();
 

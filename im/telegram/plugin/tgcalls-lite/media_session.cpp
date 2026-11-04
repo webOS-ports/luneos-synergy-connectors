@@ -26,9 +26,9 @@ std::vector<uint8_t> concat_key_salt(const std::array<uint8_t, 16> &key, const s
 MediaSession::MediaSession(GMainContext *ctx, bool isOutgoing)
 	: _isOutgoing(isOutgoing) {
 	_ice = std::make_unique<IceSession>(ctx, /*controlling=*/isOutgoing);
-	// See header comment: caller (isOutgoing) = DTLS server (passive), callee = DTLS client
-	// (active). DtlsTransport's isClient constructor arg is the inverse of isOutgoing here.
-	_dtls = std::make_unique<DtlsTransport>(/*isClient=*/!isOutgoing);
+	// tgcalls' roles (NativeNetworkingImpl::setRemoteParams): the caller offers "actpass", the
+	// callee answers "passive", so the caller is the DTLS client and the callee the server.
+	_dtls = std::make_unique<DtlsTransport>(/*isClient=*/isOutgoing);
 
 	_ice->onGatheringDone = [this]() { if (onGatheringDone) onGatheringDone(); };
 	_ice->onDataReceived = [this](const uint8_t *data, size_t len) { handleIceData(data, len); };
@@ -36,7 +36,7 @@ MediaSession::MediaSession(GMainContext *ctx, bool isOutgoing)
 		if (s == IceConnectionState::Connected && !_iceConnected) {
 			_iceConnected = true;
 			setState(MediaSessionState::Connecting);
-			_dtls->start(); // caller is DTLS server (waits/accepts), callee is client (initiates)
+			_dtls->start(); // the client sends the ClientHello, the server waits for it
 		} else if (s == IceConnectionState::Failed) {
 			setState(MediaSessionState::Failed);
 		}
@@ -44,29 +44,31 @@ MediaSession::MediaSession(GMainContext *ctx, bool isOutgoing)
 
 	_dtls->onOutgoingData = [this](const uint8_t *data, size_t len) { _ice->send(data, len); };
 	_dtls->onHandshakeComplete = [this]() {
-		if (_remoteFingerprint.empty()) {
-			// Fingerprint not known yet (signaling race -- peer's InitialSetupMessage hasn't
-			// arrived even though media connected first). setRemoteDtlsFingerprint will finish
-			// this check once it does arrive; nothing more to do here yet.
-			return;
-		}
-		if (!_dtls->verifyPeerFingerprint(_remoteFingerprint)) {
-			setState(MediaSessionState::Failed);
-			return;
-		}
-		auto mat = _dtls->exportSrtpKeys();
-		// DTLS client's "client key" is ITS send direction; DTLS server's "client key" is what it
-		// receives FROM the client. isOutgoing == DTLS server here (see constructor comment).
-		auto sendKey = _isOutgoing ? concat_key_salt(mat.serverKey, mat.serverSalt)
-		                           : concat_key_salt(mat.clientKey, mat.clientSalt);
-		auto recvKey = _isOutgoing ? concat_key_salt(mat.clientKey, mat.clientSalt)
-		                           : concat_key_salt(mat.serverKey, mat.serverSalt);
-		_srtp = std::make_unique<SrtpSession>(sendKey.data(), recvKey.data());
-		setState(_srtp->ok() ? MediaSessionState::Ready : MediaSessionState::Failed);
+		_dtlsDone = true;
+		// If the peer's fingerprint has not arrived yet (media connected before signalling),
+		// setRemoteDtlsFingerprint() finishes this once it does.
+		if (!_remoteFingerprint.empty()) finishHandshake();
 	};
 	_dtls->onHandshakeFailed = [this](const std::string &) {
 		if (_state != MediaSessionState::Ready) setState(MediaSessionState::Failed);
 	};
+}
+
+void MediaSession::finishHandshake() {
+	if (_srtp || _state == MediaSessionState::Failed) return;
+	if (!_dtls->verifyPeerFingerprint(_remoteFingerprint)) {
+		setState(MediaSessionState::Failed);
+		return;
+	}
+	auto mat = _dtls->exportSrtpKeys();
+	// RFC 5764 4.2: the client sends with the client write key, the server with the server one.
+	const bool isClient = _isOutgoing;
+	auto sendKey = isClient ? concat_key_salt(mat.clientKey, mat.clientSalt)
+	                        : concat_key_salt(mat.serverKey, mat.serverSalt);
+	auto recvKey = isClient ? concat_key_salt(mat.serverKey, mat.serverSalt)
+	                        : concat_key_salt(mat.clientKey, mat.clientSalt);
+	_srtp = std::make_unique<SrtpSession>(sendKey.data(), recvKey.data());
+	setState(_srtp->ok() ? MediaSessionState::Ready : MediaSessionState::Failed);
 }
 
 MediaSession::~MediaSession() = default;
@@ -97,21 +99,11 @@ bool MediaSession::addRemoteCandidateSdp(const std::string &sdpString) {
 
 void MediaSession::setRemoteDtlsFingerprint(const std::string &fingerprint) {
 	_remoteFingerprint = fingerprint;
-	// If the DTLS handshake already finished before the fingerprint arrived (signaling race the
-	// other way), re-check now instead of waiting for a callback that already fired.
-	if (_state == MediaSessionState::Connecting) {
-		// onHandshakeComplete already ran once with an empty _remoteFingerprint and returned
-		// early; re-run its logic now that we actually have one.
-		if (_dtls->verifyPeerFingerprint(_remoteFingerprint)) {
-			auto mat = _dtls->exportSrtpKeys();
-			auto sendKey = _isOutgoing ? concat_key_salt(mat.serverKey, mat.serverSalt)
-			                           : concat_key_salt(mat.clientKey, mat.clientSalt);
-			auto recvKey = _isOutgoing ? concat_key_salt(mat.clientKey, mat.clientSalt)
-			                           : concat_key_salt(mat.serverKey, mat.serverSalt);
-			_srtp = std::make_unique<SrtpSession>(sendKey.data(), recvKey.data());
-			setState(_srtp->ok() ? MediaSessionState::Ready : MediaSessionState::Failed);
-		}
-	}
+	if (_dtlsDone) finishHandshake();
+}
+
+size_t MediaSession::setServers(const std::vector<RtcServer> &servers) {
+	return _ice->setServers(servers);
 }
 
 bool MediaSession::sendRtp(uint8_t *buf, int *len) {

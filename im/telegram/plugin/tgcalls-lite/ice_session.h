@@ -21,6 +21,19 @@
 
 namespace tgcalls_lite {
 
+// One STUN or TURN server from TDLib's callStateReady.servers (callServerTypeWebrtc). Telegram's
+// own UDP reflectors (callServerTypeTelegramReflector) speak tgcalls' ReflectorPort protocol, not
+// TURN, so they cannot be used here. host must be a literal IPv4/IPv6 address: libnice does not
+// resolve names.
+struct RtcServer {
+	std::string host;
+	uint16_t port = 0;
+	std::string login;
+	std::string password;
+	bool isTurn = false;
+	bool isTcp = false;
+};
+
 enum class IceConnectionState {
 	Gathering,
 	Checking,
@@ -40,6 +53,10 @@ public:
 
 	IceSession(const IceSession &) = delete;
 	IceSession &operator=(const IceSession &) = delete;
+
+	// Configures STUN/TURN; call before gatherCandidates(). libnice takes one STUN server, so the
+	// first usable one wins; every usable TURN server is added. Returns how many were applied.
+	size_t setServers(const std::vector<RtcServer> &servers);
 
 	// Starts local candidate gathering. onGatheringDone fires (once) when
 	// getLocalCandidateSdpStrings() will return the complete set.
