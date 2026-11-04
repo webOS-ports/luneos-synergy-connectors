@@ -1,0 +1,19 @@
+{
+    "appId": "org.webosports.service.videos",
+    "allowedNames": [
+        "org.webosports.service.videos"
+    ],
+    "trustLevel": "oem",
+    "type": "regular",
+    "permissions": [
+        {
+            "service": "org.webosports.service.videos",
+            "inbound": [
+                "*"
+            ],
+            "outbound": [
+                "*"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,9 @@
+{
+	"name": "org.webosports.service.videos",
+	"version": "1.0.0",
+	"description": "The video services of LuneOS Synergy (Jellyfin, UPnP/DLNA, PeerTube) for Videos (capability Video)",
+	"main": "service.js",
+	"private": true,
+	"engines": { "node": ">=22" },
+	"license": "GPL-3.0-or-later"
+}
