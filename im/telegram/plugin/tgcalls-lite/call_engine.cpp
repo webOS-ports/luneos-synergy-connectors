@@ -305,9 +305,15 @@ void CallEngine::sendInitialSetupAndCandidates() {
 void CallEngine::sendOfferIfNeeded() {
 	auto offer = _negotiator->takeOffer(random_exchange_id());
 	if (!offer) return;
+	_offerRetries = 0;
+	emitOffer(std::move(*offer));
+}
+
+void CallEngine::emitOffer(NegotiateChannelsMessage offer) {
+	_offerTick = _ticks;
 	SignalingMessage msg;
 	msg.type = SignalingMessageType::NegotiateChannels;
-	msg.negotiateChannels = std::move(*offer);
+	msg.negotiateChannels = std::move(offer);
 	emitEncrypted(msg);
 }
 
@@ -368,6 +374,15 @@ void CallEngine::tick() {
 	// Every 10th tick (5 s at the usual 500 ms) for the first minute, then every 60th.
 	_ticks++;
 	if (_ticks % (_ticks <= 120 ? 10 : 60) == 0) logStats();
+
+	if (_negotiator->offerPending() && _offerRetries < kMaxOfferRetries &&
+	    _ticks - _offerTick >= kOfferRetryTicks) {
+		if (auto offer = _negotiator->renewOffer(random_exchange_id())) {
+			_offerRetries++;
+			g_message("tgcalls-lite: offer unanswered, sending it again (%u)", _offerRetries);
+			emitOffer(std::move(*offer));
+		}
+	}
 }
 
 void CallEngine::logStats() const {

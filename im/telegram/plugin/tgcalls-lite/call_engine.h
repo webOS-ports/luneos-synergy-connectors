@@ -119,6 +119,13 @@ private:
 	bool _isVideo;
 	bool _sentInitialSetup = false;
 	unsigned _ticks = 0;
+	// An unanswered offer is sent again under a new exchangeId every kOfferRetryTicks, at most
+	// kMaxOfferRetries times (see ContentNegotiator::renewOffer()).
+	static constexpr unsigned kOfferRetryTicks = 4; // 2 s at the usual 500 ms tick
+	static constexpr unsigned kMaxOfferRetries = 5;
+	unsigned _offerTick = 0;
+	unsigned _offerRetries = 0;
+	void emitOffer(NegotiateChannelsMessage offer);
 	std::unique_ptr<ContentNegotiator> _negotiator;
 
 	uint32_t _localAudioSsrc;

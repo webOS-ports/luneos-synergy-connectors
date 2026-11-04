@@ -44,6 +44,13 @@ public:
 	// exchangeId must be non-zero and should be random.
 	std::optional<NegotiateChannelsMessage> takeOffer(uint32_t exchangeId);
 
+	// The unanswered offer again, under a new exchangeId, or nullopt if none is pending. tgcalls
+	// sends each offer once, and a caller with an offer of its own outstanding drops the callee's:
+	// the callee answers and offers in one go, and the two signalling messages can reach the caller
+	// in either order. Without a new offer the callee then sends nothing for the whole call. Our
+	// offers all carry the same contents, so an answer to any of them, however late, settles it.
+	std::optional<NegotiateChannelsMessage> renewOffer(uint32_t exchangeId);
+
 	// Handles a NegotiateChannels message from the peer. Returns the answer to send, if any.
 	// Call takeOffer() afterwards: a dropped offer is re-sent from there.
 	std::optional<NegotiateChannelsMessage> handleRemote(const NegotiateChannelsMessage &msg);
@@ -59,6 +66,7 @@ private:
 	std::vector<MediaContent> _localContents;
 	bool _needOffer = true;
 	std::optional<uint32_t> _pendingExchangeId;
+	std::vector<uint32_t> _ownExchangeIds; // every exchangeId we offered under
 	NegotiatedCodecs _codecs;
 };
 

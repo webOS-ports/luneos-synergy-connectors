@@ -139,6 +139,50 @@ static void test_race() {
 	CHECK(callee.codecs().outgoingAudioPt == 111, "callee's audio accepted");
 }
 
+// sargo, 2026-11-04: the callee's answer and its own offer reached the caller in the wrong order,
+// the caller dropped the offer while its own was pending, and the callee never sent audio.
+static void test_renew() {
+	ContentNegotiator caller(true, {audio(11, {pt(111, "opus", 48000)})});
+	ContentNegotiator callee(false, {audio(22, {pt(111, "opus", 48000)})});
+	CHECK(!callee.renewOffer(3), "nothing to renew before an offer");
+
+	auto callerOffer = caller.takeOffer(5);
+	REQUIRE(callerOffer, "caller offers");
+	auto answer = callee.handleRemote(*callerOffer);
+	auto calleeOffer = callee.takeOffer(9);
+	REQUIRE(answer && calleeOffer, "callee answers and offers");
+
+	CHECK(!caller.handleRemote(*calleeOffer), "offer arriving first is dropped");
+	CHECK(!caller.handleRemote(*answer), "caller takes the answer");
+	CHECK(callee.codecs().outgoingAudioPt == -1, "callee has nothing to send yet");
+
+	CHECK(!callee.renewOffer(9), "renewing under the same exchangeId refused");
+	CHECK(!callee.renewOffer(0), "renewing under exchangeId 0 refused");
+	auto renewed = callee.renewOffer(12);
+	REQUIRE(renewed && renewed->exchangeId == 12 && renewed->contents.size() == 1 && renewed->contents[0].ssrc == 22,
+	        "callee repeats its offer under a new exchangeId");
+	CHECK(callee.offerPending(), "renewed offer pending");
+
+	auto answer2 = caller.handleRemote(*renewed);
+	REQUIRE(answer2 && answer2->exchangeId == 12, "caller answers the renewed offer");
+	CHECK(!callee.handleRemote(*answer2), "callee takes the answer");
+	CHECK(callee.codecs().outgoingAudioPt == 111, "callee's audio accepted");
+	CHECK(!callee.offerPending(), "nothing pending any more");
+	CHECK(!callee.renewOffer(13), "nothing to renew after the answer");
+
+	// A late answer to the replaced offer is an answer, not a new offer to answer.
+	ContentNegotiator late(false, {audio(33, {pt(111, "opus", 48000)})});
+	auto first = late.takeOffer(20);
+	auto second = late.renewOffer(21);
+	REQUIRE(first && second, "offer and its renewal");
+	ContentNegotiator peer(true, {audio(44, {pt(111, "opus", 48000)})});
+	auto lateAnswer = peer.handleRemote(*first);
+	REQUIRE(lateAnswer && lateAnswer->exchangeId == 20, "peer answers the first offer");
+	CHECK(!late.handleRemote(*lateAnswer), "late answer gets no reply");
+	CHECK(late.codecs().outgoingAudioPt == 111 && !late.offerPending(), "late answer settles the offer");
+	CHECK(late.codecs().incomingAudioPt == -1, "late answer not taken for an offer");
+}
+
 static void test_partial_answer() {
 	PayloadType h264 = pt(100, "H264", 90000);
 	h264.parameters.push_back({"packetization-mode", "1"});
@@ -203,6 +247,7 @@ int main() {
 	test_exchange();
 	test_peer_ids_and_feedback();
 	test_race();
+	test_renew();
 	test_partial_answer();
 	test_rtp();
 	if (failures) {
