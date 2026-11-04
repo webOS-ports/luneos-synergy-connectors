@@ -48,6 +48,56 @@ inline bool parse_rtp_header(const uint8_t *data, size_t len, RtpPacketInfo &out
 	return true;
 }
 
+// Writes an RTP header for payload type pt into pkt, with, when cvoId is 1..14, a one-byte
+// header extension (RFC 8285) carrying the video orientation byte cvo under that id. Returns the
+// header length: 12, or 20 with the extension. pkt must have room for 20 bytes.
+inline size_t write_rtp_header(uint8_t *pkt, uint8_t pt, uint16_t seq, uint32_t ts, uint32_t ssrc, bool marker,
+                               int cvoId = 0, uint8_t cvo = 0) {
+	pkt[0] = 0x80;
+	pkt[1] = (uint8_t)((marker ? 0x80 : 0) | (pt & 0x7f));
+	pkt[2] = (uint8_t)(seq >> 8);
+	pkt[3] = (uint8_t)seq;
+	pkt[4] = (uint8_t)(ts >> 24);
+	pkt[5] = (uint8_t)(ts >> 16);
+	pkt[6] = (uint8_t)(ts >> 8);
+	pkt[7] = (uint8_t)ts;
+	pkt[8] = (uint8_t)(ssrc >> 24);
+	pkt[9] = (uint8_t)(ssrc >> 16);
+	pkt[10] = (uint8_t)(ssrc >> 8);
+	pkt[11] = (uint8_t)ssrc;
+	if (cvoId < 1 || cvoId > 14) return 12;
+	pkt[0] |= 0x10;            // X: an extension follows
+	pkt[12] = 0xbe;            // one-byte header profile
+	pkt[13] = 0xde;
+	pkt[14] = 0;
+	pkt[15] = 1;               // one 32-bit word of elements
+	pkt[16] = (uint8_t)(cvoId << 4); // id, length - 1 = 0
+	pkt[17] = cvo;
+	pkt[18] = 0;               // padding
+	pkt[19] = 0;
+	return 20;
+}
+
+// The one-byte header extension element with this id in an RTP packet, or -1 (no extension,
+// another profile, or not there). Only 1-byte elements are returned.
+inline int find_rtp_one_byte_extension(const uint8_t *data, size_t len, int id) {
+	if (!data || len < 12 || !(data[0] & 0x10)) return -1;
+	size_t off = 12 + 4 * (size_t)(data[0] & 0x0f);
+	if (off + 4 > len || data[off] != 0xbe || data[off + 1] != 0xde) return -1;
+	const size_t end = off + 4 + 4 * (((size_t)data[off + 2] << 8) | data[off + 3]);
+	if (end > len) return -1;
+	for (off += 4; off < end;) {
+		const uint8_t b = data[off];
+		if (b == 0) { off++; continue; } // padding
+		const int elemId = b >> 4;
+		const size_t elemLen = (size_t)(b & 0x0f) + 1;
+		if (elemId == 15 || off + 1 + elemLen > end) return -1;
+		if (elemId == id) return elemLen == 1 ? data[off + 1] : -1;
+		off += 1 + elemLen;
+	}
+	return -1;
+}
+
 } // namespace tgcalls_lite
 
 #endif

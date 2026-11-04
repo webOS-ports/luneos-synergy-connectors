@@ -107,7 +107,9 @@ int main() {
 	// not a real decodable frame, just enough structure for h264_rtp.c's packetizer/depacketizer
 	// to round-trip, matching what a real captured frame from voipkit.cpp's Thread A looks like
 	// on the wire).
-	std::vector<uint8_t> accessUnit = {0x00, 0x00, 0x00, 0x01, 0x65};
+	// The receiver passes a stream on from its first IDR with a sequence parameter set, so
+	// a fake SPS NAL comes first.
+	std::vector<uint8_t> accessUnit = {0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x01, 0x65};
 	for (int i = 0; i < 50; i++) accessUnit.push_back((uint8_t)(i * 3 + 7));
 
 	caller.sendVideoAccessUnit(accessUnit.data(), accessUnit.size());

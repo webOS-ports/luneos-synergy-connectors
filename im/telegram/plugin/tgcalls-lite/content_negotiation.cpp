@@ -64,39 +64,51 @@ ContentNegotiator::ContentNegotiator(bool isOutgoing, std::vector<MediaContent> 
 std::optional<NegotiateChannelsMessage> ContentNegotiator::takeOffer(uint32_t exchangeId) {
 	if (!_needOffer || _pendingExchangeId || exchangeId == 0) return std::nullopt;
 	_needOffer = false;
-	_pendingExchangeId = exchangeId;
-	_ownExchangeIds.push_back(exchangeId);
-	NegotiateChannelsMessage offer;
-	offer.exchangeId = exchangeId;
-	offer.contents = _localContents;
-	return offer;
+	return makeOffer(exchangeId);
+}
+
+void ContentNegotiator::setLocalContents(std::vector<MediaContent> localContents) {
+	_localContents = std::move(localContents);
+	_generation++;
+	// An offer still out describes the old contents; renewOffer() replaces it.
+	if (!_pendingExchangeId) _needOffer = true;
 }
 
 std::optional<NegotiateChannelsMessage> ContentNegotiator::renewOffer(uint32_t exchangeId) {
 	if (!_pendingExchangeId || exchangeId == 0) return std::nullopt;
-	for (uint32_t own : _ownExchangeIds)
-		if (own == exchangeId) return std::nullopt;
+	for (const auto &own : _ownExchangeIds)
+		if (own.first == exchangeId) return std::nullopt;
+	return makeOffer(exchangeId);
+}
+
+NegotiateChannelsMessage ContentNegotiator::makeOffer(uint32_t exchangeId) {
 	_pendingExchangeId = exchangeId;
-	_ownExchangeIds.push_back(exchangeId);
+	_ownExchangeIds.emplace_back(exchangeId, _generation);
 	NegotiateChannelsMessage offer;
 	offer.exchangeId = exchangeId;
 	offer.contents = _localContents;
 	return offer;
 }
 
+bool ContentNegotiator::offerIsCurrent() const {
+	if (!_pendingExchangeId) return true;
+	for (const auto &own : _ownExchangeIds)
+		if (own.first == *_pendingExchangeId) return own.second == _generation;
+	return false;
+}
+
 std::optional<NegotiateChannelsMessage> ContentNegotiator::handleRemote(const NegotiateChannelsMessage &msg) {
-	for (uint32_t own : _ownExchangeIds) {
-		if (msg.exchangeId != own) continue;
-		// An answer to one of our offers. They all carry the same contents, so even a late answer
-		// to an offer renewOffer() has since replaced settles the current one.
+	for (const auto &own : _ownExchangeIds) {
+		if (msg.exchangeId != own.first) continue;
+		// An answer to one of our offers. Offers of the same contents are interchangeable, so even
+		// a late answer to an offer renewOffer() has since replaced settles the current one. An
+		// answer to older contents is applied (it still describes what the peer receives) but
+		// leaves the offer of the current contents outstanding.
 		applyAnswer(msg);
+		if (own.second == _generation) _pendingExchangeId.reset();
 		return std::nullopt;
 	}
 	if (_pendingExchangeId) {
-		if (msg.exchangeId == *_pendingExchangeId) {
-			applyAnswer(msg);
-			return std::nullopt;
-		}
 		// Both offered at once: the initiator wins.
 		if (_isOutgoing) return std::nullopt;
 		_pendingExchangeId.reset();
@@ -138,16 +150,20 @@ NegotiateChannelsMessage ContentNegotiator::answer(const NegotiateChannelsMessag
 }
 
 void ContentNegotiator::applyAnswer(const NegotiateChannelsMessage &answer) {
-	_pendingExchangeId.reset();
 	_codecs.outgoingAudioPt = -1;
 	_codecs.outgoingVideoPt = -1;
+	_codecs.outgoingVideoRotationExtId = -1;
 	for (const auto &content : answer.contents) {
 		for (const auto &local : _localContents) {
 			if (local.ssrc == 0 || local.ssrc != content.ssrc || local.type != content.type) continue;
 			if (local.type == MediaContent::Type::Audio)
 				_codecs.outgoingAudioPt = pt_for_type(content, MediaContent::Type::Audio);
-			else
+			else {
 				_codecs.outgoingVideoPt = pt_for_type(content, MediaContent::Type::Video);
+				for (const auto &ext : content.rtpExtensions)
+					if (ext.uri == kVideoRotationUri && ext.id >= 1 && ext.id <= 14)
+						_codecs.outgoingVideoRotationExtId = ext.id;
+			}
 		}
 	}
 }
