@@ -10,10 +10,13 @@ import (
 	"testing"
 )
 
-// No test reaches the real bus: secretCall answers as luna-send does when it is
-// not there, unless a test puts fakeKeymanager in its place.
+// No test reaches the real bus: secretCall and podcastLuna answer as luna-send
+// does when it is not there, unless a test puts a fake in their place.
 func TestMain(m *testing.M) {
 	secretCall = func(string, string) (map[string]interface{}, error) {
+		return nil, errors.New("no bus in the tests")
+	}
+	podcastLuna = func(string, string) (map[string]interface{}, error) {
 		return nil, errors.New("no bus in the tests")
 	}
 	os.Exit(m.Run())
