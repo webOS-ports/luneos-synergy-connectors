@@ -1114,7 +1114,7 @@ static void test_rx_portrait(const char *dir)
     }
     if (dec) gst_object_unref(dec);
     if (shm) gst_object_unref(shm);
-    gst_object_unref(p);
+    teardown(p);
     g_unsetenv("TEAMS_MEDIA_VIDEO_SHM");
     g_free(sock);
 }
