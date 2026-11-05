@@ -53,7 +53,7 @@ class Manifest(unittest.TestCase):
         fam = {}
         for c in cs:
             fam[c.family] = fam.get(c.family, 0) + 1
-        self.assertEqual(fam, {"im": 7, "cloud": 12, "music": 9})
+        self.assertEqual(fam, {"im": 8, "cloud": 12, "music": 9})
         self.assertEqual(len({c.key for c in cs}), 28)
 
     def test_uris_and_services(self):

@@ -8,6 +8,7 @@
     "com.palm.gometa":      {"key": "facebook",   "family": "im", "plugin": "libwhatsmeow.so",      "service_name": "type_gometa",    "auth": "password+2fa",    "package": "purple-combined", "name": "Facebook (E2EE)"},
     "com.palm.discord":     {"key": "discord",    "family": "im", "plugin": "libdiscord.so",        "service_name": "type_discord",   "auth": "password",        "package": "purple-discord"},
     "com.palm.googlechat":  {"key": "googlechat", "family": "im", "plugin": "libgooglechat.so",     "service_name": "type_googlechat","auth": "cookie",          "package": "purple-googlechat"},
+    "com.palm.irc":         {"key": "irc",        "family": "im", "plugin": "libirc.so",            "service_name": "type_irc",       "auth": "password",        "package": "synergy-im-irc"},
 
     "com.palm.dropbox":     {"key": "dropbox",    "family": "cloud", "service": "com.palm.service.dropbox",    "auth": "oauth2",     "package": null},
     "com.palm.boxnet":      {"key": "box",        "family": "cloud", "service": "com.palm.service.boxnet",     "auth": "oauth2",     "package": null},
