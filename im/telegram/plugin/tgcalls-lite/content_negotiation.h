@@ -1,3 +1,4 @@
+// Parts of this file are derived from TelegramMessenger/tgcalls (LGPL-3.0); see NOTICE.
 // content_negotiation.h — the NegotiateChannels offer/answer exchange of tgcalls V2, after
 // reference/tgcalls/tgcalls/v2/ContentNegotiation.cpp, reduced to what tgcalls-lite can send and
 // receive: Opus audio and H.264 (packetization-mode 1) video.

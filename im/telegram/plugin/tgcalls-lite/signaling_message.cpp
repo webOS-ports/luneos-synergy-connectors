@@ -1,3 +1,4 @@
+// Parts of this file are derived from TelegramMessenger/tgcalls (LGPL-3.0); see NOTICE.
 #include "signaling_message.h"
 
 #include <json-glib/json-glib.h>

@@ -1,3 +1,4 @@
+// Parts of this file are derived from TelegramMessenger/tgcalls (LGPL-3.0); see NOTICE.
 // crypto_helper.h — AES-CTR key/IV derivation for tgcalls' EncryptedConnection scheme, ported
 // from reference/tgcalls/tgcalls/CryptoHelper.h/.cpp (TelegramMessenger/tgcalls). This is the
 // same key/IV derivation formula as MTProto's own transport encryption (SHA256 over overlapping

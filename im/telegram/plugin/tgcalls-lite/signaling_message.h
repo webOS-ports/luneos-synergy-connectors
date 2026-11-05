@@ -1,3 +1,4 @@
+// Parts of this file are derived from TelegramMessenger/tgcalls (LGPL-3.0); see NOTICE.
 // signaling_message.h — the 4 signaling message shapes tgcalls v2 exchanges over its encrypted
 // out-of-band channel (see reference/tgcalls/tgcalls/v2/Signaling.h/.cpp, cloned from
 // TelegramMessenger/tgcalls as a read-only spec reference -- NOT built). Wire format is plain

@@ -1,3 +1,4 @@
+// Parts of this file are derived from TelegramMessenger/tgcalls (LGPL-3.0); see NOTICE.
 #include "crypto_helper.h"
 
 #include <openssl/evp.h>

@@ -1,3 +1,4 @@
+// Parts of this file are derived from TelegramMessenger/tgcalls (LGPL-3.0); see NOTICE.
 // encrypted_connection.h — the signaling-channel packet encryption tgcalls' SignalingEncryption
 // actually uses (EncryptedConnection::encryptRawPacket/decryptRawPacket -- confirmed by reading
 // reference/tgcalls/tgcalls/v2/SignalingEncryption.cpp, which calls exactly these two, NOT the
