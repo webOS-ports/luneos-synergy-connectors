@@ -1031,6 +1031,94 @@ static void test_selfview_from_sent(const char *h264, const char *dir)
     g_free(pv);
 }
 
+/* The decoder's caps as the probe sees them. */
+static void feed_rx_caps(GstElement *dec, int w, int h)
+{
+    GstPad *src = gst_element_get_static_pad(dec, "src");
+    GstCaps *c = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "I420", "width", G_TYPE_INT, w,
+                                     "height", G_TYPE_INT, h, NULL);
+    GstPadProbeInfo info;
+    memset(&info, 0, sizeof info);
+    info.type = GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM;
+    info.data = gst_event_new_caps(c);
+    tm_probe_vrxcaps(src, &info, &g_tm);
+    gst_event_unref(GST_EVENT(info.data));
+    gst_caps_unref(c);
+    gst_object_unref(src);
+}
+
+/* The next frame on its way to the socket, as the probe sees it. */
+static void feed_rx_frame(GstElement *shm)
+{
+    GstPad *sink = gst_element_get_static_pad(shm, "sink");
+    GstPadProbeInfo info;
+    memset(&info, 0, sizeof info);
+    info.type = GST_PAD_PROBE_TYPE_BUFFER;
+    tm_probe_vshm(sink, &info, &g_tm);
+    gst_object_unref(sink);
+}
+
+static gboolean rx_caps_are(GstElement *cf, int w, int h)
+{
+    GstCaps *c = NULL;
+    gint cw = 0, ch = 0;
+    g_object_get(cf, "caps", &c, NULL);
+    gboolean ok = c && gst_caps_get_size(c) == 1 &&
+                  gst_structure_get_int(gst_caps_get_structure(c, 0), "width", &cw) &&
+                  gst_structure_get_int(gst_caps_get_structure(c, 0), "height", &ch) && cw == w && ch == h;
+    if (c) gst_caps_unref(c);
+    return ok;
+}
+
+/* The Teams app on a phone sends its picture upright, so portrait: it is published as 480x640, not
+ * shrunk into 640x480, and the size is said again each time the picture turns. */
+static void test_rx_portrait(const char *dir)
+{
+    setup();
+    gchar *sock = g_build_filename(dir, "teams-portrait.sock", NULL);
+    g_setenv("TEAMS_MEDIA_VIDEO_SHM", sock, TRUE);
+    GstElement *p = gst_pipeline_new("rx");
+    CHECK(tm_video_rx_build(&g_tm, p));
+    GstElement *dec = gst_bin_get_by_name(GST_BIN(p), "rxv-dec"), *shm = gst_bin_get_by_name(GST_BIN(p), "rxv-shm");
+    CHECK(dec && shm && g_tm.vrx_size);
+    if (dec && shm && g_tm.vrx_size) {
+        gchar *want;
+        CHECK(rx_caps_are(g_tm.vrx_size, 640, 480));
+        feed_rx_caps(dec, 640, 360);                    /* landscape: as before, nothing new to say */
+        feed_rx_frame(shm);
+        CHECK(events_with("VSHM ") == 1);
+        want = g_strdup_printf("VSHM %s 640 480", sock);
+        gchar *line = event_with("VSHM ");
+        CHECK(line && strcmp(line, want) == 0);
+        g_free(line); g_free(want);
+
+        feed_rx_caps(dec, 360, 640);                    /* the Android held upright */
+        CHECK(rx_caps_are(g_tm.vrx_size, 480, 640));
+        feed_rx_frame(shm);
+        feed_rx_frame(shm);
+        CHECK(events_with("VSHM ") == 2);
+        want = g_strdup_printf("VSHM %s 480 640", sock);
+        g_mutex_lock(&ev_lock);
+        CHECK(strcmp(g_ptr_array_index(events, events->len - 1), want) == 0);
+        g_mutex_unlock(&ev_lock);
+        g_free(want);
+
+        feed_rx_caps(dec, 480, 848);                    /* still portrait: no new size */
+        feed_rx_frame(shm);
+        CHECK(events_with("VSHM ") == 2);
+
+        feed_rx_caps(dec, 1280, 720);                   /* turned to landscape */
+        CHECK(rx_caps_are(g_tm.vrx_size, 640, 480));
+        feed_rx_frame(shm);
+        CHECK(events_with("VSHM ") == 3);
+    }
+    if (dec) gst_object_unref(dec);
+    if (shm) gst_object_unref(shm);
+    gst_object_unref(p);
+    g_unsetenv("TEAMS_MEDIA_VIDEO_SHM");
+    g_free(sock);
+}
+
 /* The turned head as built for droidvenc: the sizes swap on a side turn, videoflip gets the
  * direction for the sensor's angle, and the self-view needs no turn of its own. */
 static void test_turned_description(void)
@@ -1212,6 +1300,7 @@ int main(int argc, char **argv)
     reset_rtcp_counts();
     test_tx(h264, dir);
     test_selfview_from_sent(h264, dir);
+    test_rx_portrait(dir);
     test_turned_description();
     test_selfview_turned(h264, dir);
     g_ptr_array_unref(events);

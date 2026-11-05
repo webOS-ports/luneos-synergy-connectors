@@ -150,7 +150,9 @@ typedef struct {
     gint          vtx_capture;    /* atomic: start-capture sent to the droid camera */
     gint          vtx_announced;  /* atomic: VPREVIEW sent for this camera head */
     GstElement   *rtcp_out;       /* appsrc: our RTCP, to srtpenc */
-    gint          vrx_announced;  /* atomic: VSHM sent */
+    gint          vrx_announced;  /* atomic: VSHM sent for the current size */
+    GstElement   *vrx_size;       /* capsfilter: the size the far side's picture is published at */
+    gint          vrx_w, vrx_h;   /* atomic: that size */
     gint          peer_vssrc;     /* atomic: the far side's video SSRC, 0 none yet */
     gint          pli_wanted;     /* atomic: our decoder wants a keyframe */
     gint          key_wanted;     /* atomic: the far side asked us for a keyframe */
@@ -467,7 +469,8 @@ static GstCaps *opus_rtp_caps(int pt)
  * number extension, so REMB is the bandwidth feedback there is.
  *
  * Video lines (stdout, through event_cb):
- *   VSHM <path> <w> <h>           the far side's decoded picture is on this gst-shm socket
+ *   VSHM <path> <w> <h>           the far side's decoded picture is on this gst-shm socket, at
+ *                                 640x480 or 480x640 as it is held; said again when that changes
  *   VPREVIEW <path> <w> <h> <q> <m> our camera's picture (q quarter turns, m mirrored 0/1)
  *   VTX <0|1>                     our camera is sending / stopped
  *   PEERVIDEO <0|1>               the far side's video is arriving / stopped for 2 s
@@ -629,7 +632,49 @@ static GstPadProbeReturn tm_probe_vdec(GstPad *pad, GstPadProbeInfo *info, gpoin
     return GST_PAD_PROBE_OK;
 }
 
-/* The first decoded frame on its way to the Phone app's socket: say where it is. */
+/* The size the far side's picture is published at, for a decoded w x h: 640x480, or 480x640 for a
+ * portrait picture. The Teams app on a phone sends its frames upright (no rotation field), and a
+ * portrait picture scaled into a landscape frame came out a narrow strip between borders. */
+static void tm_rx_frame_size(gint w, gint h, gint *ow, gint *oh)
+{
+    gboolean portrait = h > w;
+    *ow = portrait ? TM_VIDEO_H : TM_VIDEO_W;
+    *oh = portrait ? TM_VIDEO_W : TM_VIDEO_H;
+}
+
+/* Streaming thread: the decoder's caps. Publish the picture in its own orientation, and have the
+ * next frame announce the size again when that changes it. */
+static GstPadProbeReturn tm_probe_vrxcaps(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    GstEvent *ev = GST_PAD_PROBE_INFO_EVENT(info);
+    (void)pad;
+    if (!ev || GST_EVENT_TYPE(ev) != GST_EVENT_CAPS)
+        return GST_PAD_PROBE_OK;
+    GstCaps *caps = NULL;
+    gint w = 0, h = 0, ow, oh;
+    gst_event_parse_caps(ev, &caps);
+    const GstStructure *st = caps && gst_caps_get_size(caps) > 0 ? gst_caps_get_structure(caps, 0) : NULL;
+    if (!st || !gst_structure_get_int(st, "width", &w) || !gst_structure_get_int(st, "height", &h) ||
+        w <= 0 || h <= 0)
+        return GST_PAD_PROBE_OK;
+    tm_rx_frame_size(w, h, &ow, &oh);
+    g_message("teams_media: far side's picture %dx%d, published at %dx%d", w, h, ow, oh);
+    if (ow == g_atomic_int_get(&tm->vrx_w) && oh == g_atomic_int_get(&tm->vrx_h))
+        return GST_PAD_PROBE_OK;
+    if (tm->vrx_size) {
+        GstCaps *vc = tm_i420_caps(ow, oh);
+        g_object_set(tm->vrx_size, "caps", vc, NULL);
+        gst_caps_unref(vc);
+    }
+    g_atomic_int_set(&tm->vrx_w, ow);
+    g_atomic_int_set(&tm->vrx_h, oh);
+    g_atomic_int_set(&tm->vrx_announced, 0);
+    return GST_PAD_PROBE_OK;
+}
+
+/* A decoded frame on its way to the Phone app's socket: the first one at a size says where the
+ * picture is and how big. */
 static GstPadProbeReturn tm_probe_vshm(GstPad *pad, GstPadProbeInfo *info, gpointer user)
 {
     TeamsMedia *tm = user;
@@ -641,10 +686,11 @@ static GstPadProbeReturn tm_probe_vshm(GstPad *pad, GstPadProbeInfo *info, gpoin
             g_object_get(shm, "socket-path", &path, NULL);
             gst_object_unref(shm);
         }
-        tm_event(tm, "VSHM %s %d %d", path ? path : TM_VIDEO_SHM, TM_VIDEO_W, TM_VIDEO_H);
+        tm_event(tm, "VSHM %s %d %d", path ? path : TM_VIDEO_SHM, g_atomic_int_get(&tm->vrx_w),
+                 g_atomic_int_get(&tm->vrx_h));
         g_free(path);
     }
-    return GST_PAD_PROBE_REMOVE;
+    return GST_PAD_PROBE_OK;
 }
 
 /* The receive branch, added to pipeline; tm->vrx_caps is where rtpptdemux links PT 107. Nothing
@@ -690,8 +736,12 @@ static gboolean tm_video_rx_build(TeamsMedia *tm, GstElement *pipeline)
     tm_add_probe(e[0], "sink", GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, tm_probe_vrx, tm);
     tm_add_probe(e[2], "sink", GST_PAD_PROBE_TYPE_EVENT_UPSTREAM, tm_probe_vkey, tm);
     tm_add_probe(e[4], "src", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_vdec, tm);
+    tm_add_probe(e[4], "src", GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, tm_probe_vrxcaps, tm);
     tm_add_probe(e[9], "sink", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_vshm, tm);
     tm->vrx_caps = e[0];
+    tm->vrx_size = e[7];
+    g_atomic_int_set(&tm->vrx_w, TM_VIDEO_W);
+    g_atomic_int_set(&tm->vrx_h, TM_VIDEO_H);
     g_message("teams_media: video receive branch up");
     return TRUE;
 }
@@ -1447,6 +1497,7 @@ static gboolean build_pipeline(TeamsMedia *tm)
             /* Half-built video elements stay in the bin, unlinked from the audio, and do nothing. */
             g_printerr("teams_media: video could not be built, the call stays voice only\n");
             tm->vrx_caps = NULL;
+            tm->vrx_size = NULL;
             tm->vtx_queue = NULL;
             tm->rtcp_out = NULL;
             tm_event(tm, "VIDEOERR build");
