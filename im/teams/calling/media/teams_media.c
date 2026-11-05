@@ -444,7 +444,9 @@ static GstCaps *opus_rtp_caps(int pt)
  * on a gst-shm socket for the Phone app (RemoteVideo.qml, the contract the Signal engine has).
  * While the user has the camera on (VIDEO 1), the front camera's hardware H264 (droidcamsrc in
  * video mode, as luneos-rtc-engine does for WhatsApp) is sent on PT 107 from our own SSRC, and
- * the viewfinder goes to a second shm socket for the self-view.
+ * what we send is decoded again for the self-view on a second shm socket. The viewfinder cannot
+ * give the self-view: droidcamsrc stops it once the capture runs (sargo, 5 Nov 2026: 115 frames
+ * in the 4 s before start-capture, none after it, while the encoder went on at 30 a second).
  *
  *   RX: ptdemux --107--> capsfilter -> rtpjitterbuffer -> rtph264depay -> h264parse -> avdec_h264
  *       -> videoconvert -> videoscale -> I420 640x480 -> leaky queue -> shmsink /tmp/teams-video
@@ -810,12 +812,15 @@ static gboolean tm_video_tick(gpointer user)
     return G_SOURCE_CONTINUE;
 }
 
-/* The camera head: front camera, hardware H264 from droidcamsrc's video pad, its viewfinder to
- * the self-view socket. TEAMS_MEDIA_CAMERA replaces it (tests, or another camera setup); it must
- * have an element "tmvout" whose src pad gives H264 byte-stream access units, and may have a
- * shmsink "tmpvshm" for the self-view. The vfsrc caps are fully fixed: droidcamsrc fixes only
- * size and frame rate of its viewfinder, and left the pixel aspect ratio a range that the
- * converters after it cannot take ("failed to negotiate vfsrc", Signal engine 9f38163). */
+/* The camera head: front camera, hardware H264 from droidcamsrc's video pad, sent and decoded
+ * again for the self-view socket. Its viewfinder only shows that the camera runs (the capture is
+ * started on its first frame); it stops once the capture does. TEAMS_MEDIA_CAMERA replaces the
+ * head (tests, or another camera setup); it must have an element "tmvout" whose src pad gives
+ * H264 byte-stream access units, and may have a shmsink "tmpvshm" for the self-view. The vfsrc
+ * caps are fully fixed: droidcamsrc fixes only size and frame rate of its viewfinder, and left
+ * the pixel aspect ratio a range that it then cannot negotiate ("failed to negotiate vfsrc",
+ * Signal engine 9f38163). The self-view's decoder takes what the tee gives it through a leaky
+ * queue, so a slow decoder costs self-view frames and never holds up what we send. */
 static gchar *tm_camera_description(const TeamsMedia *tm, gboolean *mirrored)
 {
     int w = tm->vtx_w ? (int)tm->vtx_w : TM_VIDEO_W, h = tm->vtx_h ? (int)tm->vtx_h : TM_VIDEO_H;
@@ -830,12 +835,15 @@ static gchar *tm_camera_description(const TeamsMedia *tm, gboolean *mirrored)
         "droidcamsrc name=tmcam mode=2 camera-device=1 target-bitrate=%d "
         "tmcam.imgsrc ! fakesink async=false "
         "tmcam.vfsrc ! video/x-raw,format=NV21,width=%d,height=%d,framerate=30/1,pixel-aspect-ratio=1/1 ! "
-        "queue leaky=downstream max-size-buffers=2 ! videoconvert ! videoscale ! "
-        "video/x-raw,format=I420,width=%d,height=%d,pixel-aspect-ratio=1/1 ! "
-        "queue leaky=downstream max-size-buffers=2 ! shmsink name=tmpvshm "
+        "fakesink name=tmvf async=false sync=false enable-last-sample=false "
         "tmcam.vidsrc ! video/x-h264,width=%d,height=%d ! h264parse config-interval=-1 ! "
-        "video/x-h264,stream-format=byte-stream,alignment=au ! queue name=tmvout",
-        bps, TM_VIDEO_W, TM_VIDEO_H, TM_PREVIEW_W, TM_PREVIEW_H, w, h);
+        "video/x-h264,stream-format=byte-stream,alignment=au ! tee name=tmvt "
+        "tmvt. ! queue name=tmvout "
+        "tmvt. ! queue leaky=downstream max-size-buffers=30 max-size-bytes=0 max-size-time=0 ! "
+        "avdec_h264 ! videoconvert ! videoscale ! "
+        "video/x-raw,format=I420,width=%d,height=%d,pixel-aspect-ratio=1/1 ! "
+        "queue leaky=downstream max-size-buffers=2 ! shmsink name=tmpvshm",
+        bps, TM_VIDEO_W, TM_VIDEO_H, w, h, TM_PREVIEW_W, TM_PREVIEW_H);
 }
 
 /* Quarter turns (counter-clockwise, as the Phone app turns the self-view) for the camera's sensor
@@ -868,6 +876,21 @@ static gboolean tm_start_capture(gpointer user)
     return G_SOURCE_REMOVE;
 }
 
+/* Streaming thread: the camera's first viewfinder frame, so it runs; start the capture. */
+static GstPadProbeReturn tm_probe_first_vf(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    (void)pad; (void)info;
+    if (tm->vtx_cam && g_signal_lookup("start-capture", G_OBJECT_TYPE(tm->vtx_cam))) {
+        GSource *s = g_idle_source_new();
+        g_source_set_callback(s, tm_start_capture, tm, NULL);
+        g_source_attach(s, tm->ctx);
+        g_source_unref(s);
+    }
+    return GST_PAD_PROBE_REMOVE;
+}
+
+/* Streaming thread: the first self-view frame; say where the picture is. */
 static GstPadProbeReturn tm_probe_vpreview(GstPad *pad, GstPadProbeInfo *info, gpointer user)
 {
     TeamsMedia *tm = user;
@@ -882,12 +905,6 @@ static GstPadProbeReturn tm_probe_vpreview(GstPad *pad, GstPadProbeInfo *info, g
         tm_event(tm, "VPREVIEW %s %d %d %d %d", path ? path : TM_PREVIEW_SHM, TM_PREVIEW_W, TM_PREVIEW_H,
                  tm_preview_turns(tm), tm_video_tx_mirrored ? 1 : 0);
         g_free(path);
-        if (tm->vtx_cam && g_signal_lookup("start-capture", G_OBJECT_TYPE(tm->vtx_cam))) {
-            GSource *s = g_idle_source_new();
-            g_source_set_callback(s, tm_start_capture, tm, NULL);
-            g_source_attach(s, tm->ctx);
-            g_source_unref(s);
-        }
     }
     return GST_PAD_PROBE_REMOVE;
 }
@@ -928,6 +945,11 @@ static gboolean tm_video_tx_start(gpointer user)
         gst_object_unref(pv);
     }
     tm->vtx_cam = gst_bin_get_by_name(GST_BIN(head), "tmcam");
+    GstElement *vf = gst_bin_get_by_name(GST_BIN(head), "tmvf");
+    if (vf) {
+        tm_add_probe(vf, "sink", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_first_vf, tm);
+        gst_object_unref(vf);
+    }
     tm_video_tx_mirrored = mirrored;
     g_atomic_int_set(&tm->vtx_announced, 0);
     g_atomic_int_set(&tm->vtx_capture, 0);

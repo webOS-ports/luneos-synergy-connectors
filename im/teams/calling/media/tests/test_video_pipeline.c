@@ -450,6 +450,7 @@ static GstPadProbeReturn count_keyunit(GstPad *pad, GstPadProbeInfo *info, gpoin
 
 static gboolean tx_flowing(void) { return g_atomic_int_get(&tx_pkts) >= 30 && events_with("VPREVIEW ") > 0; }
 static gboolean keyunit_seen(void) { return g_atomic_int_get(&tx_keyunit) > 0; }
+static gboolean has_vpreview(void) { return events_with("VPREVIEW ") > 0; }
 
 static void test_tx(const char *h264, const char *dir)
 {
@@ -940,6 +941,95 @@ static void test_caller_srflx(void)
     g_free(uf); g_free(pw); g_free(txk);
 }
 
+/* The camera head as built for droidcamsrc, with its two pads played by stand-ins: a viewfinder that
+ * stops after 5 frames, as droidcamsrc's does once the capture runs (sargo, 5 Nov 2026), and the
+ * H264 fixture for the encoder. The self-view must go on after the viewfinder stopped, so it must
+ * come from what is sent. */
+static GstPadProbeReturn count_vf(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+{
+    (void)pad; (void)info;
+    g_atomic_int_inc((gint *)u);
+    return GST_PAD_PROBE_OK;
+}
+
+static gchar *replace_once(gchar *s, const char *from, const char *to)
+{
+    gchar *at = s ? strstr(s, from) : NULL;
+    CHECK(at != NULL);
+    if (!at)
+        return s;
+    gchar *out = g_strdup_printf("%.*s%s%s", (int)(at - s), s, to, at + strlen(from));
+    g_free(s);
+    return out;
+}
+
+static gint selfview_vf;
+static gboolean selfview_late(void) { return g_atomic_int_get(&shm_frames) >= 40; }
+
+static void test_selfview_from_sent(const char *h264, const char *dir)
+{
+    setup();
+    gchar *pv = g_build_filename(dir, "teams-selfview.sock", NULL);
+    g_setenv("TEAMS_MEDIA_PREVIEW_SHM", pv, TRUE);
+    g_unsetenv("TEAMS_MEDIA_CAMERA");
+    g_tm.vtx_w = 320; g_tm.vtx_h = 240;              /* the fixture's size */
+    gboolean m = FALSE;
+    gchar *d = tm_camera_description(&g_tm, &m), *cam = NULL;
+    /* droidcamsrc's three pads: imgsrc goes, vfsrc and vidsrc become the stand-ins. */
+    gchar *head = g_strdup_printf("droidcamsrc name=tmcam mode=2 camera-device=1 target-bitrate=%d "
+                                  "tmcam.imgsrc ! fakesink async=false tmcam.vfsrc ", TM_VIDEO_BITRATE);
+    d = replace_once(d, head, "videotestsrc is-live=true num-buffers=5 ");
+    gchar *enc = g_strdup_printf("filesrc location=%s ! video/x-h264,framerate=15/1 ! h264parse ! "
+                                 "identity sync=true ", h264);
+    cam = replace_once(d, "tmcam.vidsrc ", enc);
+    g_free(head); g_free(enc);
+    g_setenv("TEAMS_MEDIA_CAMERA", cam, TRUE);
+
+    GstElement *p = gst_pipeline_new("tx");
+    GstElement *vpay = NULL, *rtcp = NULL, *vsink = el("fakesink", NULL);
+    CHECK(tm_video_tx_build(&g_tm, p, &vpay, &rtcp));
+    g_object_set(vsink, "sync", FALSE, "async", FALSE, NULL);
+    gst_bin_add(GST_BIN(p), vsink);
+    CHECK(gst_element_link(vpay, vsink));
+    rtcp_sink(p, rtcp);
+    g_tm.pipeline = p;
+    CHECK(gst_element_set_state(p, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE);
+
+    g_atomic_int_set(&shm_frames, 0);
+    g_atomic_int_set(&shm_bad_size, 0);
+    g_atomic_int_set(&selfview_vf, 0);
+    tm_set_video(&g_tm, TRUE);
+    while (g_main_context_iteration(g_tm.ctx, FALSE)) {}
+    CHECK(g_tm.vtx_head != NULL);
+    GstElement *vf = g_tm.vtx_head ? gst_bin_get_by_name(GST_BIN(g_tm.vtx_head), "tmvf") : NULL;
+    CHECK(vf != NULL);
+    if (vf) {
+        GstPad *vp = gst_element_get_static_pad(vf, "sink");
+        gst_pad_add_probe(vp, GST_PAD_PROBE_TYPE_BUFFER, count_vf, &selfview_vf, NULL);
+        gst_object_unref(vp);
+        gst_object_unref(vf);
+    }
+    CHECK(wait_for(has_vpreview, 10000));
+    GstElement *r = shm_reader(pv, TM_PREVIEW_W, TM_PREVIEW_H);
+    gst_element_set_state(r, GST_STATE_PLAYING);
+    CHECK(wait_for(selfview_late, 15000));
+    CHECK(g_atomic_int_get(&selfview_vf) <= 5);       /* the viewfinder had stopped long before */
+    CHECK(g_atomic_int_get(&shm_bad_size) == 0);
+    g_print("self-view: %d frames after a viewfinder of %d\n", g_atomic_int_get(&shm_frames),
+            g_atomic_int_get(&selfview_vf));
+    gst_element_set_state(r, GST_STATE_NULL);
+    gst_object_unref(r);
+
+    tm_set_video(&g_tm, FALSE);
+    while (g_main_context_iteration(g_tm.ctx, FALSE)) {}
+    teardown(p);
+    g_unsetenv("TEAMS_MEDIA_CAMERA");
+    g_unsetenv("TEAMS_MEDIA_PREVIEW_SHM");
+    g_tm.vtx_w = 0; g_tm.vtx_h = 0;
+    g_free(cam);
+    g_free(pv);
+}
+
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -959,6 +1049,7 @@ int main(int argc, char **argv)
     test_rx_nokey(h264);
     reset_rtcp_counts();
     test_tx(h264, dir);
+    test_selfview_from_sent(h264, dir);
     g_ptr_array_unref(events);
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
