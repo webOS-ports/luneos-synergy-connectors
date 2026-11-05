@@ -381,6 +381,12 @@ func TestRadioPlaylists(t *testing.T) {
 	if lists[0].Tracks != 2 || lists[0].Owner != "grouped" || lists[2].Tracks != 1 {
 		t.Errorf("counts %+v", lists[:3])
 	}
+	// Radio Browser's lists say no count: it is not known before they are read.
+	for _, l := range lists[3:] {
+		if l.Tracks != 0 || l.Owner != "Radio Browser" {
+			t.Errorf("Radio Browser list %+v", l)
+		}
+	}
 	tr, err := p.PlaylistTracks(context.Background(), news)
 	if err != nil || len(tr) != 2 || tr[0].Title != "N1" || tr[1].Title != "N2" {
 		t.Fatalf("news: %+v %v", tr, err)

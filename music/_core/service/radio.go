@@ -743,7 +743,9 @@ func (p *radioProvider) Playlists(ctx context.Context) ([]providerPlaylist, erro
 		}
 	}
 	for _, l := range p.rbPlaylists() {
-		out = append(out, providerPlaylist{ID: l.ID, Provider: "radio", Name: l.Name, Owner: "Radio Browser", Tracks: radioListSize})
+		// How many stations it holds is not known before it is read:
+		// up to radioListSize, of those Radio Browser has.
+		out = append(out, providerPlaylist{ID: l.ID, Provider: "radio", Name: l.Name, Owner: "Radio Browser"})
 	}
 	if len(out) > maxPlaylists {
 		out = out[:maxPlaylists]
