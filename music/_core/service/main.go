@@ -185,6 +185,7 @@ func main() {
 	restoreSession()        // reload a persisted token, if any, so login survives restarts
 	serveLibrespotOAuth()   // end of librespot's sign-in (librespotauth.go)
 	loadYtToken()           // reload a persisted YouTube OAuth token, if any
+	startPodcasts()         // subscriptions, their refresh and downloads (podcasts.go)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/login", handleLoginRedirect) // short URL to type in the browser
@@ -239,6 +240,7 @@ func main() {
 	mux.HandleFunc("/player/seek", withCORS(handlePlayerSeek))
 	mux.HandleFunc("/player/volume", withCORS(handlePlayerVolume))
 	mux.HandleFunc("/player/status", withCORS(handlePlayerStatus))
+	registerPodcastRoutes(mux) // /podcasts/... (podcasts.go)
 
 	ln, err := newRawAcceptListener(*addr)
 	if err != nil {

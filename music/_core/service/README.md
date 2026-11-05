@@ -144,6 +144,51 @@ As Radio Browser asks: the server comes from the DNS name
 `/json/url/<stationuuid>`. A station's own `.pls` or `.m3u` file is opened
 for its stream when it plays (GStreamer plays HLS's `.m3u8` itself).
 
+## Podcasts
+
+`podcasts.go`, `podcastfeed.go`, `podcastdownload.go`, `podcastopml.go`: the
+user's subscriptions, kept by the service so feeds are refreshed, episodes
+downloaded and new ones notified while the Music app is closed. The app is a
+client of these routes (JSON, errors as `{error}`):
+
+| Route | What |
+|---|---|
+| `GET /podcasts` | `{podcasts (by title), refreshing, downloading}` |
+| `GET /podcasts/search?q=&limit=` | the webOS Archive's directory (drPodder's); Apple's when that fails or finds nothing |
+| `POST /podcasts/preview {url}` | a feed's podcast and first 50 episodes, nothing kept |
+| `POST /podcasts/subscribe {url}`, `/unsubscribe {id, deleteDownloads}` | |
+| `GET /podcasts/episodes?id=&offset=&limit=` | newest first, with `more` and `next` (0: no next page) |
+| `GET /podcasts/new`, `/inprogress`, `/downloads` | over all podcasts |
+| `POST /podcasts/state {id, position_ms?, played?, new?}`, `/markall {podcast, played?, new?}` | |
+| `POST /podcasts/refresh {id?}` | answers at once; the work goes on in the background |
+| `POST /podcasts/download`, `/download/cancel`, `/download/delete {id}` | |
+| `POST /podcasts/resolve {trackId}` | the downloaded file (`file://`) while it is there, else the enclosure |
+| `GET /podcasts/opml`, `POST /podcasts/opml/export`, `/opml/import {opml\|path\|url}`, `GET /podcasts/opml/files` | |
+| `GET`/`POST /podcasts/settings`, `POST /podcasts/feedsettings {id, autoDownload}` | |
+
+A podcast's id is the first 12 hex digits of the SHA-1 of its address as
+first subscribed (it stays when the feed moves for good, 301/308); an
+episode's is `podcast:<id>.<16 hex of the SHA-1 of its guid>`, also its track
+in the app (`<id>.<e>` alone is taken too). Feeds are RSS 2.0/0.9x with the
+itunes: elements, Atom 1.0 (`rel="enclosure"`) or RSS 1.0; an item without an
+http(s) enclosure is left out. They are read as `LuneOS-Music/1.0`, at most
+16 MiB in 30 s, with ETag / Last-Modified, and the newest 2000 episodes of
+each are kept.
+
+State: `podcasts.json` in spotifyDataDir, written whole (temporary file,
+rename) two seconds after a change. Downloads go to
+`/media/internal/podcasts/<podcast>/<YYYY-MM-DD> <episode>.<ext>` (names made
+safe for vfat), written as `.part` and renamed, two at a time; one is refused
+with less free space than the episode and 64 MiB. Nothing outside that
+folder is ever removed or played.
+
+Every refreshHours (0: only when asked) all podcasts are refreshed; then each
+podcast's newest autoDownload unplayed episodes are downloaded (only on Wi-Fi,
+by com.palm.connectionmanager/getStatus, when wifiOnly), and the downloads of
+episodes played more than keepPlayedDays ago removed. New episodes found by
+the timed refresh give one notification (com.webos.notification/createToast,
+kept in the notification area, opening the app's podcasts) when notify is on.
+
 ## Browsing a library
 
 A provider with a library to walk implements `libraryBrowser` (`browse.go`),
