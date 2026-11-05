@@ -746,6 +746,78 @@ static void test_unavailable(void)
     g_mutex_clear(&g_tm.vlock);
 }
 
+/* ------------------------------------------------------------------ ICE thread --------------- */
+
+static GMutex blk_lock;
+static GCond  blk_cond;
+static gboolean blk_entered, blk_release;
+static gint ice_ran;
+
+/* Stands in for a media-thread callback stuck in a push (the camera's start-capture). */
+static gboolean block_media_loop(gpointer user)
+{
+    (void)user;
+    g_mutex_lock(&blk_lock);
+    blk_entered = TRUE;
+    g_cond_broadcast(&blk_cond);
+    while (!blk_release) g_cond_wait(&blk_cond, &blk_lock);
+    g_mutex_unlock(&blk_lock);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean mark_ice_ran(gpointer user)
+{
+    (void)user;
+    g_atomic_int_set(&ice_ran, 1);
+    return G_SOURCE_REMOVE;
+}
+
+/* The ICE agent's context keeps running while the media loop is stuck: nicesink's "writable"
+ * notice, ICE checks and keepalives must not wait on a media-thread callback (the 5 Nov deadlock
+ * of every call we placed: start-capture blocked on nicesink, nicesink waited for the loop). */
+static void test_ice_own_thread(void)
+{
+    gchar *uf = NULL, *pw = NULL, *txk = NULL;
+    GMainContext *actx = NULL;
+
+    CHECK(tm_start(1, NULL, NULL, NULL, 0, NULL, NULL, NULL, &uf, &pw, &txk) == 0);
+    CHECK(g_tm.agent != NULL);
+    if (g_tm.agent) g_object_get(g_tm.agent, "main-context", &actx, NULL);
+    CHECK(actx != NULL && actx != g_tm.ctx);
+
+    blk_entered = blk_release = FALSE;
+    g_atomic_int_set(&ice_ran, 0);
+    GSource *s = g_idle_source_new();
+    g_source_set_callback(s, block_media_loop, NULL, NULL);
+    g_source_attach(s, g_tm.ctx);
+    g_source_unref(s);
+    g_mutex_lock(&blk_lock);
+    gint64 end = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+    while (!blk_entered && g_cond_wait_until(&blk_cond, &blk_lock, end)) {}
+    gboolean blocked = blk_entered;
+    g_mutex_unlock(&blk_lock);
+    CHECK(blocked);
+
+    if (actx) {
+        s = g_timeout_source_new(10);
+        g_source_set_callback(s, mark_ice_ran, NULL, NULL);
+        g_source_attach(s, actx);
+        g_source_unref(s);
+    }
+    end = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+    while (!g_atomic_int_get(&ice_ran) && g_get_monotonic_time() < end) g_usleep(10000);
+    CHECK(g_atomic_int_get(&ice_ran));
+
+    g_mutex_lock(&blk_lock);
+    blk_release = TRUE;
+    g_cond_broadcast(&blk_cond);
+    g_mutex_unlock(&blk_lock);
+    if (actx) g_main_context_unref(actx);
+    tm_stop();
+    CHECK(g_tm.agent == NULL && g_tm.nice_thread == NULL);
+    g_free(uf); g_free(pw); g_free(txk);
+}
+
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -755,6 +827,7 @@ int main(int argc, char **argv)
     if (!h264 || !dir) { fprintf(stderr, "TEAMS_TEST_H264 and TEAMS_TEST_DIR are needed\n"); return 2; }
     CHECK(tm_video_available());
     test_unavailable();
+    test_ice_own_thread();
     test_srtp_funnel();
     test_shm_allocation(dir);
     test_camera_size();

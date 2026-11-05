@@ -93,6 +93,15 @@ typedef struct {
     GMainLoop    *loop;
     GThread      *thread;
 
+    /* libnice runs on its own context and thread (tm_nice_thread), never on ctx: nicesink waits
+     * for the agent's "writable" notice when a TCP path is full, and that notice is dispatched on
+     * the agent's context. On ctx, any media-thread callback that pushes into the send path (the
+     * camera's start-capture) waited on nicesink while nicesink waited on ctx: the media loop,
+     * ICE checks and all sending stopped for the rest of the call. */
+    GMainContext *nice_ctx;
+    GMainLoop    *nice_loop;
+    GThread      *nice_thread;
+
     NiceAgent    *agent;
     guint         stream_id;
     guint         component;   /* 1 = RTP (rtcp-mux) */
@@ -1078,7 +1087,7 @@ static gboolean build_ice(TeamsMedia *tm, gboolean controlling, const char *remo
 {
     /* NICE_COMPATIBILITY_RFC5245 = standard ICE. Teams' MS-ICE is close enough for host/srflx/relay
      * pairing in practice; if MS-specific quirks block it we may need MS-TURN via RELAY. */
-    tm->agent = nice_agent_new(tm->ctx, NICE_COMPATIBILITY_RFC5245);
+    tm->agent = nice_agent_new(tm->nice_ctx, NICE_COMPATIBILITY_RFC5245);
     if (!tm->agent) { g_printerr("teams_media: nice_agent_new failed\n"); return FALSE; }
     g_object_set(tm->agent, "controlling-mode", controlling ? TRUE : FALSE, NULL);
 
@@ -1348,6 +1357,16 @@ static gpointer media_thread(gpointer data)
     return NULL;
 }
 
+/* The ICE agent's thread: runs its context for the whole call (see TeamsMedia.nice_ctx). */
+static gpointer tm_nice_thread(gpointer data)
+{
+    TeamsMedia *tm = (TeamsMedia *)data;
+    g_main_context_push_thread_default(tm->nice_ctx);
+    g_main_loop_run(tm->nice_loop);
+    g_main_context_pop_thread_default(tm->nice_ctx);
+    return NULL;
+}
+
 static void tm_init(void)
 {
     if (g_once_init_enter(&g_inited)) { gst_init(NULL, NULL); g_once_init_leave(&g_inited, 1); }
@@ -1415,6 +1434,9 @@ static int tm_start(int is_caller, const char *rx_master_b64, const char *remote
 
     g_tm.ctx  = g_main_context_new();
     g_tm.loop = g_main_loop_new(g_tm.ctx, FALSE);
+    g_tm.nice_ctx  = g_main_context_new();
+    g_tm.nice_loop = g_main_loop_new(g_tm.nice_ctx, FALSE);
+    g_tm.nice_thread = g_thread_new("teams-ice", tm_nice_thread, &g_tm);
 
     if (!build_ice(&g_tm, is_caller, remote_ufrag, remote_pwd)) return -1;
 
@@ -1477,7 +1499,13 @@ static void tm_stop(void)
     if (g_tm.vtx_cam) { gst_object_unref(g_tm.vtx_cam); g_tm.vtx_cam = NULL; }
     g_tm.vtx_head = NULL;   /* owned by the pipeline */
     if (g_tm.pipeline) { gst_object_unref(g_tm.pipeline); g_tm.pipeline = NULL; }
+    /* The pipeline is down, so nothing waits on the agent any more: stop its thread first, so no
+     * agent callback runs while the agent goes. */
+    if (g_tm.nice_loop) g_main_loop_quit(g_tm.nice_loop);
+    if (g_tm.nice_thread) { g_thread_join(g_tm.nice_thread); g_tm.nice_thread = NULL; }
     if (g_tm.agent) { g_object_unref(g_tm.agent); g_tm.agent = NULL; }
+    if (g_tm.nice_loop) { g_main_loop_unref(g_tm.nice_loop); g_tm.nice_loop = NULL; }
+    if (g_tm.nice_ctx) { g_main_context_unref(g_tm.nice_ctx); g_tm.nice_ctx = NULL; }
     set_rx_master(&g_tm, NULL);
     if (g_tm.tx_master) { gst_buffer_unref(g_tm.tx_master); g_tm.tx_master = NULL; }
     if (g_tm.loop) { g_main_loop_unref(g_tm.loop); g_tm.loop = NULL; }
