@@ -5,7 +5,7 @@
     "com.palm.telegram":    {"key": "telegram",   "family": "im", "plugin": "libtelegram-tdlib.so", "service_name": "type_telegram",  "auth": "phone+code",      "package": "tdlib-purple"},
     "com.palm.signal":      {"key": "signal",     "family": "im", "plugin": "libpresage.so",        "service_name": "type_signal",    "auth": "link-qr",         "package": "purple-presage"},
     "com.palm.whatsapp":    {"key": "whatsapp",   "family": "im", "plugin": "libwhatsmeow.so",      "service_name": "type_whatsapp",  "auth": "link-qr",         "package": "purple-combined"},
-    "com.palm.gometa":      {"key": "facebook",   "family": "im", "plugin": "libwhatsmeow.so",      "service_name": "type_gometa",    "auth": "password+2fa",    "package": "purple-combined", "name": "Facebook (E2EE)"},
+    "com.palm.gometa":      {"key": "facebook",   "family": "im", "plugin": "libwhatsmeow.so",      "service_name": "type_gometa",    "auth": "password+2fa",    "package": "purple-combined", "name": "Facebook"},
     "com.palm.discord":     {"key": "discord",    "family": "im", "plugin": "libdiscord.so",        "service_name": "type_discord",   "auth": "password",        "package": "purple-discord"},
     "com.palm.googlechat":  {"key": "googlechat", "family": "im", "plugin": "libgooglechat.so",     "service_name": "type_googlechat","auth": "cookie",          "package": "purple-googlechat"},
 

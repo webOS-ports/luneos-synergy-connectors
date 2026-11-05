@@ -1,6 +1,6 @@
 [{
     "templateId": "com.palm.gometa",
-    "loc_name": "Facebook (E2EE)",
+    "loc_name": "Facebook",
     "icon": {
         "loc_32x32": "images/facebook-32x32.png",
         "loc_48x48": "images/facebook-48x48.png"
@@ -35,7 +35,7 @@
             "capabilitySubtype": "IM",
             "id": "com.palm.gometa.im",
             "alwaysOn": true,
-            "loc_shortName": "Facebook (E2EE)",
+            "loc_shortName": "Facebook",
             "icon": {
                 "loc_32x32": "images/facebook-32x32.png",
                 "loc_48x48": "images/facebook-48x48.png",

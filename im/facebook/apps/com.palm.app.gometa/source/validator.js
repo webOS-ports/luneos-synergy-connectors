@@ -25,7 +25,7 @@ enyo.kind({
     components: [
         { kind: "Toolbar", className: "enyo-toolbar-light accounts-header", pack: "center", components: [
             { kind: "Image", src: "images/header-icon.png" },
-            { kind: "Control", name: "title", content: "Facebook (E2EE)" }
+            { kind: "Control", name: "title", content: "Facebook" }
         ]},
         { className: "accounts-header-shadow" },
         { kind: "Scroller", flex: 1, components: [
