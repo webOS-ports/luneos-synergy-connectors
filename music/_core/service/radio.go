@@ -442,12 +442,13 @@ type radioCached struct {
 type rbCached struct {
 	at     time.Time
 	tracks []providerTrack
+	next   int // the next page's offset, 0: none
 }
 
 type radioProvider struct {
 	mu    sync.Mutex
 	lists map[string]radioCached // list address -> its stations
-	rb    map[string]rbCached    // a Radio Browser playlist id -> its stations
+	rb    map[string]rbCached    // "<Radio Browser playlist id>@<offset>" -> that page
 }
 
 func newRadioProvider() *radioProvider {
@@ -754,29 +755,64 @@ func (p *radioProvider) Playlists(ctx context.Context) ([]providerPlaylist, erro
 }
 
 func (p *radioProvider) PlaylistTracks(ctx context.Context, playlistID string) ([]providerTrack, error) {
+	tracks, _, err := p.PlaylistPage(ctx, playlistID, 0)
+	return tracks, err
+}
+
+// PlaylistPage: a Radio Browser list radioListSize stations at a time, up to
+// maxPlaylistTracks; the user's own lists come whole, with the first page.
+func (p *radioProvider) PlaylistPage(ctx context.Context, playlistID string, offset int) ([]providerTrack, int, error) {
 	if strings.HasPrefix(playlistID, "rb.") {
 		for _, l := range p.rbPlaylists() {
-			if l.ID != playlistID {
-				continue
+			if l.ID == playlistID {
+				return p.rbPage(ctx, l, offset)
 			}
-			p.mu.Lock()
-			c, ok := p.rb[l.ID]
-			p.mu.Unlock()
-			if ok && time.Since(c.at) < radioCacheTTL {
-				return c.tracks, nil
-			}
-			var st []radioStation
-			if err := radioGet(ctx, l.Path, l.Query, &st); err != nil {
-				return nil, err
-			}
-			tracks := radioTracks(st, radioListSize)
-			p.mu.Lock()
-			p.rb[l.ID] = rbCached{at: time.Now(), tracks: tracks}
-			p.mu.Unlock()
-			return tracks, nil
 		}
-		return nil, fmt.Errorf("radio: no playlist %q", playlistID)
+		return nil, 0, fmt.Errorf("radio: no playlist %q", playlistID)
 	}
+	if offset > 0 {
+		if _, _, ok := parseListPlaylistID(playlistID); !ok {
+			return nil, 0, fmt.Errorf("radio: no playlist %q", playlistID)
+		}
+		return []providerTrack{}, 0, nil
+	}
+	tracks, err := p.listTracks(ctx, playlistID)
+	return tracks, 0, err
+}
+
+func (p *radioProvider) rbPage(ctx context.Context, l rbPlaylist, offset int) ([]providerTrack, int, error) {
+	key := l.ID + "@" + strconv.Itoa(offset)
+	p.mu.Lock()
+	c, ok := p.rb[key]
+	p.mu.Unlock()
+	if ok && time.Since(c.at) < radioCacheTTL {
+		return c.tracks, c.next, nil
+	}
+	q := l.Query // rbPlaylists makes it anew each time
+	q.Set("offset", strconv.Itoa(offset))
+	var st []radioStation
+	if err := radioGet(ctx, l.Path, q, &st); err != nil {
+		return nil, 0, err
+	}
+	tracks := radioTracks(st, radioListSize)
+	// A full page may have a next one, from after the stations it read -
+	// also those it left out (broken, no address), as Radio Browser counts.
+	next := 0
+	if len(st) >= radioListSize && offset+radioListSize < maxPlaylistTracks {
+		next = offset + radioListSize
+	}
+	p.mu.Lock()
+	for k, old := range p.rb {
+		if time.Since(old.at) >= radioCacheTTL {
+			delete(p.rb, k)
+		}
+	}
+	p.rb[key] = rbCached{at: time.Now(), tracks: tracks, next: next}
+	p.mu.Unlock()
+	return tracks, next, nil
+}
+
+func (p *radioProvider) listTracks(ctx context.Context, playlistID string) ([]providerTrack, error) {
 	idx, group, ok := parseListPlaylistID(playlistID)
 	lists := readRadioLists()
 	if !ok || idx >= len(lists) {

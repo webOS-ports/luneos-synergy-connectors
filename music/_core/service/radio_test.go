@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -67,6 +69,17 @@ func newFakeRadioBrowser(t *testing.T) *fakeRadioBrowser {
 			}
 			_ = json.NewEncoder(w).Encode(out)
 		default:
+			// limit and offset as Radio Browser takes them.
+			q := r.URL.Query()
+			if off, err := strconv.Atoi(q.Get("offset")); err == nil && off > 0 {
+				if off > len(stations) {
+					off = len(stations)
+				}
+				stations = stations[off:]
+			}
+			if n, err := strconv.Atoi(q.Get("limit")); err == nil && n < len(stations) {
+				stations = stations[:n]
+			}
 			_ = json.NewEncoder(w).Encode(stations)
 		}
 	}))
@@ -606,5 +619,107 @@ func TestRadioStreamURLAsksNothingForABadID(t *testing.T) {
 	}
 	if len(rb.paths) != 0 {
 		t.Errorf("Radio Browser asked %v", rb.paths)
+	}
+}
+
+// Radio Browser's lists a page of radioListSize at a time: the next page from
+// where the last ended, more while a page is full, never past
+// maxPlaylistTracks (the next page's offset, 0 for none); each page kept
+// for a while. The user's lists come whole.
+func TestRadioPlaylistPages(t *testing.T) {
+	rb := newFakeRadioBrowser(t)
+	all := []radioStation{}
+	for i := 0; i < maxPlaylistTracks+50; i++ {
+		u := fmt.Sprintf("%08x-0000-4000-8000-%012x", i, i)
+		st := rbStation(u, fmt.Sprintf("S%d", i), fmt.Sprintf("http://s.example/%d", i))
+		if i == 1 {
+			st.LastCheckOK = 0 // broken: left out, but it counts for the page
+		}
+		all = append(all, st)
+	}
+	rb.stations = all[:radioListSize*2+50]
+	useRadio(t, []string{rb.srv.URL}, "")
+	files := serveFiles(t, map[string][2]string{"/plain.pls": {"audio/x-scpls", "[playlist]\nFile1=http://s.example/p1\nTitle1=P1\n"}})
+	writeLists(t, files.URL+"/plain.pls")
+	p := newRadioProvider()
+	ctx := context.Background()
+
+	page := func(offset int) ([]providerTrack, int) {
+		t.Helper()
+		tr, next, err := p.PlaylistPage(ctx, "rb.tag.jazz", offset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tr, next
+	}
+	tr, next := page(0)
+	if len(tr) != radioListSize-1 || next != radioListSize || tr[0].Title != "S0" || tr[1].Title != "S2" {
+		t.Fatalf("first page: %d %v %s", len(tr), next, tr[0].Title)
+	}
+	if _, q := rb.last(); q.Get("offset") != "0" || q.Get("limit") != "100" || q.Get("tag") != "jazz" {
+		t.Errorf("asked %v", q)
+	}
+	tr, next = page(radioListSize)
+	if len(tr) != radioListSize || next != 2*radioListSize || tr[0].Title != "S100" {
+		t.Fatalf("second page: %d %v", len(tr), next)
+	}
+	if _, q := rb.last(); q.Get("offset") != "100" || q.Get("tag") != "jazz" {
+		t.Errorf("asked %v", q)
+	}
+	tr, next = page(radioListSize * 2)
+	if len(tr) != 50 || next != 0 || tr[0].Title != "S200" {
+		t.Fatalf("last page: %d %v", len(tr), next)
+	}
+	// Kept: no new question for a page already read.
+	n := len(rb.paths)
+	if tr, next = page(radioListSize); len(tr) != radioListSize || next != 2*radioListSize || len(rb.paths) != n {
+		t.Errorf("again: %d %v, %d questions", len(tr), next, len(rb.paths)-n)
+	}
+	// A full page at the end of what the app is given has no next one.
+	rb.mu.Lock()
+	rb.stations = all
+	rb.mu.Unlock()
+	if tr, next = page(maxPlaylistTracks - radioListSize); len(tr) != radioListSize || next != 0 {
+		t.Errorf("at the end: %d %v", len(tr), next)
+	}
+	if tr, next = page(maxPlaylistTracks - radioListSize - 1); len(tr) != radioListSize || next != maxPlaylistTracks-1 {
+		t.Errorf("before the end: %d %v", len(tr), next)
+	}
+	// PlaylistTracks is the first page.
+	if tr, err := p.PlaylistTracks(ctx, "rb.tag.jazz"); err != nil || len(tr) != radioListSize-1 {
+		t.Errorf("tracks: %d %v", len(tr), err)
+	}
+	// The user's list: whole with the first page, nothing after.
+	if tr, next, err := p.PlaylistPage(ctx, "l0", 0); err != nil || len(tr) != 1 || next != 0 {
+		t.Errorf("own list: %v %v %v", tr, next, err)
+	}
+	if tr, next, err := p.PlaylistPage(ctx, "l0", radioListSize); err != nil || len(tr) != 0 || next != 0 {
+		t.Errorf("own list, later: %v %v %v", tr, next, err)
+	}
+	for _, bad := range []string{"lx", "rb.nope", "x"} {
+		if _, _, err := p.PlaylistPage(ctx, bad, radioListSize); err == nil {
+			t.Errorf("%q gave a page", bad)
+		}
+	}
+	rb.mu.Lock()
+	rb.fail = true
+	rb.mu.Unlock()
+	if _, _, err := p.PlaylistPage(ctx, "rb.tag.rock", 0); err == nil {
+		t.Error("Radio Browser down, no error")
+	}
+}
+
+// Pages past their time are let go when another is kept.
+func TestRadioPagesExpire(t *testing.T) {
+	rb := newFakeRadioBrowser(t)
+	useRadio(t, []string{rb.srv.URL}, "")
+	p := newRadioProvider()
+	p.rb["rb.top@100"] = rbCached{at: time.Now().Add(-radioCacheTTL - time.Second)}
+	p.rb["rb.top@200"] = rbCached{at: time.Now()}
+	if _, _, err := p.PlaylistPage(context.Background(), "rb.top", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, old := p.rb["rb.top@100"]; old || len(p.rb) != 2 {
+		t.Errorf("kept %v", p.rb)
 	}
 }
