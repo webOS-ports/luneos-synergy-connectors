@@ -632,14 +632,20 @@ static GstPadProbeReturn tm_probe_vdec(GstPad *pad, GstPadProbeInfo *info, gpoin
     return GST_PAD_PROBE_OK;
 }
 
-/* The size the far side's picture is published at, for a decoded w x h: 640x480, or 480x640 for a
- * portrait picture. The Teams app on a phone sends its frames upright (no rotation field), and a
- * portrait picture scaled into a landscape frame came out a narrow strip between borders. */
+/* The size the far side's picture is published at, for a decoded w x h: its own shape, scaled down
+ * so the long side is at most 640, in even numbers. The Teams app on a phone sends its frames
+ * upright (no rotation field), often 360x640; boxed into a fixed 640x480 or 480x640 it gained
+ * borders, and the Phone app, fitting that box to the screen, showed the picture small. */
 static void tm_rx_frame_size(gint w, gint h, gint *ow, gint *oh)
 {
-    gboolean portrait = h > w;
-    *ow = portrait ? TM_VIDEO_H : TM_VIDEO_W;
-    *oh = portrait ? TM_VIDEO_W : TM_VIDEO_H;
+    const gint64 lim = MAX(TM_VIDEO_W, TM_VIDEO_H);
+    gint64 lw = MAX(w, 2), lh = MAX(h, 2), lng = MAX(lw, lh);
+    if (lng > lim) {
+        lw = (lw * lim + lng / 2) / lng;
+        lh = (lh * lim + lng / 2) / lng;
+    }
+    *ow = (gint) MAX(lw & ~(gint64) 1, 2);
+    *oh = (gint) MAX(lh & ~(gint64) 1, 2);
 }
 
 /* Streaming thread: the decoder's caps. Publish the picture in its own orientation, and have the

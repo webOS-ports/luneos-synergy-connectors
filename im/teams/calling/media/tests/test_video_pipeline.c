@@ -260,7 +260,8 @@ static void test_rx(const char *h264, const char *dir)
 
     CHECK(gst_element_set_state(p, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE);
     CHECK(wait_for(has_vshm, 10000));
-    GstElement *reader = shm_reader(shm, TM_VIDEO_W, TM_VIDEO_H);
+    /* Read at the size announced, as the Phone app does: the fixture's own 320x240. */
+    GstElement *reader = shm_reader(shm, g_atomic_int_get(&g_tm.vrx_w), g_atomic_int_get(&g_tm.vrx_h));
     gst_element_set_state(reader, GST_STATE_PLAYING);
 
     /* The far side's sender report about its video: our next receiver report quotes it. */
@@ -271,7 +272,7 @@ static void test_rx(const char *h264, const char *dir)
 
     wait_for(rx_done, 15000);
     gchar *vshm = event_with("VSHM ");
-    gchar *want = g_strdup_printf("VSHM %s 640 480", shm);
+    gchar *want = g_strdup_printf("VSHM %s 320 240", shm);
     CHECK(vshm && !g_strcmp0(vshm, want));
     g_free(vshm); g_free(want);
     CHECK(events_with("VSHM ") == 1);
@@ -1070,8 +1071,18 @@ static gboolean rx_caps_are(GstElement *cf, int w, int h)
     return ok;
 }
 
-/* The Teams app on a phone sends its picture upright, so portrait: it is published as 480x640, not
- * shrunk into 640x480, and the size is said again each time the picture turns. */
+/* The Teams app on a phone sends its picture upright, often 360x640: it is published in its own
+ * shape (long side at most 640), not boxed into 640x480 or 480x640, and the size is said again each
+ * time it changes. */
+static void last_vshm_is(const char *sock, int w, int h)
+{
+    gchar *want = g_strdup_printf("VSHM %s %d %d", sock, w, h);
+    g_mutex_lock(&ev_lock);
+    CHECK(events->len > 0 && strcmp(g_ptr_array_index(events, events->len - 1), want) == 0);
+    g_mutex_unlock(&ev_lock);
+    g_free(want);
+}
+
 static void test_rx_portrait(const char *dir)
 {
     setup();
@@ -1082,35 +1093,37 @@ static void test_rx_portrait(const char *dir)
     GstElement *dec = gst_bin_get_by_name(GST_BIN(p), "rxv-dec"), *shm = gst_bin_get_by_name(GST_BIN(p), "rxv-shm");
     CHECK(dec && shm && g_tm.vrx_size);
     if (dec && shm && g_tm.vrx_size) {
-        gchar *want;
         CHECK(rx_caps_are(g_tm.vrx_size, 640, 480));
-        feed_rx_caps(dec, 640, 360);                    /* landscape: as before, nothing new to say */
+        feed_rx_caps(dec, 640, 480);                    /* the default size: nothing new to say */
         feed_rx_frame(shm);
         CHECK(events_with("VSHM ") == 1);
-        want = g_strdup_printf("VSHM %s 640 480", sock);
-        gchar *line = event_with("VSHM ");
-        CHECK(line && strcmp(line, want) == 0);
-        g_free(line); g_free(want);
+        last_vshm_is(sock, 640, 480);
 
         feed_rx_caps(dec, 360, 640);                    /* the Android held upright */
-        CHECK(rx_caps_are(g_tm.vrx_size, 480, 640));
+        CHECK(rx_caps_are(g_tm.vrx_size, 360, 640));
         feed_rx_frame(shm);
         feed_rx_frame(shm);
         CHECK(events_with("VSHM ") == 2);
-        want = g_strdup_printf("VSHM %s 480 640", sock);
-        g_mutex_lock(&ev_lock);
-        CHECK(strcmp(g_ptr_array_index(events, events->len - 1), want) == 0);
-        g_mutex_unlock(&ev_lock);
-        g_free(want);
+        last_vshm_is(sock, 360, 640);
 
-        feed_rx_caps(dec, 480, 848);                    /* still portrait: no new size */
+        feed_rx_caps(dec, 360, 640);                    /* the same size again: no new event */
         feed_rx_frame(shm);
         CHECK(events_with("VSHM ") == 2);
 
-        feed_rx_caps(dec, 1280, 720);                   /* turned to landscape */
-        CHECK(rx_caps_are(g_tm.vrx_size, 640, 480));
+        feed_rx_caps(dec, 480, 848);                    /* bigger: scaled to 640 high, even width */
+        CHECK(rx_caps_are(g_tm.vrx_size, 362, 640));
         feed_rx_frame(shm);
         CHECK(events_with("VSHM ") == 3);
+        last_vshm_is(sock, 362, 640);
+
+        feed_rx_caps(dec, 1280, 720);                   /* turned to landscape */
+        CHECK(rx_caps_are(g_tm.vrx_size, 640, 360));
+        feed_rx_frame(shm);
+        CHECK(events_with("VSHM ") == 4);
+        last_vshm_is(sock, 640, 360);
+
+        feed_rx_caps(dec, 175, 143);                    /* odd sizes come out even */
+        CHECK(rx_caps_are(g_tm.vrx_size, 174, 142));
     }
     if (dec) gst_object_unref(dec);
     if (shm) gst_object_unref(shm);
