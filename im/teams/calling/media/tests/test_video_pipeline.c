@@ -10,8 +10,16 @@
  */
 #define TEAMS_MEDIA_NO_MAIN 1
 #include "../teams_media.c"
+#include <arpa/inet.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <stun/stunagent.h>
 
-static void ipc_gathered(void) {}
+static gint gathered_calls;
+static void ipc_gathered(void) { g_atomic_int_inc(&gathered_calls); }
 
 static int failures;
 #define CHECK(c) do { if (!(c)) { failures++; fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
@@ -778,7 +786,7 @@ static gboolean mark_ice_ran(gpointer user)
 static void test_ice_own_thread(void)
 {
     gchar *uf = NULL, *pw = NULL, *txk = NULL;
-    GMainContext *actx = NULL;
+    GMainContext *actx = NULL;   /* "main-context" is a plain pointer property: no reference taken */
 
     CHECK(tm_start(1, NULL, NULL, NULL, 0, NULL, NULL, NULL, &uf, &pw, &txk) == 0);
     CHECK(g_tm.agent != NULL);
@@ -812,9 +820,123 @@ static void test_ice_own_thread(void)
     blk_release = TRUE;
     g_cond_broadcast(&blk_cond);
     g_mutex_unlock(&blk_lock);
-    if (actx) g_main_context_unref(actx);
     tm_stop();
     CHECK(g_tm.agent == NULL && g_tm.nice_thread == NULL);
+    g_free(uf); g_free(pw); g_free(txk);
+}
+
+/* ------------------------------------------------------------------ caller's srflx ----------- */
+
+/* A STUN server on loopback that answers every Binding request with a fixed mapped address, the
+ * way Teams' relay tells us our address behind the NAT. */
+#define FAKE_MAPPED_IP   "203.0.113.7"
+#define FAKE_MAPPED_PORT 4242
+
+static int stun_fd = -1;
+static gint stun_answered, stun_stop;
+static GMutex cand_lock;
+static GPtrArray *cands;
+
+static gpointer stun_server(gpointer user)
+{
+    (void)user;
+    StunAgent agent;
+    stun_agent_init(&agent, STUN_ALL_KNOWN_ATTRIBUTES, STUN_COMPATIBILITY_RFC5389, 0);
+    while (!g_atomic_int_get(&stun_stop)) {
+        struct pollfd pfd = { .fd = stun_fd, .events = POLLIN };
+        if (poll(&pfd, 1, 50) <= 0) continue;
+        uint8_t in[1500], out[1500];
+        struct sockaddr_storage from;
+        socklen_t flen = sizeof from;
+        ssize_t n = recvfrom(stun_fd, in, sizeof in, 0, (struct sockaddr *)&from, &flen);
+        if (n <= 0) continue;
+        StunMessage req, resp;
+        if (stun_agent_validate(&agent, &req, in, (size_t)n, NULL, NULL) != STUN_VALIDATION_SUCCESS ||
+            stun_message_get_class(&req) != STUN_REQUEST || stun_message_get_method(&req) != STUN_BINDING)
+            continue;
+        struct sockaddr_in mapped = { .sin_family = AF_INET, .sin_port = htons(FAKE_MAPPED_PORT) };
+        inet_pton(AF_INET, FAKE_MAPPED_IP, &mapped.sin_addr);
+        if (!stun_agent_init_response(&agent, &resp, out, sizeof out, &req)) continue;
+        if (stun_message_append_xor_addr(&resp, STUN_ATTRIBUTE_XOR_MAPPED_ADDRESS,
+                                         (struct sockaddr_storage *)&mapped, sizeof mapped) != STUN_MESSAGE_RETURN_SUCCESS)
+            continue;
+        size_t len = stun_agent_finish_message(&agent, &resp, NULL, 0);
+        if (len && sendto(stun_fd, out, len, 0, (struct sockaddr *)&from, flen) == (ssize_t)len)
+            g_atomic_int_inc(&stun_answered);
+    }
+    return NULL;
+}
+
+static void on_cand(const char *c)
+{
+    g_mutex_lock(&cand_lock);
+    g_ptr_array_add(cands, g_strdup(c));
+    g_mutex_unlock(&cand_lock);
+}
+
+static gboolean have_fake_srflx(void)
+{
+    gboolean r = FALSE;
+    g_mutex_lock(&cand_lock);
+    for (guint i = 0; i < cands->len && !r; i++) {
+        const char *c = g_ptr_array_index(cands, i);
+        r = strstr(c, " typ srflx") && strstr(c, FAKE_MAPPED_IP " " G_STRINGIFY(FAKE_MAPPED_PORT));
+    }
+    g_mutex_unlock(&cand_lock);
+    return r;
+}
+
+/* The caller (no pipeline before the answer) reads the STUN server's reply and offers the
+ * server-reflexive candidate: without it the far side has no address of ours behind the NAT. */
+static void test_caller_srflx(void)
+{
+    /* libnice sends from its host candidates, and Linux does not route those to 127.0.0.1: the
+     * server listens on this machine's first IPv4 address that is not loopback. */
+    struct sockaddr_in a = { .sin_family = AF_INET };
+    socklen_t alen = sizeof a;
+    gboolean have_ip = FALSE;
+    struct ifaddrs *ifs = NULL;
+    if (getifaddrs(&ifs) == 0) {
+        for (struct ifaddrs *i = ifs; i && !have_ip; i = i->ifa_next)
+            if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET && (i->ifa_flags & IFF_UP) &&
+                !(i->ifa_flags & IFF_LOOPBACK)) {
+                a.sin_addr = ((struct sockaddr_in *)i->ifa_addr)->sin_addr;
+                have_ip = TRUE;
+            }
+        freeifaddrs(ifs);
+    }
+    if (!have_ip) { fprintf(stderr, "SKIP test_caller_srflx: no IPv4 address that is not loopback\n"); return; }
+    stun_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(stun_fd >= 0);
+    if (stun_fd < 0) return;
+    CHECK(bind(stun_fd, (struct sockaddr *)&a, sizeof a) == 0);
+    CHECK(getsockname(stun_fd, (struct sockaddr *)&a, &alen) == 0);
+    inet_ntop(AF_INET, &a.sin_addr, g_stun_host, sizeof g_stun_host);
+    g_stun_port = ntohs(a.sin_port);
+    g_atomic_int_set(&stun_answered, 0);
+    g_atomic_int_set(&stun_stop, 0);
+    g_atomic_int_set(&gathered_calls, 0);
+    cands = g_ptr_array_new_with_free_func(g_free);
+    GThread *srv = g_thread_new("stun", stun_server, NULL);
+
+    gchar *uf = NULL, *pw = NULL, *txk = NULL;
+    CHECK(tm_start(1, NULL, NULL, NULL, 0, on_cand, NULL, NULL, &uf, &pw, &txk) == 0);
+    CHECK(g_tm.pipeline == NULL);    /* the caller has no pipeline (no nicesrc) until the answer */
+    gint64 end = g_get_monotonic_time() + 5 * G_TIME_SPAN_SECOND;
+    while (!g_atomic_int_get(&gathered_calls) && g_get_monotonic_time() < end) g_usleep(10000);
+    CHECK(g_atomic_int_get(&gathered_calls) == 1);
+    CHECK(g_atomic_int_get(&stun_answered) > 0);
+    CHECK(have_fake_srflx());
+
+    tm_stop();
+    g_atomic_int_set(&stun_stop, 1);
+    g_thread_join(srv);
+    close(stun_fd);
+    stun_fd = -1;
+    g_stun_host[0] = '\0';
+    g_stun_port = 0;
+    g_ptr_array_unref(cands);
+    cands = NULL;
     g_free(uf); g_free(pw); g_free(txk);
 }
 
@@ -828,6 +950,7 @@ int main(int argc, char **argv)
     CHECK(tm_video_available());
     test_unavailable();
     test_ice_own_thread();
+    test_caller_srflx();
     test_srtp_funnel();
     test_shm_allocation(dir);
     test_camera_size();
