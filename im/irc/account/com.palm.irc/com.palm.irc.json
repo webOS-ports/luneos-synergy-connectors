@@ -1,0 +1,58 @@
+[{
+    "templateId": "com.palm.irc",
+    "loc_name": "IRC",
+    "icon": {
+        "loc_32x32": "images/irc-32x32.png",
+        "loc_48x48": "images/irc-48x48.png"
+    },
+    "validator": {
+        "customUI": {
+            "appId": "com.palm.app.irc",
+            "name": "validator.html"
+        }
+    },
+    "loc_usernameLabel": "NICK@SERVER",
+    "readPermissions": [
+        "com.palm.imlibpurple",
+        "com.palm.app.messaging",
+        "org.webosports.app.messaging",
+        "com.palm.app.irc"
+    ],
+    "writePermissions": [
+        "com.palm.app.messaging",
+        "org.webosports.app.messaging",
+        "com.palm.app.irc"
+    ],
+    "capabilityProviders": [
+        {
+            "capability": "MESSAGING",
+            "capabilitySubtype": "IM",
+            "id": "com.palm.irc.im",
+            "alwaysOn": true,
+            "loc_shortName": "IRC",
+            "icon": {
+                "loc_32x32": "images/irc-32x32.png",
+                "loc_48x48": "images/irc-48x48.png",
+                "splitter": "images/irc-32x32.png"
+            },
+            "implementation": "palm://com.palm.imlibpurple/",
+            "onCreate": "palm://com.palm.imlibpurple/onCreate",
+            "onEnabled": "palm://com.palm.imlibpurple/onEnabled",
+            "onDelete": "palm://com.palm.imlibpurple/onDelete",
+            "serviceName": "type_irc",
+            "dbkinds": {
+                "immessage": "com.palm.immessage.libpurple:1",
+                "imcommand": "com.palm.imcommand.libpurple:1"
+            },
+            "invites": {
+                "supportsCustomMessage": false
+            },
+            "groupChat": {
+                "supported": true,
+                "topicsSupported": true,
+                "invitesSupportMessages": false
+            },
+            "chatWithNonBuddies": true
+        }
+    ]
+}]

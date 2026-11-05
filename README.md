@@ -6,7 +6,7 @@ and plugs a network or service into the stock apps.
 | Family | Connectors | What they feed |
 |---|---|---|
 | `cloud/` | box, dropbox, flickr, google (Drive), hidrive, kdrive, koofr, mega, onedrive, pcloud, immich, photoprism, pigallery2, s3, smugmug, webdav (Nextcloud, ownCloud, any WebDAV server), yandex | Documents (DOCUMENTS) and Photos (PHOTO.UPLOAD) |
-| `im/` | discord, facebook (E2EE), googlechat, signal, teams, telegram, whatsapp | Messaging, through `imlibpurpleservice` and libpurple |
+| `im/` | discord, facebook (E2EE), googlechat, irc, signal, teams, telegram, whatsapp | Messaging, through `imlibpurpleservice` and libpurple |
 | `music/` | apple, archive, deezer, jamendo, qobuz, soundcloud, spotify, tidal, youtube | Music, through the streaming daemon |
 | `video/` | archive (the Internet Archive's films, TV and cartoons), emby, jellyfin, m3u (IPTV and other playlists of web streams), mediathek (ARD, ZDF, Arte, 3sat and the other public broadcasters of Germany, Austria and Switzerland), owncast (self-hosted live streams), peertube, plex, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Kodi, or Plex and Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
 
