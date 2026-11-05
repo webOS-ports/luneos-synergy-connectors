@@ -8,18 +8,20 @@
 // plugin's Matrix prpl ("prpl-matrix", mautrix-go with end-to-end encryption).
 //
 // --- AUTHENTICATION ----------------------------------------------------------
-// The account username is the Matrix ID (@user:server). The password is optional:
-//   * with a password, the prpl logs in with it, on servers that still accept passwords;
-//   * without one, it signs in through the browser: on servers with OAuth 2.0 (such as
-//     matrix.org) the "Matrix" chat in Messaging shows a link and a code to approve.
-// imlibpurpletransport rejects an EMPTY password (AcctMgr_Credentials_Not_Found), so "no
-// password" is stored as the sentinel BROWSER_SIGN_IN, which the prpl recognises.
+// The sign-in happens here, in Accounts (matrixAuth.js):
+//   * without a password, on servers with OAuth 2.0 (such as matrix.org), the server's sign-in
+//     page opens in a window (OAuthWindow); the code it returns is exchanged for tokens here;
+//   * with a password, it logs in with it here, so a wrong one is reported on this screen.
+// Either way the account's stored "password" is the resulting session ("mxoauth:..."), which
+// the prpl takes over (matrix_seed.go); the password itself is not stored. When that session
+// ends, the prpl reports bad credentials and Accounts brings this screen back to sign in again.
 //
-// After signing in, the "Matrix" chat also asks to verify the device: reply with the recovery
-// key, or VERIFY to compare emoji with another session.
+// "Sign in with a code instead" keeps the older route: the account stores BROWSER_SIGN_IN
+// (the transport refuses an empty password) and the prpl shows a link and code in the "Matrix"
+// chat in Messaging.
 //
-// We do NOT verify credentials in this UI; the prpl performs the authoritative login on
-// connect and any failure surfaces in the Messaging app.
+// The optional recovery key travels with the session; the prpl verifies the new device with it
+// once, so encrypted chats and the key backup open without a step in Messaging.
 
 var BROWSER_SIGN_IN = "browser-sign-in";
 
@@ -46,23 +48,35 @@ enyo.kind({
                       oninput: "validateInput", onkeydown: "checkForEnter" }
                 ]},
                 { kind: "RowGroup", caption: "PASSWORD (OPTIONAL)", className: "accounts-group", components: [
-                    { kind: "PasswordInput", name: "password", hint: "Leave empty to sign in with a browser",
+                    { kind: "PasswordInput", name: "password", hint: "Leave empty to sign in in a browser window",
                       spellcheck: false, autocorrect: false, autoWordComplete: false, autoCapitalize: "lowercase",
                       oninput: "validateInput", onkeydown: "checkForEnter" }
+                ]},
+                { kind: "RowGroup", caption: "RECOVERY KEY (OPTIONAL)", className: "accounts-group", components: [
+                    { kind: "PasswordInput", name: "recoveryKey", hint: "To read encrypted chats right away",
+                      spellcheck: false, autocorrect: false, autoWordComplete: false, autoCapitalize: "lowercase",
+                      onkeydown: "checkForEnter" }
                 ]},
                 { name: "errorBox", kind: "HFlexBox", showing: false, align: "center", className: "error-box", components: [
                     { name: "errorMessage", className: "enyo-text-error", flex: 1 }
                 ]},
-                { className: "accounts-body-text", style: "padding: 12px 16px; line-height: 1.4;", allowHtml: true,
-                  content: "Enter your <b>Matrix ID</b>, such as <b>@you:matrix.org</b>, then tap <b>Sign In</b>." },
+                { name: "status", className: "accounts-body-text", showing: false,
+                  style: "padding: 8px 16px; line-height: 1.4;" },
+                { name: "intro", className: "accounts-body-text", style: "padding: 12px 16px; line-height: 1.4;", allowHtml: true,
+                  content: "Enter your <b>Matrix ID</b>, such as <b>@you:matrix.org</b>, then tap <b>Sign In</b>. " +
+                           "Without a password, your server's sign-in page opens in a window." },
                 { className: "accounts-body-text", style: "padding: 4px 16px 12px; line-height: 1.4; opacity: 0.7;", allowHtml: true,
-                  content: "Without a password, the <b>Matrix</b> chat in Messaging shows a link to approve the sign-in in a browser. " +
-                           "Afterwards it asks for your <b>recovery key</b> (or to compare emoji with another session) so this device can read encrypted chats." },
+                  content: "With your <b>recovery key</b> (or passphrase), this device can read your encrypted chats " +
+                           "straight away. Without it, the <b>Matrix</b> chat in Messaging asks for it, or lets you " +
+                           "compare emoji with another of your sessions." },
                 { kind: "ActivityButton", name: "signInButton", caption: "Sign In", disabled: true, active: false,
                   className: "enyo-button-dark accounts-btn", onclick: "performSignIn" },
+                { kind: "Button", name: "codeButton", caption: "Sign in with a code instead", disabled: true,
+                  className: "accounts-btn", style: "margin-top: 6px;", onclick: "performCodeSignIn" },
 
                 // Standard framework Remove Account (with keep-data option); shown only when editing an
-                // existing account; sits directly below Sign In. init() with no capability => full delete.
+                // existing account; sits directly below the sign-in buttons. init() with no capability
+                // => full delete.
                 { name: "removeAccountButton", kind: "Accounts.RemoveAccount", className: "accounts-btn",
                   showing: false, style: "padding-top:6px;", onAccountsRemove_Done: "removeDone" }
             ]}
@@ -91,8 +105,8 @@ enyo.kind({
                 }
             }
         }
-        // Re-auth of an existing account: lock the Matrix ID, ask for the password only, and
-        // offer "Remove Account" (this re-auth flow otherwise has no path to delete the account).
+        // Re-auth of an existing account: lock the Matrix ID, sign in again, and offer "Remove
+        // Account" (this re-auth flow otherwise has no path to delete the account).
         this.accountId = (params.account && (params.account._id || params.account.id)) || params.accountId || null;
         if (params.account && params.account.username) {
             this.$.username.setValue(params.account.username);
@@ -100,12 +114,18 @@ enyo.kind({
             if (params.account.alias && params.account.alias !== params.account.username) {
                 this.$.displayName.setValue(params.account.alias);
             }
+            this.$.intro.setContent("Sign in to <b>" + this.escapeHtml(params.account.username) +
+                "</b> again. Without a password, your server's sign-in page opens in a window.");
             if (this.accountId) {
                 this.$.removeAccountButton.init(params.account);
                 this.$.removeAccountButton.show();
             }
         }
         this.validateInput();
+    },
+
+    escapeHtml: function(s) {
+        return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
     },
 
     removeDone: function() {
@@ -124,19 +144,17 @@ enyo.kind({
         return v;
     },
 
-    isMatrixId: function(v) {
-        return /^@[^:@\s]+:[A-Za-z0-9.\-]+(:[0-9]+)?$/.test(v);
-    },
-
     validateInput: function() {
-        var user = this.normalizeUser(this.$.username.getValue());
-        this.$.signInButton.setDisabled(!this.isMatrixId(user));
+        var ok = MatrixAuth.isMatrixId(this.normalizeUser(this.$.username.getValue())) && !this.busy;
+        this.$.signInButton.setDisabled(!ok);
+        this.$.codeButton.setDisabled(!ok);
     },
 
     checkForEnter: function(inSender, e) {
         if (e && e.keyCode === 13 && !this.$.signInButton.getDisabled()) {
             this.$.username.forceBlur();
             this.$.password.forceBlur();
+            this.$.recoveryKey.forceBlur();
             this.performSignIn();
         }
     },
@@ -146,29 +164,119 @@ enyo.kind({
         if (msg) { this.$.errorBox.show(); } else { this.$.errorBox.hide(); }
     },
 
+    showStatus: function(msg) {
+        this.$.status.setContent(msg || "");
+        if (msg) { this.$.status.show(); } else { this.$.status.hide(); }
+    },
+
+    setBusy: function(busy) {
+        this.busy = busy;
+        this.$.signInButton.setActive(busy);
+        this.validateInput();
+    },
+
+    // Back to the form after a failed attempt.
+    failed: function(msg) {
+        if (this._oauthWindow) {
+            try { this._oauthWindow.close(); } catch (e) {}
+            this._oauthWindow = null;
+        }
+        this.setBusy(false);
+        this.showStatus("");
+        this.showError(msg || "Sign-in failed.");
+    },
+
+    recoveryKeyValue: function() {
+        return (this.$.recoveryKey.getValue() || "").replace(/^\s+|\s+$/g, "");
+    },
+
     performSignIn: function() {
         var user = this.normalizeUser(this.$.username.getValue());
-        if (!this.isMatrixId(user)) {
+        if (!MatrixAuth.isMatrixId(user)) {
             this.showError("That is not a Matrix ID. It looks like @you:matrix.org.");
             return;
         }
-        var pass = this.$.password.getValue() || "";
+        var pass = this.$.password.getValue() || "", rk = this.recoveryKeyValue(), self = this;
         this.showError("");
-        this.$.signInButton.setActive(true);
-        this.$.signInButton.setDisabled(true);
-        var result = {
+        this.setBusy(true);
+
+        if (pass) {
+            this.showStatus("Signing in…");
+            MatrixAuth.passwordLogin(user, pass, rk).then(function (stored) {
+                self.finishWithCredential(user, stored);
+            }, function (e) { self.failed(e.message); });
+            return;
+        }
+
+        this.showStatus("Contacting " + MatrixAuth.serverOf(user) + "…");
+        MatrixAuth.prepare(user).then(function (prep) {
+            if (!prep.oauth) {
+                return MatrixAuth.hasPasswordLogin(prep.homeserver).then(function (has) {
+                    self.failed(has ?
+                        MatrixAuth.serverOf(user) + " has no browser sign-in. Enter your password." :
+                        MatrixAuth.serverOf(user) + " offers neither browser sign-in nor passwords.");
+                });
+            }
+            self.openSignInWindow(user, prep, rk);
+        }).catch(function (e) {
+            self.failed("Could not reach " + MatrixAuth.serverOf(user) + ": " + e.message);
+        });
+    },
+
+    openSignInWindow: function(user, prep, rk) {
+        var self = this;
+        if (!window.OAuthWindow || window.OAuthWindow.hasPluginWebView()) {
+            this.failed("This device cannot open a sign-in window. Use \"Sign in with a code instead\".");
+            return;
+        }
+        this.showStatus("Sign in in the window that just opened. You'll come back here automatically.");
+        this._oauthWindow = window.OAuthWindow.open({
+            url: prep.url,
+            name: "matrixSignIn",
+            redirectPrefix: MatrixAuth.REDIRECT,
+            timeoutMs: 600000,
+            onRedirect: function (url) {
+                self._oauthWindow = null;
+                self.showStatus("Finishing sign-in…");
+                MatrixAuth.finish(prep, url, user, rk).then(function (stored) {
+                    self.finishWithCredential(user, stored);
+                }, function (e) { self.failed(e.message); });
+            },
+            onError: function (msg) {
+                self._oauthWindow = null;
+                self.failed(msg);
+            }
+        });
+    },
+
+    // The older route: the prpl shows a link and a code in the "Matrix" chat in Messaging.
+    performCodeSignIn: function() {
+        var user = this.normalizeUser(this.$.username.getValue());
+        if (!MatrixAuth.isMatrixId(user)) {
+            this.showError("That is not a Matrix ID. It looks like @you:matrix.org.");
+            return;
+        }
+        this.finishWithCredential(user, BROWSER_SIGN_IN);
+    },
+
+    finishWithCredential: function(user, stored) {
+        this.showStatus("");
+        this.$.crossAppResult.sendResult({
             returnValue: true,
             username: user,
             alias: this.getAlias(user),
-            credentials: { common: { password: pass || BROWSER_SIGN_IN } },
+            credentials: { common: { password: stored } },
             config: {},
             template: this.template || { templateId: "com.palm.matrix" },
             templateId: "com.palm.matrix"
-        };
-        this.$.crossAppResult.sendResult(result);
+        });
     },
 
     cancel: function() {
+        if (this._oauthWindow) {
+            try { this._oauthWindow.close(); } catch (e) {}
+            this._oauthWindow = null;
+        }
         this.$.crossAppResult.sendResult({ returnValue: false });
     }
 });
