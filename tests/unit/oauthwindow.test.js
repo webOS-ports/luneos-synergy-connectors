@@ -14,6 +14,7 @@ const COPIES = [
 	"../../cloud/_core/apps/com.palm.app.cloud-auth/source/oauthWindow.js",
 	"../../music/_core/apps/org.webosports.app.musicauth/source/oauthWindow.js",
 	"../../im/teams/apps/com.palm.app.teams/source/oauthWindow.js",
+	"../../im/matrix/apps/com.palm.app.matrix/source/oauthWindow.js",
 ].map((p) => path.join(__dirname, p));
 
 function load(file) {
@@ -48,7 +49,7 @@ const REDIRECT = "http://localhost/boxnet/oauth2callback";
 const ERROR_PAGE = "file:///usr/share/localization/wam/loaderror.html?errorCode=-102&failedUrl=" +
 	encodeURIComponent(REDIRECT + "?state=cloud&code=cP3R");
 
-test("musicauth and Teams carry the same oauthWindow.js as cloud-auth", () => {
+test("musicauth, Teams and Matrix carry the same oauthWindow.js as cloud-auth", () => {
 	for (const copy of COPIES.slice(1)) {
 		assert.strictEqual(fs.readFileSync(copy, "utf8"), fs.readFileSync(COPIES[0], "utf8"), copy);
 	}
