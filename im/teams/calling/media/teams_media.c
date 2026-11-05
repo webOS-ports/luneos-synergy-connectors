@@ -141,12 +141,18 @@ typedef struct {
     GstElement   *vtx_queue;      /* input of the persistent send tail; a camera head links here */
     GstElement   *vtx_head;       /* the camera bin while the camera is on */
     GstElement   *vtx_cam;        /* the droidcamsrc in it, if any (start-capture, orientation) */
+    gint          vtx_cw;         /* quarter turns clockwise given to the picture before encoding;
+                                   * -1: the camera's own H264, sent as the sensor gives it */
+    gint          vtx_pv_w, vtx_pv_h; /* the self-view's size for this camera head */
+    gboolean      vtx_mirrored;   /* the self-view is to be shown mirrored */
     gboolean      vtx_wanted;     /* VIDEO 1: the user has the camera on */
     guint         vtx_w, vtx_h, vtx_kbps; /* VIDEO 1 <w> <h> <kbps>: what to send; 0 = defaults */
     gint          vtx_capture;    /* atomic: start-capture sent to the droid camera */
     gint          vtx_announced;  /* atomic: VPREVIEW sent for this camera head */
     GstElement   *rtcp_out;       /* appsrc: our RTCP, to srtpenc */
-    gint          vrx_announced;  /* atomic: VSHM sent */
+    gint          vrx_announced;  /* atomic: VSHM sent for the current size */
+    GstElement   *vrx_size;       /* capsfilter: the size the far side's picture is published at */
+    gint          vrx_w, vrx_h;   /* atomic: that size */
     gint          peer_vssrc;     /* atomic: the far side's video SSRC, 0 none yet */
     gint          pli_wanted;     /* atomic: our decoder wants a keyframe */
     gint          key_wanted;     /* atomic: the far side asked us for a keyframe */
@@ -442,13 +448,19 @@ static GstCaps *opus_rtp_caps(int pt)
  * The Teams app sends H264 (PT 107, packetization-mode 1) on the audio's ICE component and SRTP
  * key (BUNDLE). Received video is split off by rtpptdemux, decoded and published as I420 frames
  * on a gst-shm socket for the Phone app (RemoteVideo.qml, the contract the Signal engine has).
- * While the user has the camera on (VIDEO 1), the front camera's hardware H264 (droidcamsrc in
- * video mode, as luneos-rtc-engine does for WhatsApp) is sent on PT 107 from our own SSRC, and
- * the viewfinder goes to a second shm socket for the self-view.
+ * While the user has the camera on (VIDEO 1), the front camera's picture goes out as hardware
+ * H264 on PT 107 from our own SSRC. Teams carries no rotation with it, so where droidvenc takes
+ * raw frames the viewfinder's frames are turned upright first and encoded by droidvenc, and the
+ * self-view is the turned frames. Otherwise the camera's own H264 (droidcamsrc in video mode, as
+ * luneos-rtc-engine does for WhatsApp) goes out as the sensor gives it, and what we send is
+ * decoded again for the self-view: the viewfinder cannot give it, droidcamsrc stops it once the
+ * capture runs (sargo, 5 Nov 2026: 115 frames in the 4 s before start-capture, none after it,
+ * while the encoder went on at 30 a second).
  *
  *   RX: ptdemux --107--> capsfilter -> rtpjitterbuffer -> rtph264depay -> h264parse -> avdec_h264
  *       -> videoconvert -> videoscale -> I420 640x480 -> leaky queue -> shmsink /tmp/teams-video
- *   TX: [camera head: droidcamsrc vidsrc -> h264parse] -> queue -> rtph264pay -> srtpenc
+ *   TX: [camera head: vfsrc -> videoflip -> NV12 -> droidvenc -> h264parse, or droidcamsrc
+ *       vidsrc -> h264parse] -> queue -> rtph264pay -> srtpenc
  *   RTCP: appsrc -> srtpenc (rtcp) : RR + REMB every second, PLI when our decoder needs a keyframe
  *
  * A WebRTC-style sender sends a keyframe only when asked and sizes its bitrate from what the
@@ -457,7 +469,8 @@ static GstCaps *opus_rtp_caps(int pt)
  * number extension, so REMB is the bandwidth feedback there is.
  *
  * Video lines (stdout, through event_cb):
- *   VSHM <path> <w> <h>           the far side's decoded picture is on this gst-shm socket
+ *   VSHM <path> <w> <h>           the far side's decoded picture is on this gst-shm socket, at
+ *                                 640x480 or 480x640 as it is held; said again when that changes
  *   VPREVIEW <path> <w> <h> <q> <m> our camera's picture (q quarter turns, m mirrored 0/1)
  *   VTX <0|1>                     our camera is sending / stopped
  *   PEERVIDEO <0|1>               the far side's video is arriving / stopped for 2 s
@@ -619,7 +632,55 @@ static GstPadProbeReturn tm_probe_vdec(GstPad *pad, GstPadProbeInfo *info, gpoin
     return GST_PAD_PROBE_OK;
 }
 
-/* The first decoded frame on its way to the Phone app's socket: say where it is. */
+/* The size the far side's picture is published at, for a decoded w x h: its own shape, scaled down
+ * so the long side is at most 640, in even numbers. The Teams app on a phone sends its frames
+ * upright (no rotation field), often 360x640; boxed into a fixed 640x480 or 480x640 it gained
+ * borders, and the Phone app, fitting that box to the screen, showed the picture small. */
+static void tm_rx_frame_size(gint w, gint h, gint *ow, gint *oh)
+{
+    const gint64 lim = MAX(TM_VIDEO_W, TM_VIDEO_H);
+    gint64 lw = MAX(w, 2), lh = MAX(h, 2), lng = MAX(lw, lh);
+    if (lng > lim) {
+        lw = (lw * lim + lng / 2) / lng;
+        lh = (lh * lim + lng / 2) / lng;
+    }
+    *ow = (gint) MAX(lw & ~(gint64) 1, 2);
+    *oh = (gint) MAX(lh & ~(gint64) 1, 2);
+}
+
+/* Streaming thread: the decoder's caps. Publish the picture in its own orientation, and have the
+ * next frame announce the size again when that changes it. */
+static GstPadProbeReturn tm_probe_vrxcaps(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    GstEvent *ev = GST_PAD_PROBE_INFO_EVENT(info);
+    (void)pad;
+    if (!ev || GST_EVENT_TYPE(ev) != GST_EVENT_CAPS)
+        return GST_PAD_PROBE_OK;
+    GstCaps *caps = NULL;
+    gint w = 0, h = 0, ow, oh;
+    gst_event_parse_caps(ev, &caps);
+    const GstStructure *st = caps && gst_caps_get_size(caps) > 0 ? gst_caps_get_structure(caps, 0) : NULL;
+    if (!st || !gst_structure_get_int(st, "width", &w) || !gst_structure_get_int(st, "height", &h) ||
+        w <= 0 || h <= 0)
+        return GST_PAD_PROBE_OK;
+    tm_rx_frame_size(w, h, &ow, &oh);
+    g_message("teams_media: far side's picture %dx%d, published at %dx%d", w, h, ow, oh);
+    if (ow == g_atomic_int_get(&tm->vrx_w) && oh == g_atomic_int_get(&tm->vrx_h))
+        return GST_PAD_PROBE_OK;
+    if (tm->vrx_size) {
+        GstCaps *vc = tm_i420_caps(ow, oh);
+        g_object_set(tm->vrx_size, "caps", vc, NULL);
+        gst_caps_unref(vc);
+    }
+    g_atomic_int_set(&tm->vrx_w, ow);
+    g_atomic_int_set(&tm->vrx_h, oh);
+    g_atomic_int_set(&tm->vrx_announced, 0);
+    return GST_PAD_PROBE_OK;
+}
+
+/* A decoded frame on its way to the Phone app's socket: the first one at a size says where the
+ * picture is and how big. */
 static GstPadProbeReturn tm_probe_vshm(GstPad *pad, GstPadProbeInfo *info, gpointer user)
 {
     TeamsMedia *tm = user;
@@ -631,10 +692,11 @@ static GstPadProbeReturn tm_probe_vshm(GstPad *pad, GstPadProbeInfo *info, gpoin
             g_object_get(shm, "socket-path", &path, NULL);
             gst_object_unref(shm);
         }
-        tm_event(tm, "VSHM %s %d %d", path ? path : TM_VIDEO_SHM, TM_VIDEO_W, TM_VIDEO_H);
+        tm_event(tm, "VSHM %s %d %d", path ? path : TM_VIDEO_SHM, g_atomic_int_get(&tm->vrx_w),
+                 g_atomic_int_get(&tm->vrx_h));
         g_free(path);
     }
-    return GST_PAD_PROBE_REMOVE;
+    return GST_PAD_PROBE_OK;
 }
 
 /* The receive branch, added to pipeline; tm->vrx_caps is where rtpptdemux links PT 107. Nothing
@@ -680,8 +742,12 @@ static gboolean tm_video_rx_build(TeamsMedia *tm, GstElement *pipeline)
     tm_add_probe(e[0], "sink", GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, tm_probe_vrx, tm);
     tm_add_probe(e[2], "sink", GST_PAD_PROBE_TYPE_EVENT_UPSTREAM, tm_probe_vkey, tm);
     tm_add_probe(e[4], "src", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_vdec, tm);
+    tm_add_probe(e[4], "src", GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, tm_probe_vrxcaps, tm);
     tm_add_probe(e[9], "sink", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_vshm, tm);
     tm->vrx_caps = e[0];
+    tm->vrx_size = e[7];
+    g_atomic_int_set(&tm->vrx_w, TM_VIDEO_W);
+    g_atomic_int_set(&tm->vrx_h, TM_VIDEO_H);
     g_message("teams_media: video receive branch up");
     return TRUE;
 }
@@ -810,38 +876,132 @@ static gboolean tm_video_tick(gpointer user)
     return G_SOURCE_CONTINUE;
 }
 
-/* The camera head: front camera, hardware H264 from droidcamsrc's video pad, its viewfinder to
- * the self-view socket. TEAMS_MEDIA_CAMERA replaces it (tests, or another camera setup); it must
- * have an element "tmvout" whose src pad gives H264 byte-stream access units, and may have a
- * shmsink "tmpvshm" for the self-view. The vfsrc caps are fully fixed: droidcamsrc fixes only
- * size and frame rate of its viewfinder, and left the pixel aspect ratio a range that the
- * converters after it cannot take ("failed to negotiate vfsrc", Signal engine 9f38163). */
-static gchar *tm_camera_description(const TeamsMedia *tm, gboolean *mirrored)
+/* Quarter turns clockwise that make a picture upright, for a sensor orientation in degrees. */
+static gint tm_cw_for_degrees(gint deg)
 {
+    return (((deg % 360) + 360 + 45) / 90) & 3;
+}
+
+/* Quarter turns clockwise for the front camera's picture: TEAMS_MEDIA_VIDEO_ROTATION, else the
+ * sensor orientation of a droidcamsrc that is never started (it has it from the HAL's camera
+ * list, sargo 5 Nov 2026: 270), else 0. */
+static gint tm_camera_cw(void)
+{
+    const char *env = g_getenv("TEAMS_MEDIA_VIDEO_ROTATION");
+    if (env && *env)
+        return (gint)(g_ascii_strtoll(env, NULL, 10) & 3);
+    gint deg = 0;
+    GstElement *cam = gst_element_factory_make("droidcamsrc", NULL);
+    if (cam) {
+        gst_object_ref_sink(cam);
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(cam), "sensor-orientation")) {
+            g_object_set(cam, "camera-device", 1, NULL);
+            g_object_get(cam, "sensor-orientation", &deg, NULL);
+        }
+        gst_object_unref(cam);
+    }
+    return tm_cw_for_degrees(deg);
+}
+
+/* Whether to turn the picture before the hardware encoder: Teams sends no rotation with the
+ * video (its SDP has no urn:3gpp:video-orientation), so the far side shows what it gets as it
+ * is, and the camera's own H264 comes as the sensor lies, a quarter turn off on a phone. That
+ * needs droidvenc taking raw NV12 (gst-droid's raw-input patch) and videoflip.
+ * TEAMS_MEDIA_TURN=0 keeps the camera's own H264; =1 turns without checking (tests, or a
+ * TEAMS_MEDIA_CAMERA head with another encoder). */
+static gboolean tm_turn_before_encoding(void)
+{
+    const char *env = g_getenv("TEAMS_MEDIA_TURN");
+    if (env && *env)
+        return g_strcmp0(env, "0") != 0;
+    GstElementFactory *flip = gst_element_factory_find("videoflip");
+    GstElementFactory *enc = gst_element_factory_find("droidvenc");
+    gboolean raw = FALSE;
+    if (flip && enc) {
+        GstCaps *want = gst_caps_from_string("video/x-raw,format=NV12");
+        for (const GList *l = gst_element_factory_get_static_pad_templates(enc); l && !raw; l = l->next) {
+            GstStaticPadTemplate *t = l->data;
+            if (t->direction != GST_PAD_SINK)
+                continue;
+            GstCaps *caps = gst_static_pad_template_get_caps(t);
+            raw = gst_caps_can_intersect(caps, want);
+            gst_caps_unref(caps);
+        }
+        gst_caps_unref(want);
+    }
+    if (flip) gst_object_unref(flip);
+    if (enc) gst_object_unref(enc);
+    return raw;
+}
+
+/* The camera head, front camera, in one of two shapes:
+ *
+ * cw >= 0, turned: the viewfinder's frames, turned cw quarter turns (videoflip), as NV12 into the
+ * hardware encoder (droidvenc) and, through their own leaky queue, scaled into the self-view
+ * socket; both upright, so the self-view needs no turn of its own. A side turn swaps the sent
+ * size (640x480 asked gives 480x640) and the self-view's.
+ *
+ * cw < 0: hardware H264 from droidcamsrc's video pad, sent and decoded again for the self-view
+ * socket. Its viewfinder only shows that the camera runs (the capture is started on its first
+ * frame); it stops once the capture does.
+ *
+ * TEAMS_MEDIA_CAMERA replaces the head (tests, or another camera setup), with the sizes still
+ * as cw says; it must have an element "tmvout" whose src pad gives H264 byte-stream access
+ * units, and may have a shmsink "tmpvshm" for the self-view. The vfsrc caps are fully fixed:
+ * droidcamsrc fixes only size and frame rate of its viewfinder, and left the pixel aspect ratio
+ * a range that it then cannot negotiate ("failed to negotiate vfsrc", Signal engine 9f38163).
+ * The self-view never holds up what we send: it takes frames through a leaky queue. Sets
+ * vtx_cw, vtx_pv_w/h and vtx_mirrored to match. */
+static gchar *tm_camera_description(TeamsMedia *tm, gint cw)
+{
+    static const char *const direction[] = { "identity", "90r", "180", "90l" };
     int w = tm->vtx_w ? (int)tm->vtx_w : TM_VIDEO_W, h = tm->vtx_h ? (int)tm->vtx_h : TM_VIDEO_H;
     int bps = tm->vtx_kbps ? (int)tm->vtx_kbps * 1000 : TM_VIDEO_BITRATE;
+    gboolean side = cw >= 0 && (cw & 1);
     const char *env = g_getenv("TEAMS_MEDIA_CAMERA");
-    if (env && *env) {
-        *mirrored = FALSE;
+    tm->vtx_cw = cw < 0 ? -1 : (cw & 3);
+    tm->vtx_pv_w = side ? TM_PREVIEW_H : TM_PREVIEW_W;
+    tm->vtx_pv_h = side ? TM_PREVIEW_W : TM_PREVIEW_H;
+    tm->vtx_mirrored = !(env && *env);
+    if (env && *env)
         return g_strdup(env);
-    }
-    *mirrored = TRUE;
+    if (cw >= 0)
+        return g_strdup_printf(
+            "droidcamsrc name=tmcam camera-device=1 "
+            "tmcam.imgsrc ! fakesink async=false tmcam.vidsrc ! fakesink async=false "
+            "tmcam.vfsrc ! video/x-raw,format=NV21,width=%d,height=%d,framerate=30/1,pixel-aspect-ratio=1/1 ! "
+            "queue leaky=downstream max-size-buffers=2 ! videoflip video-direction=%s ! videoconvert ! "
+            "videoscale ! video/x-raw,format=NV12,width=%d,height=%d,pixel-aspect-ratio=1/1 ! tee name=tmvt "
+            "tmvt. ! queue leaky=downstream max-size-buffers=2 ! droidvenc target-bitrate=%d ! "
+            "video/x-h264,stream-format=avc,alignment=au ! h264parse config-interval=-1 ! "
+            "video/x-h264,stream-format=byte-stream,alignment=au ! queue name=tmvout "
+            "tmvt. ! queue leaky=downstream max-size-buffers=2 ! videoconvert ! videoscale ! "
+            "video/x-raw,format=I420,width=%d,height=%d,pixel-aspect-ratio=1/1 ! "
+            "queue leaky=downstream max-size-buffers=2 ! shmsink name=tmpvshm",
+            TM_VIDEO_W, TM_VIDEO_H, direction[cw & 3], side ? h : w, side ? w : h, bps,
+            tm->vtx_pv_w, tm->vtx_pv_h);
     return g_strdup_printf(
         "droidcamsrc name=tmcam mode=2 camera-device=1 target-bitrate=%d "
         "tmcam.imgsrc ! fakesink async=false "
         "tmcam.vfsrc ! video/x-raw,format=NV21,width=%d,height=%d,framerate=30/1,pixel-aspect-ratio=1/1 ! "
-        "queue leaky=downstream max-size-buffers=2 ! videoconvert ! videoscale ! "
-        "video/x-raw,format=I420,width=%d,height=%d,pixel-aspect-ratio=1/1 ! "
-        "queue leaky=downstream max-size-buffers=2 ! shmsink name=tmpvshm "
+        "fakesink name=tmvf async=false sync=false enable-last-sample=false "
         "tmcam.vidsrc ! video/x-h264,width=%d,height=%d ! h264parse config-interval=-1 ! "
-        "video/x-h264,stream-format=byte-stream,alignment=au ! queue name=tmvout",
-        bps, TM_VIDEO_W, TM_VIDEO_H, TM_PREVIEW_W, TM_PREVIEW_H, w, h);
+        "video/x-h264,stream-format=byte-stream,alignment=au ! tee name=tmvt "
+        "tmvt. ! queue name=tmvout "
+        "tmvt. ! queue leaky=downstream max-size-buffers=30 max-size-bytes=0 max-size-time=0 ! "
+        "avdec_h264 ! videoconvert ! videoscale ! "
+        "video/x-raw,format=I420,width=%d,height=%d,pixel-aspect-ratio=1/1 ! "
+        "queue leaky=downstream max-size-buffers=2 ! shmsink name=tmpvshm",
+        bps, TM_VIDEO_W, TM_VIDEO_H, w, h, tm->vtx_pv_w, tm->vtx_pv_h);
 }
 
-/* Quarter turns (counter-clockwise, as the Phone app turns the self-view) for the camera's sensor
- * orientation; TEAMS_MEDIA_VIDEO_ROTATION overrides it. */
+/* Quarter turns (counter-clockwise, as the Phone app turns the self-view) the self-view still
+ * needs: none for a turned head; for the camera's own H264 the sensor orientation of the running
+ * camera, or TEAMS_MEDIA_VIDEO_ROTATION. */
 static gint tm_preview_turns(TeamsMedia *tm)
 {
+    if (tm->vtx_cw >= 0)
+        return 0;
     const char *env = g_getenv("TEAMS_MEDIA_VIDEO_ROTATION");
     gint cw = 0;
     if (env && *env)
@@ -849,12 +1009,10 @@ static gint tm_preview_turns(TeamsMedia *tm)
     else if (tm->vtx_cam && g_object_class_find_property(G_OBJECT_GET_CLASS(tm->vtx_cam), "sensor-orientation")) {
         gint deg = 0;
         g_object_get(tm->vtx_cam, "sensor-orientation", &deg, NULL);
-        cw = ((deg + 45) / 90) & 3;
+        cw = tm_cw_for_degrees(deg);
     }
     return (4 - cw) & 3;
 }
-
-static gboolean tm_video_tx_mirrored;
 
 /* Media thread: begin the hardware-encoded stream, once per camera head. droidcamsrc ignores a
  * start-capture before the camera runs, so it waits for the first viewfinder frame. */
@@ -868,6 +1026,21 @@ static gboolean tm_start_capture(gpointer user)
     return G_SOURCE_REMOVE;
 }
 
+/* Streaming thread: the camera's first viewfinder frame, so it runs; start the capture. */
+static GstPadProbeReturn tm_probe_first_vf(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    TeamsMedia *tm = user;
+    (void)pad; (void)info;
+    if (tm->vtx_cam && g_signal_lookup("start-capture", G_OBJECT_TYPE(tm->vtx_cam))) {
+        GSource *s = g_idle_source_new();
+        g_source_set_callback(s, tm_start_capture, tm, NULL);
+        g_source_attach(s, tm->ctx);
+        g_source_unref(s);
+    }
+    return GST_PAD_PROBE_REMOVE;
+}
+
+/* Streaming thread: the first self-view frame; say where the picture is. */
 static GstPadProbeReturn tm_probe_vpreview(GstPad *pad, GstPadProbeInfo *info, gpointer user)
 {
     TeamsMedia *tm = user;
@@ -879,15 +1052,9 @@ static GstPadProbeReturn tm_probe_vpreview(GstPad *pad, GstPadProbeInfo *info, g
             g_object_get(shm, "socket-path", &path, NULL);
             gst_object_unref(shm);
         }
-        tm_event(tm, "VPREVIEW %s %d %d %d %d", path ? path : TM_PREVIEW_SHM, TM_PREVIEW_W, TM_PREVIEW_H,
-                 tm_preview_turns(tm), tm_video_tx_mirrored ? 1 : 0);
+        tm_event(tm, "VPREVIEW %s %d %d %d %d", path ? path : TM_PREVIEW_SHM, tm->vtx_pv_w, tm->vtx_pv_h,
+                 tm_preview_turns(tm), tm->vtx_mirrored ? 1 : 0);
         g_free(path);
-        if (tm->vtx_cam && g_signal_lookup("start-capture", G_OBJECT_TYPE(tm->vtx_cam))) {
-            GSource *s = g_idle_source_new();
-            g_source_set_callback(s, tm_start_capture, tm, NULL);
-            g_source_attach(s, tm->ctx);
-            g_source_unref(s);
-        }
     }
     return GST_PAD_PROBE_REMOVE;
 }
@@ -898,8 +1065,7 @@ static gboolean tm_video_tx_start(gpointer user)
     TeamsMedia *tm = user;
     if (tm->vtx_head || !tm->vtx_wanted || !tm->vtx_queue || !tm->pipeline)
         return G_SOURCE_REMOVE;
-    gboolean mirrored = FALSE;
-    gchar *desc = tm_camera_description(tm, &mirrored);
+    gchar *desc = tm_camera_description(tm, tm_turn_before_encoding() ? tm_camera_cw() : -1);
     GError *err = NULL;
     GstElement *head = gst_parse_bin_from_description(desc, FALSE, &err);
     if (!head) {
@@ -928,7 +1094,11 @@ static gboolean tm_video_tx_start(gpointer user)
         gst_object_unref(pv);
     }
     tm->vtx_cam = gst_bin_get_by_name(GST_BIN(head), "tmcam");
-    tm_video_tx_mirrored = mirrored;
+    GstElement *vf = gst_bin_get_by_name(GST_BIN(head), "tmvf");
+    if (vf) {
+        tm_add_probe(vf, "sink", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_first_vf, tm);
+        gst_object_unref(vf);
+    }
     g_atomic_int_set(&tm->vtx_announced, 0);
     g_atomic_int_set(&tm->vtx_capture, 0);
 
@@ -946,7 +1116,7 @@ static gboolean tm_video_tx_start(gpointer user)
     }
     tm->vtx_head = head;
     tm_event(tm, "VTX 1");
-    g_message("teams_media: camera on (%s)", desc);
+    g_message("teams_media: camera on, turned %d (%s)", tm->vtx_cw, desc);
     g_free(desc);
     return G_SOURCE_REMOVE;
 }
@@ -1333,6 +1503,7 @@ static gboolean build_pipeline(TeamsMedia *tm)
             /* Half-built video elements stay in the bin, unlinked from the audio, and do nothing. */
             g_printerr("teams_media: video could not be built, the call stays voice only\n");
             tm->vrx_caps = NULL;
+            tm->vrx_size = NULL;
             tm->vtx_queue = NULL;
             tm->rtcp_out = NULL;
             tm_event(tm, "VIDEOERR build");

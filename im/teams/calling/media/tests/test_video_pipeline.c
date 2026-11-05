@@ -260,7 +260,8 @@ static void test_rx(const char *h264, const char *dir)
 
     CHECK(gst_element_set_state(p, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE);
     CHECK(wait_for(has_vshm, 10000));
-    GstElement *reader = shm_reader(shm, TM_VIDEO_W, TM_VIDEO_H);
+    /* Read at the size announced, as the Phone app does: the fixture's own 320x240. */
+    GstElement *reader = shm_reader(shm, g_atomic_int_get(&g_tm.vrx_w), g_atomic_int_get(&g_tm.vrx_h));
     gst_element_set_state(reader, GST_STATE_PLAYING);
 
     /* The far side's sender report about its video: our next receiver report quotes it. */
@@ -271,7 +272,7 @@ static void test_rx(const char *h264, const char *dir)
 
     wait_for(rx_done, 15000);
     gchar *vshm = event_with("VSHM ");
-    gchar *want = g_strdup_printf("VSHM %s 640 480", shm);
+    gchar *want = g_strdup_printf("VSHM %s 320 240", shm);
     CHECK(vshm && !g_strcmp0(vshm, want));
     g_free(vshm); g_free(want);
     CHECK(events_with("VSHM ") == 1);
@@ -450,6 +451,7 @@ static GstPadProbeReturn count_keyunit(GstPad *pad, GstPadProbeInfo *info, gpoin
 
 static gboolean tx_flowing(void) { return g_atomic_int_get(&tx_pkts) >= 30 && events_with("VPREVIEW ") > 0; }
 static gboolean keyunit_seen(void) { return g_atomic_int_get(&tx_keyunit) > 0; }
+static gboolean has_vpreview(void) { return events_with("VPREVIEW ") > 0; }
 
 static void test_tx(const char *h264, const char *dir)
 {
@@ -727,14 +729,14 @@ static void test_shm_allocation(const char *dir)
 static void test_camera_size(void)
 {
     TeamsMedia tm;
-    gboolean m;
     memset(&tm, 0, sizeof tm);
     g_unsetenv("TEAMS_MEDIA_CAMERA");
-    gchar *d = tm_camera_description(&tm, &m);
+    gchar *d = tm_camera_description(&tm, -1);
     CHECK(strstr(d, "target-bitrate=800000 ") && strstr(d, "vidsrc ! video/x-h264,width=640,height=480 "));
+    CHECK(tm.vtx_cw == -1 && tm.vtx_pv_w == TM_PREVIEW_W && tm.vtx_pv_h == TM_PREVIEW_H && tm.vtx_mirrored);
     g_free(d);
     tm.vtx_w = 176; tm.vtx_h = 144; tm.vtx_kbps = 208;
-    d = tm_camera_description(&tm, &m);
+    d = tm_camera_description(&tm, -1);
     CHECK(strstr(d, "target-bitrate=208000 ") && strstr(d, "vidsrc ! video/x-h264,width=176,height=144 "));
     CHECK(strstr(d, "vfsrc ! video/x-raw,format=NV21,width=640,height=480,"));   /* the viewfinder stays */
     g_free(d);
@@ -940,6 +942,357 @@ static void test_caller_srflx(void)
     g_free(uf); g_free(pw); g_free(txk);
 }
 
+/* The camera head as built for droidcamsrc, with its two pads played by stand-ins: a viewfinder that
+ * stops after 5 frames, as droidcamsrc's does once the capture runs (sargo, 5 Nov 2026), and the
+ * H264 fixture for the encoder. The self-view must go on after the viewfinder stopped, so it must
+ * come from what is sent. */
+static GstPadProbeReturn count_vf(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+{
+    (void)pad; (void)info;
+    g_atomic_int_inc((gint *)u);
+    return GST_PAD_PROBE_OK;
+}
+
+static gchar *replace_once(gchar *s, const char *from, const char *to)
+{
+    gchar *at = s ? strstr(s, from) : NULL;
+    CHECK(at != NULL);
+    if (!at)
+        return s;
+    gchar *out = g_strdup_printf("%.*s%s%s", (int)(at - s), s, to, at + strlen(from));
+    g_free(s);
+    return out;
+}
+
+static gint selfview_vf;
+static gboolean selfview_late(void) { return g_atomic_int_get(&shm_frames) >= 40; }
+
+static void test_selfview_from_sent(const char *h264, const char *dir)
+{
+    setup();
+    gchar *pv = g_build_filename(dir, "teams-selfview.sock", NULL);
+    g_setenv("TEAMS_MEDIA_PREVIEW_SHM", pv, TRUE);
+    g_unsetenv("TEAMS_MEDIA_CAMERA");
+    g_setenv("TEAMS_MEDIA_TURN", "0", TRUE);         /* the camera's own H264 */
+    g_tm.vtx_w = 320; g_tm.vtx_h = 240;              /* the fixture's size */
+    gchar *d = tm_camera_description(&g_tm, -1), *cam = NULL;
+    /* droidcamsrc's three pads: imgsrc goes, vfsrc and vidsrc become the stand-ins. */
+    gchar *head = g_strdup_printf("droidcamsrc name=tmcam mode=2 camera-device=1 target-bitrate=%d "
+                                  "tmcam.imgsrc ! fakesink async=false tmcam.vfsrc ", TM_VIDEO_BITRATE);
+    d = replace_once(d, head, "videotestsrc is-live=true num-buffers=5 ");
+    gchar *enc = g_strdup_printf("filesrc location=%s ! video/x-h264,framerate=15/1 ! h264parse ! "
+                                 "identity sync=true ", h264);
+    cam = replace_once(d, "tmcam.vidsrc ", enc);
+    g_free(head); g_free(enc);
+    g_setenv("TEAMS_MEDIA_CAMERA", cam, TRUE);
+
+    GstElement *p = gst_pipeline_new("tx");
+    GstElement *vpay = NULL, *rtcp = NULL, *vsink = el("fakesink", NULL);
+    CHECK(tm_video_tx_build(&g_tm, p, &vpay, &rtcp));
+    g_object_set(vsink, "sync", FALSE, "async", FALSE, NULL);
+    gst_bin_add(GST_BIN(p), vsink);
+    CHECK(gst_element_link(vpay, vsink));
+    rtcp_sink(p, rtcp);
+    g_tm.pipeline = p;
+    CHECK(gst_element_set_state(p, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE);
+
+    g_atomic_int_set(&shm_frames, 0);
+    g_atomic_int_set(&shm_bad_size, 0);
+    g_atomic_int_set(&selfview_vf, 0);
+    tm_set_video(&g_tm, TRUE);
+    while (g_main_context_iteration(g_tm.ctx, FALSE)) {}
+    CHECK(g_tm.vtx_head != NULL);
+    GstElement *vf = g_tm.vtx_head ? gst_bin_get_by_name(GST_BIN(g_tm.vtx_head), "tmvf") : NULL;
+    CHECK(vf != NULL);
+    if (vf) {
+        GstPad *vp = gst_element_get_static_pad(vf, "sink");
+        gst_pad_add_probe(vp, GST_PAD_PROBE_TYPE_BUFFER, count_vf, &selfview_vf, NULL);
+        gst_object_unref(vp);
+        gst_object_unref(vf);
+    }
+    CHECK(wait_for(has_vpreview, 10000));
+    GstElement *r = shm_reader(pv, TM_PREVIEW_W, TM_PREVIEW_H);
+    gst_element_set_state(r, GST_STATE_PLAYING);
+    CHECK(wait_for(selfview_late, 15000));
+    CHECK(g_atomic_int_get(&selfview_vf) <= 5);       /* the viewfinder had stopped long before */
+    CHECK(g_atomic_int_get(&shm_bad_size) == 0);
+    g_print("self-view: %d frames after a viewfinder of %d\n", g_atomic_int_get(&shm_frames),
+            g_atomic_int_get(&selfview_vf));
+    gst_element_set_state(r, GST_STATE_NULL);
+    gst_object_unref(r);
+
+    tm_set_video(&g_tm, FALSE);
+    while (g_main_context_iteration(g_tm.ctx, FALSE)) {}
+    teardown(p);
+    g_unsetenv("TEAMS_MEDIA_CAMERA");
+    g_unsetenv("TEAMS_MEDIA_PREVIEW_SHM");
+    g_unsetenv("TEAMS_MEDIA_TURN");
+    g_tm.vtx_w = 0; g_tm.vtx_h = 0;
+    g_free(cam);
+    g_free(pv);
+}
+
+/* The decoder's caps as the probe sees them. */
+static void feed_rx_caps(GstElement *dec, int w, int h)
+{
+    GstPad *src = gst_element_get_static_pad(dec, "src");
+    GstCaps *c = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "I420", "width", G_TYPE_INT, w,
+                                     "height", G_TYPE_INT, h, NULL);
+    GstPadProbeInfo info;
+    memset(&info, 0, sizeof info);
+    info.type = GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM;
+    info.data = gst_event_new_caps(c);
+    tm_probe_vrxcaps(src, &info, &g_tm);
+    gst_event_unref(GST_EVENT(info.data));
+    gst_caps_unref(c);
+    gst_object_unref(src);
+}
+
+/* The next frame on its way to the socket, as the probe sees it. */
+static void feed_rx_frame(GstElement *shm)
+{
+    GstPad *sink = gst_element_get_static_pad(shm, "sink");
+    GstPadProbeInfo info;
+    memset(&info, 0, sizeof info);
+    info.type = GST_PAD_PROBE_TYPE_BUFFER;
+    tm_probe_vshm(sink, &info, &g_tm);
+    gst_object_unref(sink);
+}
+
+static gboolean rx_caps_are(GstElement *cf, int w, int h)
+{
+    GstCaps *c = NULL;
+    gint cw = 0, ch = 0;
+    g_object_get(cf, "caps", &c, NULL);
+    gboolean ok = c && gst_caps_get_size(c) == 1 &&
+                  gst_structure_get_int(gst_caps_get_structure(c, 0), "width", &cw) &&
+                  gst_structure_get_int(gst_caps_get_structure(c, 0), "height", &ch) && cw == w && ch == h;
+    if (c) gst_caps_unref(c);
+    return ok;
+}
+
+/* The Teams app on a phone sends its picture upright, often 360x640: it is published in its own
+ * shape (long side at most 640), not boxed into 640x480 or 480x640, and the size is said again each
+ * time it changes. */
+static void last_vshm_is(const char *sock, int w, int h)
+{
+    gchar *want = g_strdup_printf("VSHM %s %d %d", sock, w, h);
+    g_mutex_lock(&ev_lock);
+    CHECK(events->len > 0 && strcmp(g_ptr_array_index(events, events->len - 1), want) == 0);
+    g_mutex_unlock(&ev_lock);
+    g_free(want);
+}
+
+static void test_rx_portrait(const char *dir)
+{
+    setup();
+    gchar *sock = g_build_filename(dir, "teams-portrait.sock", NULL);
+    g_setenv("TEAMS_MEDIA_VIDEO_SHM", sock, TRUE);
+    GstElement *p = gst_pipeline_new("rx");
+    CHECK(tm_video_rx_build(&g_tm, p));
+    GstElement *dec = gst_bin_get_by_name(GST_BIN(p), "rxv-dec"), *shm = gst_bin_get_by_name(GST_BIN(p), "rxv-shm");
+    CHECK(dec && shm && g_tm.vrx_size);
+    if (dec && shm && g_tm.vrx_size) {
+        CHECK(rx_caps_are(g_tm.vrx_size, 640, 480));
+        feed_rx_caps(dec, 640, 480);                    /* the default size: nothing new to say */
+        feed_rx_frame(shm);
+        CHECK(events_with("VSHM ") == 1);
+        last_vshm_is(sock, 640, 480);
+
+        feed_rx_caps(dec, 360, 640);                    /* the Android held upright */
+        CHECK(rx_caps_are(g_tm.vrx_size, 360, 640));
+        feed_rx_frame(shm);
+        feed_rx_frame(shm);
+        CHECK(events_with("VSHM ") == 2);
+        last_vshm_is(sock, 360, 640);
+
+        feed_rx_caps(dec, 360, 640);                    /* the same size again: no new event */
+        feed_rx_frame(shm);
+        CHECK(events_with("VSHM ") == 2);
+
+        feed_rx_caps(dec, 480, 848);                    /* bigger: scaled to 640 high, even width */
+        CHECK(rx_caps_are(g_tm.vrx_size, 362, 640));
+        feed_rx_frame(shm);
+        CHECK(events_with("VSHM ") == 3);
+        last_vshm_is(sock, 362, 640);
+
+        feed_rx_caps(dec, 1280, 720);                   /* turned to landscape */
+        CHECK(rx_caps_are(g_tm.vrx_size, 640, 360));
+        feed_rx_frame(shm);
+        CHECK(events_with("VSHM ") == 4);
+        last_vshm_is(sock, 640, 360);
+
+        feed_rx_caps(dec, 175, 143);                    /* odd sizes come out even */
+        CHECK(rx_caps_are(g_tm.vrx_size, 174, 142));
+    }
+    if (dec) gst_object_unref(dec);
+    if (shm) gst_object_unref(shm);
+    teardown(p);
+    g_unsetenv("TEAMS_MEDIA_VIDEO_SHM");
+    g_free(sock);
+}
+
+/* The turned head as built for droidvenc: the sizes swap on a side turn, videoflip gets the
+ * direction for the sensor's angle, and the self-view needs no turn of its own. */
+static void test_turned_description(void)
+{
+    TeamsMedia tm;
+    memset(&tm, 0, sizeof tm);
+    g_unsetenv("TEAMS_MEDIA_CAMERA");
+    CHECK(tm_cw_for_degrees(0) == 0 && tm_cw_for_degrees(90) == 1 && tm_cw_for_degrees(180) == 2);
+    CHECK(tm_cw_for_degrees(270) == 3 && tm_cw_for_degrees(360) == 0 && tm_cw_for_degrees(-90) == 3);
+    gchar *d = tm_camera_description(&tm, 3);          /* sargo's front camera: 270 */
+    CHECK(strstr(d, "videoflip video-direction=90l ") != NULL);
+    CHECK(strstr(d, "format=NV12,width=480,height=640,") != NULL);
+    CHECK(strstr(d, "droidvenc target-bitrate=800000 ") != NULL);
+    CHECK(strstr(d, "format=I420,width=240,height=320,") != NULL);
+    CHECK(strstr(d, "vfsrc ! video/x-raw,format=NV21,width=640,height=480,") != NULL);
+    CHECK(strstr(d, "start-capture") == NULL && strstr(d, "mode=2") == NULL && strstr(d, "avdec_h264") == NULL);
+    CHECK(tm.vtx_cw == 3 && tm.vtx_pv_w == 240 && tm.vtx_pv_h == 320 && tm.vtx_mirrored);
+    CHECK(tm_preview_turns(&tm) == 0);
+    g_free(d);
+    tm.vtx_w = 176; tm.vtx_h = 144; tm.vtx_kbps = 208;
+    d = tm_camera_description(&tm, 1);
+    CHECK(strstr(d, "video-direction=90r ") && strstr(d, "format=NV12,width=144,height=176,"));
+    CHECK(strstr(d, "droidvenc target-bitrate=208000 ") != NULL);
+    g_free(d);
+    d = tm_camera_description(&tm, 2);
+    CHECK(strstr(d, "video-direction=180 ") && strstr(d, "format=NV12,width=176,height=144,"));
+    CHECK(tm.vtx_pv_w == 320 && tm.vtx_pv_h == 240);
+    g_free(d);
+    d = tm_camera_description(&tm, 0);
+    CHECK(strstr(d, "video-direction=identity ") != NULL);
+    g_free(d);
+    /* the camera's own H264 still turns its self-view by the sensor's angle */
+    tm.vtx_cw = -1;
+    g_setenv("TEAMS_MEDIA_VIDEO_ROTATION", "3", TRUE);
+    CHECK(tm_preview_turns(&tm) == 1);
+    g_unsetenv("TEAMS_MEDIA_VIDEO_ROTATION");
+    g_setenv("TEAMS_MEDIA_TURN", "0", TRUE);
+    CHECK(!tm_turn_before_encoding());
+    g_setenv("TEAMS_MEDIA_TURN", "1", TRUE);
+    CHECK(tm_turn_before_encoding());
+    g_unsetenv("TEAMS_MEDIA_TURN");
+    CHECK(!tm_turn_before_encoding());                 /* no droidvenc here */
+}
+
+/* The first self-view frame of the turned head, on the shm reader's sink: SMPTE bars run up and
+ * down in the source; turned a quarter, they run across, so luma changes down a column and stays
+ * along a row. */
+static gint turned_checked, turned_rows_flat, turned_cols_vary;
+static GstPadProbeReturn check_turned(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+{
+    (void)pad; (void)u;
+    GstBuffer *b = GST_PAD_PROBE_INFO_BUFFER(info);
+    GstMapInfo m;
+    if (g_atomic_int_get(&turned_checked) || !gst_buffer_map(b, &m, GST_MAP_READ))
+        return GST_PAD_PROBE_OK;
+    const int w = 240, h = 320;
+    if (m.size >= (gsize)w * h) {
+        int rmin = 255, rmax = 0, cmin = 255, cmax = 0;
+        /* row 160: the middle; an unturned 4:3 picture is letterboxed in 240x320 (videoscale keeps
+         * its aspect), so a row near the top would be border, flat and black */
+        for (int x = 4; x < 140; x++) {
+            int v = m.data[160 * w + x];
+            rmin = MIN(rmin, v); rmax = MAX(rmax, v);
+        }
+        for (int y = 4; y < h - 4; y++) {               /* down column 40 */
+            int v = m.data[y * w + 40];
+            cmin = MIN(cmin, v); cmax = MAX(cmax, v);
+        }
+        g_atomic_int_set(&turned_rows_flat, rmax - rmin <= 8 && rmin > 24);
+        g_atomic_int_set(&turned_cols_vary, cmax - cmin >= 60);
+        g_print("turned self-view: row spread %d (from %d), column spread %d\n", rmax - rmin, rmin, cmax - cmin);
+        g_atomic_int_set(&turned_checked, 1);
+    }
+    gst_buffer_unmap(b, &m);
+    return GST_PAD_PROBE_OK;
+}
+static gboolean turned_seen(void) { return g_atomic_int_get(&turned_checked) && g_atomic_int_get(&shm_frames) >= 20; }
+
+/* The turned head running, its camera and encoder played by stand-ins: SMPTE bars for the
+ * viewfinder, the H264 fixture for droidvenc. The self-view comes turned and portrait, and is
+ * announced with no turn of its own; what we send flows. */
+static void test_selfview_turned(const char *h264, const char *dir)
+{
+    setup();
+    gchar *pv = g_build_filename(dir, "teams-turned.sock", NULL);
+    g_setenv("TEAMS_MEDIA_PREVIEW_SHM", pv, TRUE);
+    g_unsetenv("TEAMS_MEDIA_CAMERA");
+    g_tm.vtx_w = 320; g_tm.vtx_h = 240;
+    gchar *d = tm_camera_description(&g_tm, 3), *cam = NULL;
+    d = replace_once(d, "droidcamsrc name=tmcam camera-device=1 tmcam.imgsrc ! fakesink async=false "
+                        "tmcam.vidsrc ! fakesink async=false tmcam.vfsrc ",
+                     "videotestsrc is-live=true pattern=smpte ");
+    gchar *enc = g_strdup_printf("fakesink async=false sync=false filesrc location=%s ! "
+                                 "video/x-h264,framerate=15/1 ! h264parse ! identity sync=true ! "
+                                 "video/x-h264,stream-format=byte-stream,alignment=au ! queue name=tmvout ", h264);
+    gchar *real = g_strdup_printf("droidvenc target-bitrate=%d ! video/x-h264,stream-format=avc,alignment=au ! "
+                                  "h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! "
+                                  "queue name=tmvout ", TM_VIDEO_BITRATE);
+    cam = replace_once(d, real, enc);
+    g_free(enc); g_free(real);
+    g_setenv("TEAMS_MEDIA_CAMERA", cam, TRUE);
+    g_setenv("TEAMS_MEDIA_TURN", "1", TRUE);
+    g_setenv("TEAMS_MEDIA_VIDEO_ROTATION", "3", TRUE);
+
+    GstElement *p = gst_pipeline_new("tx");
+    GstElement *vpay = NULL, *rtcp = NULL, *vsink = el("fakesink", NULL);
+    CHECK(tm_video_tx_build(&g_tm, p, &vpay, &rtcp));
+    g_object_set(vsink, "sync", FALSE, "async", FALSE, NULL);
+    gst_bin_add(GST_BIN(p), vsink);
+    CHECK(gst_element_link(vpay, vsink));
+    GstPad *vp = gst_element_get_static_pad(vsink, "sink");
+    gst_pad_add_probe(vp, GST_PAD_PROBE_TYPE_BUFFER, count_tx, NULL, NULL);
+    gst_object_unref(vp);
+    rtcp_sink(p, rtcp);
+    g_tm.pipeline = p;
+    CHECK(gst_element_set_state(p, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE);
+
+    g_atomic_int_set(&shm_frames, 0);
+    g_atomic_int_set(&shm_bad_size, 0);
+    g_atomic_int_set(&tx_pkts, 0);
+    g_atomic_int_set(&turned_checked, 0);
+    tm_set_video(&g_tm, TRUE);
+    while (g_main_context_iteration(g_tm.ctx, FALSE)) {}
+    CHECK(g_tm.vtx_head != NULL && g_tm.vtx_cw == 3);
+    CHECK(wait_for(has_vpreview, 10000));
+    gchar *line = event_with("VPREVIEW "), *want = g_strdup_printf("VPREVIEW %s 240 320 0 0", pv);
+    CHECK(line && strcmp(line, want) == 0);
+    if (line && strcmp(line, want) != 0) g_printerr("got '%s'\n", line);
+    g_free(line); g_free(want);
+    GstElement *r = shm_reader(pv, 240, 320);
+    GstIterator *it = gst_bin_iterate_sinks(GST_BIN(r));
+    GValue v = G_VALUE_INIT;
+    if (gst_iterator_next(it, &v) == GST_ITERATOR_OK) {
+        GstPad *sp = gst_element_get_static_pad(GST_ELEMENT(g_value_get_object(&v)), "sink");
+        gst_pad_add_probe(sp, GST_PAD_PROBE_TYPE_BUFFER, check_turned, NULL, NULL);
+        gst_object_unref(sp);
+        g_value_unset(&v);
+    }
+    gst_iterator_free(it);
+    gst_element_set_state(r, GST_STATE_PLAYING);
+    CHECK(wait_for(turned_seen, 15000));
+    CHECK(g_atomic_int_get(&turned_rows_flat) && g_atomic_int_get(&turned_cols_vary));
+    CHECK(g_atomic_int_get(&shm_bad_size) == 0);
+    CHECK(g_atomic_int_get(&tx_pkts) > 0);
+    g_print("turned head: %d self-view frames, %d packets sent\n", g_atomic_int_get(&shm_frames),
+            g_atomic_int_get(&tx_pkts));
+    gst_element_set_state(r, GST_STATE_NULL);
+    gst_object_unref(r);
+
+    tm_set_video(&g_tm, FALSE);
+    while (g_main_context_iteration(g_tm.ctx, FALSE)) {}
+    teardown(p);
+    g_unsetenv("TEAMS_MEDIA_CAMERA");
+    g_unsetenv("TEAMS_MEDIA_PREVIEW_SHM");
+    g_unsetenv("TEAMS_MEDIA_TURN");
+    g_unsetenv("TEAMS_MEDIA_VIDEO_ROTATION");
+    g_tm.vtx_w = 0; g_tm.vtx_h = 0;
+    g_free(cam);
+    g_free(pv);
+}
+
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -959,6 +1312,10 @@ int main(int argc, char **argv)
     test_rx_nokey(h264);
     reset_rtcp_counts();
     test_tx(h264, dir);
+    test_selfview_from_sent(h264, dir);
+    test_rx_portrait(dir);
+    test_turned_description();
+    test_selfview_turned(h264, dir);
     g_ptr_array_unref(events);
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
