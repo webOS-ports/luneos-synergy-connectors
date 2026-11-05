@@ -15,10 +15,11 @@
             "address": "palm://org.webosports.service.videos/login"
         },
         "loc_usernameLabel": "PLEX",
-        "__comment2": "org.webosports.app.videoauth MUST be in write/readPermissions: createAccount runs as the customUI app. org.webosports.service.videos reads the credentials for every catalogue call.",
+        "__comment2": "org.webosports.app.videoauth MUST be in write/readPermissions: createAccount runs as the customUI app. org.webosports.service.videos reads the credentials for every catalogue call. org.webosports.app.music.service (the Music app's daemon) only reads them, to play the server's music in Music.",
         "readPermissions": [
             "org.webosports.service.videos",
-            "org.webosports.app.videoauth"
+            "org.webosports.app.videoauth",
+            "org.webosports.app.music.service"
         ],
         "writePermissions": [
             "org.webosports.service.videos",

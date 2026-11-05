@@ -185,3 +185,53 @@ test("a Web API session without librespot's sign-in does not finish the account"
 		assert.strictEqual(login, finishes ? 0 : 1, JSON.stringify(status));
 	}
 });
+
+function radioCard(listValue) {
+	const { card } = load({ plugin: false });
+	for (const n of ["listGroup", "serverGroup", "userGroup", "passwordGroup", "emailGroup", "arlGroup", "headerIcon", "title"]) card.$[n] = control();
+	card.$.list = { getValue: () => listValue };
+	card.$.headerIcon.setSrc = () => {};
+	card.$.signInButton.setCaption = (v) => { card.$.signInButton.caption = v; };
+	card.stopPoll = () => {};
+	card.handleLaunch({ template: { templateId: "org.webosports.app.music.radio", loc_name: "Internet Radio" } });
+	return card;
+}
+
+test("radio: Radio Browser needs nothing, the own list is offered", () => {
+	const card = radioCard("");
+	assert.strictEqual(card.mode, "radio");
+	assert.strictEqual(card.$.listGroup.showing, true);
+	assert.strictEqual(card.$.serverGroup.showing, null);
+	assert.strictEqual(card.$.signInButton.caption, "Add Internet Radio");
+	let posted = 0;
+	card.post = () => { posted++; };
+	card.performPrimary();
+	assert.strictEqual(posted, 0);
+	const r = card.$.crossAppResult.sent[0];
+	assert.strictEqual(r.returnValue, true);
+	assert.strictEqual(r.templateId, "org.webosports.app.music.radio");
+});
+
+test("radio: an own list is read by the service before the account is added", () => {
+	const card = radioCard("  https://lists.example/my.m3u ");
+	let asked = null;
+	card.post = (url, body, cb) => { asked = { url, body }; cb(true, { ok: true, lists: [{ address: body.lists[0], stations: 3 }] }); };
+	card.performPrimary();
+	assert.strictEqual(asked.url, "http://127.0.0.1:8730/radioauth/lists");
+	assert.deepStrictEqual(JSON.parse(JSON.stringify(asked.body)), { lists: ["https://lists.example/my.m3u"] });
+	assert.strictEqual(card.$.crossAppResult.sent.length, 1);
+	assert.strictEqual(card.$.crossAppResult.sent[0].returnValue, true);
+});
+
+test("radio: a list the service refuses keeps the card open with its reason", () => {
+	const card = radioCard("https://lists.example/page.html");
+	card.post = (url, body, cb) => cb(false, { error: "the playlist: it is a web page, not an M3U or PLS playlist" });
+	card.performPrimary();
+	assert.strictEqual(card.$.crossAppResult.sent.length, 0);
+	assert.strictEqual(card.$.errorBox.showing, true);
+	assert.match(card.$.errorMessage.content, /web page/);
+	const other = radioCard("https://lists.example/x.m3u");
+	other.post = (url, body, cb) => cb(false, null);
+	other.performPrimary();
+	assert.match(other.$.errorMessage.content, /could not be read/);
+});

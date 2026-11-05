@@ -65,30 +65,12 @@ type musicAccount struct {
 
 // listMusicAccounts returns every account whose templateId is one of ours.
 func listMusicAccounts() []musicAccount {
-	m, err := lunaCall("palm://com.palm.service.accounts/listAccounts", "{}")
-	if err != nil {
-		return nil
-	}
-	rawAccts, _ := m["accounts"].([]interface{})
 	var out []musicAccount
-	for _, ra := range rawAccts {
-		a, _ := ra.(map[string]interface{})
-		if a == nil {
+	for _, a := range listAccountRows() {
+		if !strings.HasPrefix(a.TemplateID, musicTemplatePrefix) || a.BeingDeleted {
 			continue
 		}
-		tid, _ := a["templateId"].(string)
-		if !strings.HasPrefix(tid, musicTemplatePrefix) {
-			continue
-		}
-		id, _ := a["_id"].(string)
-		if id == "" {
-			id, _ = a["accountId"].(string) // some builds key it this way
-		}
-		name, _ := a["username"].(string)
-		if name == "" {
-			name, _ = a["displayName"].(string)
-		}
-		out = append(out, musicAccount{ID: id, TemplateID: tid, Name: name})
+		out = append(out, musicAccount{ID: a.ID, TemplateID: a.TemplateID, Name: a.Name})
 	}
 	return out
 }

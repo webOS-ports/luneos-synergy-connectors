@@ -1,0 +1,43 @@
+[
+    {
+        "templateId": "org.webosports.video.archive",
+        "loc_name": "Internet Archive",
+        "icon": {
+            "loc_32x32": "images/archive-32x32.png",
+            "loc_48x48": "images/archive-48x48.png"
+        },
+        "__comment": "The Internet Archive's public films, TV and cartoons (archive.org) in Videos. No sign-in. The customUI app org.webosports.app.videoauth asks for what the provider needs and calls org.webosports.service.videos/login with this templateId, which checks it before Accounts stores the account.",
+        "validator": {
+            "customUI": {
+                "appId": "org.webosports.app.videoauth",
+                "name": "validator.html"
+            },
+            "address": "palm://org.webosports.service.videos/login"
+        },
+        "loc_usernameLabel": "INTERNET ARCHIVE",
+        "__comment2": "org.webosports.app.videoauth MUST be in write/readPermissions: createAccount runs as the customUI app. org.webosports.service.videos reads the credentials for every catalogue call.",
+        "readPermissions": [
+            "org.webosports.service.videos",
+            "org.webosports.app.videoauth"
+        ],
+        "writePermissions": [
+            "org.webosports.service.videos",
+            "org.webosports.app.videoauth"
+        ],
+        "capabilityProviders": [
+            {
+                "capability": "Video",
+                "capabilitySubtype": "STREAMING",
+                "id": "org.webosports.video.archive.streaming",
+                "alwaysOn": true,
+                "implementation": "palm://org.webosports.service.videos/",
+                "loc_shortName": "Internet Archive",
+                "icon": {
+                    "loc_32x32": "images/archive-32x32.png",
+                    "loc_48x48": "images/archive-48x48.png",
+                    "splitter": "images/archive-32x32.png"
+                }
+            }
+        ]
+    }
+]

@@ -161,3 +161,62 @@ test("Emby asks for the server, user name and password, and signs in with its ow
 	assert.deepStrictEqual(JSON.parse(JSON.stringify(card.$.svc.calls.map((c) => [c.opts.method, c.params]))), [["login",
 		{ templateId: "org.webosports.video.emby", server: "emby.example.org", username: "alice", password: "pw" }]]);
 });
+
+test("Mediathek asks for nothing: one tap signs in with its templateId alone", () => {
+	const card = load({ template: { templateId: "org.webosports.video.mediathek", loc_name: "Mediathek" } });
+	assert.strictEqual(card.$.title.content, "Mediathek");
+	assert.match(card.$.bodyText.content, /public broadcasters/);
+	assert.deepStrictEqual([card.$.serverGroup.showing, card.$.usernameGroup.showing, card.$.passwordGroup.showing, card.$.urlGroup.showing,
+		card.$.catalogGroup.showing, card.$.instanceGroup.showing, card.$.addressLink.showing], [false, false, false, false, false, false, false]);
+	assert.strictEqual(card.$.headerIcon.src, "images/connectors/mediathek.png");
+	assert.ok(fs.existsSync(path.join(APP, card.$.headerIcon.src)));
+	for (const n of ["mediathek-32x32.png", "mediathek-48x48.png"]) {
+		assert.ok(fs.existsSync(path.join(__dirname, "../../video/mediathek/account/org.webosports.video.mediathek/images", n)), n);
+	}
+	card.primaryTap();
+	assert.deepStrictEqual(plain(card.$.svc.calls.map((c) => [c.opts.method, c.params])), [["login", { templateId: "org.webosports.video.mediathek" }]]);
+	const sent = [];
+	card.$.crossAppResult.sendResult = (r) => sent.push(r);
+	card.loginSuccess(null, { username: "mediathekviewweb.de", alias: "Mediathek", credentials: { common: { service: "mediathekviewweb" } } });
+	assert.deepStrictEqual(plain(sent.map((r) => [r.returnValue, r.templateId, r.username, r.alias, r.credentials])),
+		[[true, "org.webosports.video.mediathek", "mediathekviewweb.de", "Mediathek", { common: { service: "mediathekviewweb" } }]]);
+});
+
+const OWNCAST = { template: { templateId: "org.webosports.video.owncast", loc_name: "Owncast" } };
+
+test("Owncast offers the directory first, with nothing to type, and signs it in as directory: true", () => {
+	const card = load(OWNCAST);
+	assert.strictEqual(card.$.title.content, "Owncast");
+	assert.strictEqual(card.$.headerIcon.src, "images/connectors/owncast.png");
+	assert.ok(fs.existsSync(path.join(APP, card.$.headerIcon.src)));
+	for (const n of ["owncast-32x32.png", "owncast-48x48.png"]) {
+		assert.ok(fs.existsSync(path.join(__dirname, "../../video/owncast/account/org.webosports.video.owncast/images", n)), n);
+	}
+	assert.strictEqual(card.$.catalogGroup.showing, true);
+	assert.deepStrictEqual(plain(card.$.catalogPicker.items.map((i) => i.value)), ["directory", "own"]);
+	assert.strictEqual(card.$.catalogPicker.value, "directory");
+	assert.strictEqual(card.$.serverGroup.showing, false);
+	assert.match(card.$.catalogNote.content, /directory\.owncast\.online/);
+	assert.strictEqual(card.$.catalogs.calls.length, 0, "no Free TV lists");
+	card.$.server.value = "ignored.example";
+	card.primaryTap();
+	assert.deepStrictEqual(plain(card.$.svc.calls.map((c) => [c.opts.method, c.params])),
+		[["login", { templateId: "org.webosports.video.owncast", directory: true }]]);
+});
+
+test("Owncast's one server: the address is asked for and sent as typed, trimmed", () => {
+	const card = load(OWNCAST);
+	card.$.catalogPicker.setValue("own");
+	card.catalogChanged();
+	assert.strictEqual(card.$.serverGroup.showing, true);
+	assert.match(card.$.catalogNote.content, /192\.168\.1\.10:8080/);
+	card.primaryTap();
+	assert.strictEqual(card.$.svc.calls.length, 0, "no address, no login");
+	assert.strictEqual(card.lastError, "Enter the address.");
+	card.$.server.value = "  live.example.org ";
+	card.primaryTap();
+	assert.deepStrictEqual(plain(card.$.svc.calls.map((c) => c.params)), [{ templateId: "org.webosports.video.owncast", server: "live.example.org" }]);
+	card.$.catalogPicker.setValue("directory");
+	card.catalogChanged();
+	assert.strictEqual(card.$.serverGroup.showing, false);
+});

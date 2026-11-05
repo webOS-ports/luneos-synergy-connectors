@@ -8,12 +8,17 @@
  *   peertube  an instance: typed, or picked from the healthy, non-NSFW instances the directory
  *             (instances.joinpeertube.org) lists, searchable by name
  *   upnp      nothing: one tap adds the media servers on the local network
+ *   archive   nothing: one tap adds the Internet Archive's public films, TV and cartoons
  *   plex      a code from plex.tv (plexPin), entered at plex.tv/link on any device; the app asks
  *             login until the code is linked or runs out. Or, for a server that lets the network
  *             in without signing in, its address and, if wanted, a token.
  *   m3u       Free TV: one of Free-TV/IPTV's lists (m3uCatalogs), the phone's country picked to
  *             begin with; or "My own playlist": its web address (an IPTV service's list holds its
  *             password: shown as typed, never logged) and, if wanted, a name for it
+ *   mediathek nothing: one tap adds the public broadcasters' libraries (ARD, ZDF, Arte, 3sat, ...)
+ *             through MediathekViewWeb
+ *   owncast   the Owncast Directory (the servers live now, nothing to type), or one server by its
+ *             address
  *
  * Every kind calls org.webosports.service.videos/login with the templateId and what was typed; the
  * service checks it against the server and answers the account (username, alias, credentials),
@@ -54,12 +59,34 @@ enyo.kind({
 				"with DLNA on, ...). There is nothing to sign in to.",
 			button: "Add"
 		},
+		archive: {
+			fields: [],
+			text: "Watch the Internet Archive's public collections in Videos: feature films, classic TV, cartoons, " +
+				"silent films and more from archive.org. There is nothing to sign in to.",
+			button: "Add"
+		},
 		m3u: {
 			fields: ["url", "name"],
 			catalogs: true,
 			text: "Watch TV channels in Videos: the free channels of a country from Free TV, or your own M3U " +
 				"playlist - the list an IPTV service gives you, or any playlist of streams on the web.",
 			ownText: "Enter the playlist's address as the service gives it.",
+			button: "Add"
+		},
+		mediathek: {
+			fields: [],
+			text: "Watch the libraries of the German, Austrian and Swiss public broadcasters in Videos: ARD and its " +
+				"regional channels, ZDF, Arte, 3sat, KiKA, ORF, SRF and more, through MediathekViewWeb. There is nothing " +
+				"to sign in to. Some programmes play only in their own country.",
+			button: "Add"
+		},
+		owncast: {
+			fields: ["server"],
+			choice: [{ caption: "Owncast Directory", value: "directory" }, { caption: "One Owncast server", value: "own" }],
+			text: "Watch live streams from Owncast, self-hosted live streaming, in Videos: whatever is live now " +
+				"in the Owncast Directory, or one Owncast server.",
+			directoryText: "The streams that are live now on the servers listed at directory.owncast.online, by category.",
+			ownText: "Enter the address you watch the stream at (for example live.example.org or 192.168.1.10:8080).",
 			button: "Add"
 		},
 		plex: {
@@ -170,6 +197,7 @@ enyo.kind({
 		if (this.kindId === "jellyfin") { this.$.server.setHint("jellyfin.example.org or 192.168.1.10:8096"); }
 		if (this.kindId === "emby") { this.$.server.setHint("emby.example.org or 192.168.1.10:8096"); }
 		if (this.kindId === "plex") { this.$.server.setHint("192.168.1.10 or plex.example.org:32400"); }
+		if (this.kindId === "owncast") { this.$.server.setHint("live.example.org"); }
 		this.$.addressLink.setShowing(!!k.pin);
 		this.addressMode = false;
 		var account = p.account;
@@ -179,6 +207,14 @@ enyo.kind({
 		if (k.instances) {
 			this.$.instanceGroup.show();
 			this.loadInstances("");
+		}
+		if (k.choice) {
+			// Owncast: the directory, or one server.
+			this.$.catalogGroup.setCaption("STREAMS");
+			this.$.catalogGroup.show();
+			this.$.catalogPicker.setItems(k.choice);
+			this.$.catalogPicker.setValue(k.choice[0].value);
+			this.catalogChanged();
 		}
 		if (k.catalogs) {
 			// The address fields until the lists and the phone's country are in.
@@ -226,6 +262,13 @@ enyo.kind({
 	},
 	catalogChanged: function () {
 		var own = this.$.catalogPicker.getValue() === "own";
+		if (this.k.choice) {
+			this.$.serverGroup.setShowing(own);
+			this.$.catalogNote.setContent(esc(own ? this.k.ownText : this.k.directoryText));
+			this.$.catalogNote.show();
+			this.showError("");
+			return;
+		}
 		this.$.urlGroup.setShowing(own);
 		this.$.nameGroup.setShowing(own);
 		var src = this.catalogSource;
@@ -356,6 +399,10 @@ enyo.kind({
 		var f = this.k.fields;
 		if (this.k.catalogs && this.$.catalogPicker.getValue() !== "own") {
 			payload.catalog = this.$.catalogPicker.getValue();
+			f = [];
+		}
+		if (this.k.choice && this.$.catalogPicker.getValue() !== "own") {
+			payload.directory = true;
 			f = [];
 		}
 		if (f.indexOf("server") >= 0) { payload.server = trim(this.$.server.getValue()); }

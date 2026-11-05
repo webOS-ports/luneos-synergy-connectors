@@ -8,7 +8,7 @@ and plugs a network or service into the stock apps.
 | `cloud/` | box, dropbox, flickr, google (Drive), hidrive, kdrive, koofr, mega, onedrive, pcloud, immich, photoprism, pigallery2, s3, smugmug, webdav (Nextcloud, ownCloud, any WebDAV server), yandex | Documents (DOCUMENTS) and Photos (PHOTO.UPLOAD) |
 | `im/` | discord, facebook (E2EE), googlechat, signal, teams, telegram, whatsapp | Messaging, through `imlibpurpleservice` and libpurple |
 | `music/` | apple, archive, deezer, jamendo, qobuz, soundcloud, spotify, tidal, youtube | Music, through the streaming daemon |
-| `video/` | emby, jellyfin, m3u (IPTV and other playlists of web streams), peertube, plex, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Kodi, or Plex and Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
+| `video/` | archive (the Internet Archive's films, TV and cartoons), emby, jellyfin, m3u (IPTV and other playlists of web streams), mediathek (ARD, ZDF, Arte, 3sat and the other public broadcasters of Germany, Austria and Switzerland), owncast (self-hosted live streams), peertube, plex, upnp (UPnP/DLNA media servers: MiniDLNA, NAS, Kodi, or Plex and Jellyfin's DLNA) | Videos (Video, subtype STREAMING), through org.webosports.service.videos |
 
 ## Layout
 
@@ -100,6 +100,39 @@ The sign-in offers Free TV ready made: the per-country and per-topic playlists o
 everybody in their country, or all of them in one list. It picks the phone's region to begin
 with; "My own playlist" takes an address instead. The lists are named in the provider, so login
 only ever fetches one of those addresses for a `catalog`.
+
+A Mediathek account needs no sign-in: it reads the public broadcasters' libraries through
+[MediathekViewWeb](https://mediathekviewweb.de) (`POST /api/query`, `/api/entries`), the search
+over the [MediathekView](https://github.com/mediathekview) project's film list, which holds ARD
+and its regional channels, ZDF, Arte, 3sat, KiKA, Phoenix, ORF, SRF and more as plain MP4 files
+and HLS streams (no DRM). The sections are "New", "Live TV" and one per channel; search goes over
+titles and topics. `resolve` picks the tallest of the three links (low, normal, HD) no taller
+than `prefer.maxHeight`, by the size the link names where it names one; ARD's subtitles come as
+WebVTT. The film list does not say where an item plays, so the CDNs' marks in the links (`/de/`,
+`/dach/`, `geo`, ORF's `cms-austria`, ...) are read and such items say "Only in its own country".
+Requests name the client (`User-Agent: LuneOS-Videos/1.0`), and answers are kept a minute.
+
+An Internet Archive account has nothing to sign in to. Its sections are archive.org
+collections (Feature Films, Classic TV, Animation & Cartoons, Silent Films, Sci-Fi / Horror, Film
+Noir, Comedy Films, Short Films, Prelinger Archives, News & Public Affairs), most downloaded first,
+through `advancedsearch.php`; search looks in the titles, creators and subjects of every
+moving-image item. Items that archive.org only lends or keeps back (`access-restricted-item`, the
+lending collections, `stream_only`) and items with no MP4 are left out. An item with a runtime is
+one video; one without (a series, a box of cartoons) opens as a folder of its videos, read from
+`/metadata/<identifier>`. A video plays from `/download/<identifier>/<file>`: the tallest MP4 no
+taller than asked, with the item's `.srt`/`.vtt` files (the speech-recognised `.asr.srt` as
+"Automatic captions"). Requests say `User-Agent: LuneOS-Videos/1.0`, and an item's metadata is
+kept 10 minutes.
+
+An Owncast account is one server, or the Owncast Directory (directory.owncast.online). A
+server is checked with `/api/config` and `/api/status` (a bare host is tried on https, http, then
+http on 8080); its one section holds the stream while it is live ("Live Now"), and is an empty
+"Not Live Right Now" while it is not. The directory's live servers, NSFW ones left out, are
+"Live Now", then its categories that have something live, then "All Live Streams", and can be
+searched. Every stream is `live`, and plays from `<server>/hls/stream.m3u8` once the server's
+`/api/status` says it is on; from the directory, only a server it lists as live is played. The
+directory is read at most every two minutes, a server's status every 20 seconds, as
+`LuneOS-Videos/1.0`. Owncast calls these APIs internal, so every field is taken as optional.
 
 UPnP searches with SSDP from UDP port 41900 and keeps only servers on private,
 link-local or loopback addresses. The replies come from each server's own

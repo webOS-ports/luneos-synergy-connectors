@@ -1,0 +1,41 @@
+[
+    {
+        "templateId": "org.webosports.app.music.radio",
+        "loc_name": "Internet Radio",
+        "icon": {
+            "loc_32x32": "images/radio-32x32.png",
+            "loc_48x48": "images/radio-48x48.png"
+        },
+        "validator": {
+            "customUI": {
+                "appId": "org.webosports.app.musicauth",
+                "name": "validator.html"
+            }
+        },
+        "loc_usernameLabel": "INTERNET RADIO",
+        "readPermissions": [
+            "org.webosports.app.music.service",
+            "org.webosports.app.music",
+            "org.webosports.app.musicauth"
+        ],
+        "writePermissions": [
+            "org.webosports.app.music.service",
+            "org.webosports.app.music",
+            "org.webosports.app.musicauth"
+        ],
+        "capabilityProviders": [
+            {
+                "capability": "Music",
+                "capabilitySubtype": "STREAMING",
+                "id": "org.webosports.app.music.radio.streaming",
+                "alwaysOn": true,
+                "loc_shortName": "Internet Radio",
+                "icon": {
+                    "loc_32x32": "images/radio-32x32.png",
+                    "loc_48x48": "images/radio-48x48.png",
+                    "splitter": "images/radio-32x32.png"
+                }
+            }
+        ]
+    }
+]

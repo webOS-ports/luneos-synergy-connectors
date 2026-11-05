@@ -798,3 +798,13 @@ test("the templates name the capability, the service and the sign-in app", () =>
 		assert.strictEqual(p.templateId, id);
 	}
 });
+
+test("Music may read the media servers' sign-ins, and change none", () => {
+	for (const n of ["jellyfin", "emby", "plex", "peertube", "upnp", "m3u"]) {
+		const id = "org.webosports.video." + n;
+		const [t] = JSON.parse(fs.readFileSync(path.join(__dirname, "../../video", n, "account", id, id + ".json"), "utf8"));
+		const music = ["jellyfin", "emby", "plex"].includes(n);
+		assert.strictEqual(t.readPermissions.includes("org.webosports.app.music.service"), music, n + " readPermissions");
+		assert.ok(!t.writePermissions.includes("org.webosports.app.music.service"), n + " writePermissions");
+	}
+});

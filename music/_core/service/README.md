@@ -98,6 +98,52 @@ and it never expires; so the app never sees a server URL: tracks play from
 add the sign-in and pass Range on for seeking. Errors never carry the URL
 they failed on.
 
+## Jellyfin, Emby and Plex (signed in in Videos)
+
+`videoaccounts.go`, `mediabrowser.go` (Jellyfin and Emby), `plexmusic.go`:
+the music on the user's media servers, with the sign-in Videos keeps. A
+Videos account of type `org.webosports.video.jellyfin`, `.emby` or `.plex`
+brings the `jellyfin`, `emby` or `plex` provider; the templates list
+`org.webosports.app.music.service` in their readPermissions (read only:
+signing in and out stays with Videos). The accounts are looked at when the
+app asks for `/providers`, at most every 30 s, and again after a server
+refused the sign-in. With two accounts of one kind, the first is used.
+
+Search, playlists, and browsing artists, albums and the album lists go
+through the provider routes. The token goes in a header (Jellyfin and
+Emby's `Authorization: MediaBrowser ... Token=`, Plex's `X-Plex-Token`), never
+in a URL: tracks play from `/mediastream?p=<id>&id=` and covers come from
+`/mediaart?p=<id>&...`, which add it and pass Range on for seeking. A Plex
+id is `<server>.<Plex id>`, so that one plex.tv account's servers keep
+apart; Plex's addresses are tried local first, the relay last, as in Videos.
+
+Checked on 2026-11-04 against Jellyfin 12.4.0, Emby 4.10.2.0 and Plex
+Media Server 1.43.5 (test servers with a small music library): artists,
+albums, tracks, the album lists, search, playlists, a seek into a stream
+and covers on each.
+
+## Internet Radio
+
+`radio.go`: the stations of [Radio Browser](https://www.radio-browser.info),
+a free directory kept by its users, and the user's own station lists (M3U or
+PLS playlists at an address). The account (template
+`org.webosports.app.music.radio`) needs no sign-in; the sign-in app can post a
+list's address to `/radioauth/lists`, which reads it (a playlist with
+stations, or a station's own stream) before keeping it in `radio-lists`.
+
+They show as the service's playlists, so the app needs nothing new: the
+user's lists (one playlist per group when a list has groups), then Radio
+Browser's most played and most liked stations, those of the system's country
+(the settings service's UI locale) and ten genres. Search looks in the
+user's lists first, then in Radio Browser. A station is a track with no
+length: `radio:rb.<stationuuid>` or `radio:u.<base64url of its stream>`.
+
+As Radio Browser asks: the server comes from the DNS name
+`all.api.radio-browser.info` (the next one when one fails), requests carry
+`User-Agent: LuneOS-Music/1.0`, and each play counts a click on
+`/json/url/<stationuuid>`. A station's own `.pls` or `.m3u` file is opened
+for its stream when it plays (GStreamer plays HLS's `.m3u8` itself).
+
 ## Browsing a library
 
 A provider with a library to walk implements `libraryBrowser` (`browse.go`),

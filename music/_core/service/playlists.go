@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"strconv"
 )
 
 // playlistSource is an OPTIONAL provider capability: the signed-in user's own
@@ -11,6 +12,15 @@ import (
 type playlistSource interface {
 	Playlists(ctx context.Context) ([]providerPlaylist, error)
 	PlaylistTracks(ctx context.Context, playlistID string) ([]providerTrack, error)
+}
+
+// playlistPager is an OPTIONAL capability of a playlistSource whose playlists
+// are read a page at a time (Radio Browser's lists): the tracks from offset
+// on, and the offset of the next page (0: there is none). A page may give
+// fewer tracks than it read - the unplayable are left out - so the next
+// page is the provider's to say.
+type playlistPager interface {
+	PlaylistPage(ctx context.Context, playlistID string, offset int) ([]providerTrack, int, error)
 }
 
 // providerPlaylist is the normalised playlist shape returned to the app.
@@ -31,7 +41,8 @@ const (
 )
 
 // GET /provider/<id>/playlists -> {playlists}
-// GET /provider/<id>/playlist?id= -> {tracks}
+// GET /provider/<id>/playlist?id=[&offset=] -> {tracks, more, next}: more
+// when there is a next page, asked for with offset=next.
 func handlePlaylistRoute(w http.ResponseWriter, r *http.Request, p MusicProvider, action string) {
 	ps, ok := p.(playlistSource)
 	if !ok {
@@ -52,12 +63,33 @@ func handlePlaylistRoute(w http.ResponseWriter, r *http.Request, p MusicProvider
 			httpErr(w, http.StatusBadRequest, "id is required")
 			return
 		}
-		tracks, err := ps.PlaylistTracks(r.Context(), id)
+		offset := 0
+		if v := r.URL.Query().Get("offset"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 || n >= maxPlaylistTracks {
+				httpErr(w, http.StatusBadRequest, "offset is out of range")
+				return
+			}
+			offset = n
+		}
+		var tracks []providerTrack
+		next := 0
+		var err error
+		if pp, ok := p.(playlistPager); ok {
+			tracks, next, err = pp.PlaylistPage(r.Context(), id, offset)
+		} else if offset == 0 {
+			tracks, err = ps.PlaylistTracks(r.Context(), id)
+		} else {
+			tracks = []providerTrack{} // all of it came with the first page
+		}
 		if err != nil {
 			httpErr(w, http.StatusBadGateway, err.Error())
 			return
 		}
-		writeJSON(w, map[string]interface{}{"tracks": tracks})
+		if next <= offset || next >= maxPlaylistTracks {
+			next = 0 // no page after this one, or one going back
+		}
+		writeJSON(w, map[string]interface{}{"tracks": tracks, "more": next > 0, "next": next})
 	}
 }
 

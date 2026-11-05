@@ -15,6 +15,9 @@
  *              Airsonic, Gonic... - any server that speaks the Subsonic API).
  *   deezer  -> email + password -> /dzauth/login (pulls the ARL for you); if Deezer
  *              blocks the login it reveals an ARL field -> /dzauth/save.
+ *   radio   -> optionally the address of a station list (M3U or PLS) ->
+ *              /radioauth/lists, which reads it before keeping it; Radio
+ *              Browser's stations need nothing.
  *   youtube/soundcloud/jamendo/archive -> no credentials, just add.
  *
  * Returns the account via enyo.CrossAppResult.sendResult({returnValue, username,...}).
@@ -86,6 +89,10 @@ enyo.kind({
 					// the type="password" attribute itself (show-then-hide behaviour).
 					{ kind: "PasswordInput", name: "password", hint: "Password", autoWordComplete: false, oninput: "validateInput" }
 				]},
+				{ name: "listGroup", showing: false, kind: "RowGroup", caption: "YOUR STATION LIST (OPTIONAL)", className: "accounts-group", components: [
+					{ kind: "Input", name: "list", hint: "https://example.org/stations.m3u", spellcheck: false,
+					  autocorrect: false, autoWordComplete: false, autoCapitalize: "lowercase", oninput: "validateInput" }
+				]},
 				{ name: "arlGroup", showing: false, kind: "RowGroup", caption: "ARL COOKIE", className: "accounts-group", components: [
 					{ kind: "Input", name: "arl", hint: "Paste your deezer ARL", spellcheck: false,
 					  autocorrect: false, autoWordComplete: false, autoCapitalize: "none", oninput: "validateInput" }
@@ -156,6 +163,7 @@ enyo.kind({
 		if (id === "tidal") { return "tidal"; }
 		if (id === "qobuz") { return "qobuz"; }
 		if (id === "subsonic") { return "subsonic"; }
+		if (id === "radio") { return "radio"; }
 		if (id === "deezer") { return "deezer"; }
 		if (id === "apple") { return "apple"; }
 		return "noauth";
@@ -178,6 +186,11 @@ enyo.kind({
 				this.$.bodyText.setContent("Sign in to your music server: <b>Navidrome</b>, Airsonic, Gonic or any other that speaks the Subsonic API. The address is the one you open it at in a browser.");
 				this.$.signInButton.setCaption("Sign In");
 				this.$.signInButton.setDisabled(true);
+				break;
+			case "radio":
+				this.$.listGroup.setShowing(true);
+				this.$.bodyText.setContent("Listen to the stations of <b>Radio Browser</b>, a directory of tens of thousands of stations. You can also add a list of your own: the address of an M3U or PLS playlist.");
+				this.$.signInButton.setCaption("Add " + this.serviceName);
 				break;
 			case "spotify":
 				this.$.bodyText.setContent("Connect your <b>Spotify</b> account. A sign-in page opens if needed.");
@@ -241,6 +254,7 @@ enyo.kind({
 		switch (this.mode) {
 			case "qobuz": this.doQobuz(); break;
 			case "subsonic": this.doSubsonic(); break;
+			case "radio": this.doRadio(); break;
 			case "deezer": this._deezerFallback ? this.doDeezerArl() : this.doDeezer(); break;
 			case "spotify": this.attemptFinish(true); break;
 			default: this.finishService(this.serviceName); // noauth
@@ -267,6 +281,17 @@ enyo.kind({
 			this.busy(false);
 			if (ok && j && j.ok) { this.finishService(j.username || user); }
 			else { this.showError((j && j.error) || "Could not sign in to the server - check its address, your username and password."); }
+		}));
+	},
+
+	doRadio: function () {
+		var list = this.trim(this.$.list.getValue());
+		if (!list) { this.finishService(this.serviceName); return; }
+		this.busy(true);
+		this.post(BACKEND + "/radioauth/lists", { lists: [list] }, enyo.bind(this, function (ok, j) {
+			this.busy(false);
+			if (ok && j && j.ok) { this.finishService(this.serviceName); }
+			else { this.showError((j && j.error) || "That list could not be read - check its address."); }
 		}));
 	},
 

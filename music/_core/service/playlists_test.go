@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -196,6 +198,78 @@ func TestPlaylistRoutes(t *testing.T) {
 		t.Errorf("a service without playlists: %d", code)
 	}
 	if code, _ := get(t, "/provider/broken/playlists"); code != http.StatusBadGateway {
+		t.Errorf("an error from the service: %d", code)
+	}
+	// One that is not read by page: all of it comes with the first.
+	if code, out := get(t, "/provider/spotify/playlist?id=p1&offset=0"); code != http.StatusOK || string(out["more"]) != "false" {
+		t.Errorf("first page: %d %s", code, out["more"])
+	}
+	code, out = get(t, "/provider/spotify/playlist?id=p1&offset=1")
+	if code != http.StatusOK || string(out["tracks"]) != "[]" || string(out["more"]) != "false" {
+		t.Errorf("later page: %d %s %s", code, out["tracks"], out["more"])
+	}
+	for _, bad := range []string{"-1", "x", "2000", "1e3"} {
+		if code, _ := get(t, "/provider/spotify/playlist?id=p1&offset="+bad); code != http.StatusBadRequest {
+			t.Errorf("offset %s: %d", bad, code)
+		}
+	}
+	if code, _ := get(t, "/provider/spotify/playlist?id=p1&offset=1999"); code != http.StatusOK {
+		t.Errorf("the last offset: %d", code)
+	}
+}
+
+// pagedProvider reads its playlist a page of two at a time, from five.
+type pagedProvider struct {
+	playlistProvider
+	asked []int
+}
+
+// The next page is the provider's to say: here 3 on from offset (one of
+// each three is left out), and id "back" says a page going back.
+func (p *pagedProvider) PlaylistPage(ctx context.Context, id string, offset int) ([]providerTrack, int, error) {
+	p.asked = append(p.asked, offset)
+	out := []providerTrack{}
+	for i := offset; i < offset+2 && i < 7; i++ {
+		out = append(out, providerTrack{ID: strconv.Itoa(i), Provider: p.id})
+	}
+	switch {
+	case id == "back":
+		return out, offset, p.err
+	case id == "far":
+		return out, maxPlaylistTracks, p.err
+	case offset+3 < 7:
+		return out, offset + 3, p.err
+	}
+	return out, 0, p.err
+}
+
+func TestPlaylistRoutePages(t *testing.T) {
+	pp := &pagedProvider{playlistProvider: playlistProvider{fakeProvider: fakeProvider{id: "radio"}}}
+	withProviders(t, pp, &pagedProvider{playlistProvider: playlistProvider{fakeProvider: fakeProvider{id: "broken"}, err: errors.New("down")}})
+	for _, c := range []struct {
+		q, ids, more, next string
+	}{{"", "0,1", "true", "3"}, {"&offset=3", "3,4", "true", "6"}, {"&offset=6", "6", "false", "0"}} {
+		code, out := get(t, "/provider/radio/playlist?id=x"+c.q)
+		var tracks []providerTrack
+		_ = json.Unmarshal(out["tracks"], &tracks)
+		ids := []string{}
+		for _, tr := range tracks {
+			ids = append(ids, tr.ID)
+		}
+		if code != http.StatusOK || strings.Join(ids, ",") != c.ids || string(out["more"]) != c.more || string(out["next"]) != c.next {
+			t.Errorf("%q: %d %v %s %s", c.q, code, ids, out["more"], out["next"])
+		}
+	}
+	// A next page that goes back, or past what the app is given, is none.
+	for _, id := range []string{"back", "far"} {
+		if _, out := get(t, "/provider/radio/playlist?id="+id+"&offset=3"); string(out["more"]) != "false" || string(out["next"]) != "0" {
+			t.Errorf("%s: %s %s", id, out["more"], out["next"])
+		}
+	}
+	if fmt.Sprint(pp.asked) != "[0 3 6 3 3]" {
+		t.Errorf("asked %v", pp.asked)
+	}
+	if code, _ := get(t, "/provider/broken/playlist?id=x&offset=2"); code != http.StatusBadGateway {
 		t.Errorf("an error from the service: %d", code)
 	}
 }
