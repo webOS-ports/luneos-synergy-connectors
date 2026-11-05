@@ -17,12 +17,13 @@ import (
 
 // youtubeProvider: a free, no-DRM source. The device has no Python/yt-dlp, so we
 // talk to YouTube's InnerTube API DIRECTLY from the Go backend (self-contained, no
-// middleman) — search via the WEB client, and resolve a direct audio stream URL via
-// mobile/VR clients that return UN-ciphered URLs (no signature descrambling needed).
-// The URL is then played by the shared gst stream player (curl | decodebin) through
-// the local /ytstream proxy (googlevideo only serves <= 1 MiB ranges), which
-// decodes AAC (itag 140, ffdec_aac) or Opus (itag 251, opusdec) — both present on
-// the device. This establishes the stream-URL connector pattern.
+// middleman) -- search via the WEB client, and resolve a direct audio stream URL via
+// the VISIONOS client (see itPlayerClients), whose URLs are UN-ciphered (no signature
+// or n descrambling) and need no PO token. The URL is then played by the shared gst
+// stream player (curl | decodebin) through the local /ytstream proxy, which fetches it
+// in 1 MiB ranges (needed for the older ANDROID_VR URLs, harmless for VISIONOS ones,
+// see ytstream.go), and decodes AAC (itag 140, ffdec_aac) or Opus (itag 251, opusdec)
+// -- both present on the device. This establishes the stream-URL connector pattern.
 type youtubeProvider struct{}
 
 func (y *youtubeProvider) ID() string   { return "youtube" }
@@ -36,12 +37,28 @@ type itClient struct {
 	extra                    map[string]interface{}
 }
 
-// Player clients that return direct (un-ciphered) audio URLs to a server, tried in
-// order until one yields a playable audio format. IOS is deliberately omitted — it
-// now 400s with "Precondition check failed" (needs attestation we can't provide).
-// ANDROID_VR is the most reliable; embedded players bypass many age/precondition
-// gates.
+// itPlayerClients are the anonymous player clients, tried in this order until one
+// yields a format whose URL googlevideo actually serves.
+//
+// VISIONOS first: since 2026-08-17 YouTube refuses every ANDROID_VR 1.65.10 format
+// (yt-dlp PR #17461, issue #17456), which is what cut our playback short after 1 MiB
+// (tests/known-issues.json "live_playback/youtube", commit b0bfb87). yt-dlp
+// (default and only JS-less client since #17261) and NewPipeExtractor (v0.26.3, #1508)
+// moved to VISIONOS, which needs no JS player and no PO token.
+//
+// Measured from a desktop host on 2026-11-05 with youtube_measure_test.go: VISIONOS
+// answers OK with un-ciphered URLs (no n parameter) for adaptive H.264 video (avc1, up
+// to 1080p), AAC 139/140 and Opus 249-251, and an hlsManifestUrl, but NO progressive
+// muxed format (no itag 18/22). Its URLs serve any range, a whole file in one range
+// and a plain GET (the latter paced to about twice the bitrate). ANDROID_VR still
+// lists itag 18, but 18 and 251 are 403 from the first byte and 140 past 1 MiB;
+// TVHTML5_SIMPLY_EMBEDDED_PLAYER ("no longer supported"), WEB_EMBEDDED_PLAYER ("This
+// video is unavailable") and ANDROID (http 400 "Precondition check failed") resolved
+// nothing. They are kept behind VISIONOS as fallbacks in case one comes back; each is
+// only asked when everything before it failed. IOS is deliberately omitted -- it 400s
+// with "Precondition check failed" (needs attestation we can't provide).
 var itPlayerClients = []itClient{
+	visionOSClient,
 	androidVRClient,
 	{name: "TVHTML5_SIMPLY_EMBEDDED_PLAYER", version: "2.0",
 		extra: map[string]interface{}{"clientScreen": "EMBED"}},
@@ -53,6 +70,28 @@ var itPlayerClients = []itClient{
 		extra:     map[string]interface{}{"androidSdkVersion": 30}},
 }
 
+// visionOSUA is the user agent yt-dlp sends for VISIONOS, both as the User-Agent header
+// and as context.client.userAgent.
+const visionOSUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
+
+// visionOSClient is YouTube for Apple Vision Pro. Context copied from yt-dlp master
+// (commit 12ac9ac, 2026-10-21), yt_dlp/extractor/youtube/_base.py INNERTUBE_CLIENTS
+// ['visionos']: clientName VISIONOS, clientVersion 1.02, deviceMake Apple, deviceModel
+// RealityDevice17,1, osName visionOS, osVersion 26.5.23O471, the Safari userAgent above,
+// INNERTUBE_CONTEXT_CLIENT_NAME 101 (X-YouTube-Client-Name), REQUIRE_JS_PLAYER False and
+// no GVS PO token policy. NewPipeExtractor (ClientsConstants.java, dev 61e04a4) sends the
+// same client id 101, name and device model, with version 1.04, osVersion 26.6.0.23O770
+// and a "com.google.visionos.youtube/..." user agent. Its URLs are un-ciphered.
+var visionOSClient = itClient{
+	name: "VISIONOS", version: "1.02", num: 101,
+	userAgent: visionOSUA,
+	extra: map[string]interface{}{
+		"deviceMake": "Apple", "deviceModel": "RealityDevice17,1",
+		"osName": "visionOS", "osVersion": "26.5.23O471",
+		"userAgent": visionOSUA,
+	},
+}
+
 // Clients used WITH the user's OAuth token (Authorization: Bearer). The token is
 // issued for the "YouTube on TV" client, so it MUST be paired with the TVHTML5
 // client context (other clients 400). Authenticated requests clear the bot-check,
@@ -60,7 +99,8 @@ var itPlayerClients = []itClient{
 var itAuthedClients = []itClient{
 	// Mobile clients return UN-ciphered URLs; with the OAuth token they also clear
 	// the bot-check. TVHTML5 is a fallback (clears the check but returns ciphered
-	// URLs we can't yet descramble).
+	// URLs we can't yet descramble). ANDROID_VR is refused since 2026-08-17 (see
+	// itPlayerClients) and kept only in case that is lifted.
 	androidVRClient,
 	{name: "ANDROID", version: "19.29.37",
 		userAgent: "com.google.android.youtube/19.29.37 (Linux; U; Android 11) gzip",
@@ -68,7 +108,8 @@ var itAuthedClients = []itClient{
 	{name: "TVHTML5", version: "7.20240724.13.00"},
 }
 
-// androidVRClient is the Oculus Quest ("VR") InnerTube client. Its player responses
+// androidVRClient is the Oculus Quest ("VR") InnerTube client. Until 2026-08-17 (when
+// YouTube started refusing all its formats, see itPlayerClients) its player responses
 // carry DIRECT, un-ciphered, un-throttled audio URLs and — crucially — it clears the
 // "sign in to confirm you're not a bot" gate on OFFICIAL music tracks (the ATV art
 // tracks) with NOTHING but an anonymous visitor session (visitorData + visitor
@@ -114,7 +155,7 @@ func ytVisitorData(ctx context.Context, force bool) string {
 		return ytVisData
 	}
 	req, err := http.NewRequestWithContext(ctx, "GET",
-		"https://www.youtube.com/?bpctr=9999999999&has_verified=1", nil)
+		itBaseURL("www.youtube.com")+"/?bpctr=9999999999&has_verified=1", nil)
 	if err != nil {
 		return ytVisData
 	}
@@ -138,6 +179,9 @@ func ytVisitorData(ctx context.Context, force bool) string {
 	return ytVisData
 }
 
+// itBaseURL is where InnerTube calls for host go; tests point it at a fake.
+var itBaseURL = func(host string) string { return "https://" + host }
+
 // innertubePost issues an InnerTube v1 call and returns the raw top-level fields.
 // If bearer != "" the request is authenticated as the signed-in YouTube account
 // (Authorization: Bearer), which clears the "confirm you're not a bot" gate.
@@ -158,7 +202,7 @@ func innertubePost(ctx context.Context, host, endpoint string, cl itClient, body
 	buf, _ := json.Marshal(full)
 	// OAuth (bearer) requests must NOT carry the web API key — mixing them yields
 	// http 400. Anonymous requests use the key.
-	url := "https://" + host + "/youtubei/v1/" + endpoint + "?prettyPrint=false"
+	url := itBaseURL(host) + "/youtubei/v1/" + endpoint + "?prettyPrint=false"
 	if bearer == "" {
 		url += "&key=" + innertubeKey
 	}
@@ -227,6 +271,11 @@ func (y *youtubeProvider) StreamURLFormat(ctx context.Context, trackID, prefForm
 // video+audio streams ourselves. Implements the optional videoResolver capability (see
 // provider.go). Availability of itag 22 in particular is YouTube's choice and has grown
 // intermittent across the ecosystem generally; itag 18 is the more durable fallback.
+//
+// As measured on 2026-11-05 (see itPlayerClients) this finds nothing: VISIONOS lists no
+// muxed format and ANDROID_VR's itag 18 is refused (403), so it returns an error. What
+// VISIONOS does offer for video is adaptive avc1 (which would need a muxer) and an HLS
+// master playlist with muxed avc1+mp4a variants beside VP9 ones.
 func (y *youtubeProvider) StreamURLVideo(ctx context.Context, trackID string) (string, error) {
 	return y.streamURL(ctx, trackID, "", "video")
 }
@@ -301,85 +350,18 @@ resolve:
 				lastErr = fmt.Errorf("%s: no streamingData", cl.name)
 				continue
 			}
-			var streaming struct {
-				AdaptiveFormats []struct {
-					Itag            int    `json:"itag"`
-					URL             string `json:"url"`
-					MimeType        string `json:"mimeType"`
-					SignatureCipher string `json:"signatureCipher"`
-				} `json:"adaptiveFormats"`
-				// Formats: progressive (single muxed video+audio file) streams — itag
-				// 18/22, H.264+AAC. Used only by the video path (kind=="video").
-				Formats []struct {
-					Itag            int    `json:"itag"`
-					URL             string `json:"url"`
-					MimeType        string `json:"mimeType"`
-					SignatureCipher string `json:"signatureCipher"`
-				} `json:"formats"`
-				HlsManifestURL  string `json:"hlsManifestUrl"`
-				DashManifestURL string `json:"dashManifestUrl"`
-			}
+			var streaming ytStreamingData
 			if json.Unmarshal(sd, &streaming) != nil {
 				continue
 			}
-			log.Printf("youtube player %s(%s): formats=%d hls=%v dash=%v", cl.name, trackID,
-				len(streaming.AdaptiveFormats), streaming.HlsManifestURL != "", streaming.DashManifestURL != "")
-			// Pick the best format (AAC 140, then Opus tiers, then any audio -- or,
-			// for video, progressive itag 22 then 18), taking either its direct URL
-			// or its ciphered form.
+			log.Printf("youtube player %s(%s): formats=%d/%d hls=%v dash=%v", cl.name, trackID,
+				len(streaming.Formats), len(streaming.AdaptiveFormats), streaming.HlsManifestURL != "", streaming.DashManifestURL != "")
 			var directURL, cipher string
 			var pickedItag int
 			var pickedMime string
-			pick := func(itag int) bool {
-				list := streaming.AdaptiveFormats
-				if kind == "video" {
-					list = streaming.Formats
-				}
-				for i := range list {
-					f := &list[i]
-					match := itag > 0 && f.Itag == itag
-					if itag == 0 {
-						match = strings.HasPrefix(f.MimeType, "audio/")
-					}
-					if match {
-						if f.URL != "" || f.SignatureCipher != "" {
-							pickedItag, pickedMime = f.Itag, f.MimeType
-						}
-						if f.URL != "" {
-							directURL = f.URL
-							return true
-						}
-						if f.SignatureCipher != "" {
-							cipher = f.SignatureCipher
-							return true
-						}
-					}
-				}
-				return false
-			}
-			var order []int
-			if kind == "video" {
-				// Progressive muxed H.264+AAC only: 22 (720p) preferred, 18 (360p)
-				// fallback -- both hardware-decodable on this device.
-				order = []int{22, 18}
-			} else {
-				// Default preference AAC-then-Opus; if the user picked a format via
-				// the selector, move the itags matching that label to the front.
-				order = []int{140, 251, 250, 249, 0}
-				if prefFormat != "" {
-					var pref []int
-					for _, it := range []int{139, 140, 141, 249, 250, 251, 256, 258} {
-						if ytFmtLabel(it, "") == prefFormat {
-							pref = append(pref, it)
-						}
-					}
-					order = append(pref, order...)
-				}
-			}
-			for _, want := range order {
-				if pick(want) {
-					break
-				}
+			if f, ok := ytPickFormat(streaming, kind, prefFormat); ok {
+				directURL, cipher = f.URL, f.SignatureCipher
+				pickedItag, pickedMime = f.Itag, f.MimeType
 			}
 			best := directURL
 			if best == "" && cipher != "" { // TVHTML5 gives ciphered URLs -- descramble via base.js
@@ -436,6 +418,79 @@ resolve:
 		break
 	}
 	return "", fmt.Errorf("youtube: could not resolve stream url: %v", lastErr)
+}
+
+// ytFormat is one entry of streamingData.formats / adaptiveFormats.
+type ytFormat struct {
+	Itag            int    `json:"itag"`
+	URL             string `json:"url"`
+	MimeType        string `json:"mimeType"`
+	SignatureCipher string `json:"signatureCipher"`
+	Height          int    `json:"height"`
+	ContentLength   int64  `json:"contentLength,string"`
+}
+
+// ytStreamingData is the part of a player response the resolver reads.
+type ytStreamingData struct {
+	// AdaptiveFormats: split video-only / audio-only streams; the audio path picks
+	// from these.
+	AdaptiveFormats []ytFormat `json:"adaptiveFormats"`
+	// Formats: progressive (single muxed video+audio file) streams -- itag 18/22,
+	// H.264+AAC. Used only by the video path (kind=="video").
+	Formats               []ytFormat `json:"formats"`
+	HlsManifestURL        string     `json:"hlsManifestUrl"`
+	DashManifestURL       string     `json:"dashManifestUrl"`
+	ServerAbrStreamingURL string     `json:"serverAbrStreamingUrl"`
+}
+
+// ytFindItag returns the format with that itag, muxed or adaptive, or nil.
+func ytFindItag(st ytStreamingData, itag int) *ytFormat {
+	for _, list := range [][]ytFormat{st.Formats, st.AdaptiveFormats} {
+		for i := range list {
+			if list[i].Itag == itag {
+				return &list[i]
+			}
+		}
+	}
+	return nil
+}
+
+// ytPickFormat chooses the format to play: for audio AAC (itag 140), then the Opus
+// tiers, then any audio, with the itags matching prefFormat (an ytFmtLabel label, from
+// the format selector) moved to the front; for video the progressive muxed H.264+AAC
+// itags only, 22 (720p) then 18 (360p) -- the SoC decoder is H.264-only and a single
+// muxed file needs no muxing here. A format counts when it has a direct URL or a
+// signatureCipher; ok is false when none does.
+func ytPickFormat(st ytStreamingData, kind, prefFormat string) (ytFormat, bool) {
+	list := st.AdaptiveFormats
+	var order []int
+	if kind == "video" {
+		list = st.Formats
+		order = []int{22, 18}
+	} else {
+		order = []int{140, 251, 250, 249, 0}
+		if prefFormat != "" {
+			var pref []int
+			for _, it := range []int{139, 140, 141, 249, 250, 251, 256, 258} {
+				if ytFmtLabel(it, "") == prefFormat {
+					pref = append(pref, it)
+				}
+			}
+			order = append(pref, order...)
+		}
+	}
+	for _, want := range order {
+		for _, f := range list {
+			match := want > 0 && f.Itag == want
+			if want == 0 {
+				match = strings.HasPrefix(f.MimeType, "audio/")
+			}
+			if match && (f.URL != "" || f.SignatureCipher != "") {
+				return f, true
+			}
+		}
+	}
+	return ytFormat{}, false
 }
 
 // ytFmtLabel maps a YouTube audio itag / mimeType to a short quality badge string.

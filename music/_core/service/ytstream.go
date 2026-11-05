@@ -24,6 +24,10 @@ import (
 // straight to the stream player played nothing: curl got a 403, gst saw an empty stream
 // and the track "ended" at position 0.
 //
+// (That was ANDROID_VR. The VISIONOS URLs the resolver gets first since 2026-11 serve any
+// range and a plain GET; chunking them costs nothing and keeps the 403 re-resolve, so
+// the proxy stays for both.)
+//
 // So the YouTube provider's StreamURL returns http://127.0.0.1:8730/ytstream?id=<videoId>
 // instead, and this handler fetches the resolved URL in sequential 1 MiB Range chunks and
 // writes them out as one plain response body. The total length comes from the first
