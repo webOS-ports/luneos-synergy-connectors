@@ -1,0 +1,36 @@
+tgcalls-lite
+============
+
+tgcalls-lite is a Telegram call engine written for LuneOS. It is licensed under the GNU General
+Public License version 3 or later (LICENSE at the root of this repository).
+
+Parts of it are derived from tgcalls, Telegram's call library:
+
+    https://github.com/TelegramMessenger/tgcalls
+    read at commit 2faee3b5524f54d56c91c2058c00e11c656a74b3
+    published under the GNU Lesser General Public License version 3 (COPYING.LGPL3 here,
+    copied unchanged from that repository's LICENSE)
+
+Those parts are conveyed here under the GNU General Public License version 3, as section 2 of the
+LGPL allows; the tgcalls authors keep their copyright in them. What was taken:
+
+    crypto_helper.h, crypto_helper.cpp
+        The AES-CTR key and IV derivation, ported from tgcalls/CryptoHelper.h and .cpp.
+
+    encrypted_connection.h, encrypted_connection.cpp
+        The signalling packet encryption (the wire format of encryptRawPacket and
+        decryptRawPacket) and the sliding replay window, ported from
+        tgcalls/EncryptedConnection.cpp as tgcalls/v2/SignalingEncryption.cpp uses it.
+
+    signaling_message.h, signaling_message.cpp
+        The field names and shapes of the V2 signalling messages, copied from
+        tgcalls/v2/Signaling.h and .cpp so that a tgcalls peer can parse what is sent.
+
+    content_negotiation.h, content_negotiation.cpp
+        The NegotiateChannels offer and answer exchange, written after
+        tgcalls/v2/ContentNegotiation.cpp and reduced to Opus audio and H.264 video.
+
+The rest -- ICE (libnice), DTLS-SRTP (OpenSSL, libsrtp2), the audio pipeline (Opus, PulseAudio),
+video receive and RTCP, the call engine and the tests -- is tgcalls-lite's own code. It follows
+the interfaces tgcalls exposes so that it can talk to tgcalls peers; no code was taken for it.
+No code from WebRTC, which tgcalls builds on, is used.

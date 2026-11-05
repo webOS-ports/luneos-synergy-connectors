@@ -91,7 +91,7 @@
             "pauseCode": [],
             "waitCode": [],
             "keyHoldMappings": [],
-            "videoFormat": "none"
+            "videoFormat": "both"
         }
     ]
 }]
