@@ -763,6 +763,27 @@ static GstPadProbeReturn tm_probe_vtx(GstPad *pad, GstPadProbeInfo *info, gpoint
     return GST_PAD_PROBE_OK;
 }
 
+/* The door between a camera head and the send tail, on the head's own output pad: a head must
+ * never flush or end the stream that the audio and our RTCP share past the funnel. droidcamsrc
+ * sends a FLUSH_START downstream as it stops and no FLUSH_STOP after it; through srtpenc and the
+ * funnel that left tx-queue and nicesink flushing, so turning the camera off stopped our audio
+ * too, and the next camera head got a few frames out before its pushes were refused. On the
+ * head's side because a sink pad marks itself flushing before its probes run: dropped at
+ * txv-queue's sink, the event would still have left that pad flushing for the next head. Heads
+ * come and go; the tail stays streaming. */
+static GstPadProbeReturn tm_probe_vtx_door(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    (void)pad; (void)user;
+    switch (GST_EVENT_TYPE(GST_PAD_PROBE_INFO_EVENT(info))) {
+        case GST_EVENT_FLUSH_START:
+        case GST_EVENT_FLUSH_STOP:
+        case GST_EVENT_EOS:
+            return GST_PAD_PROBE_DROP;
+        default:
+            return GST_PAD_PROBE_OK;
+    }
+}
+
 /* The persistent send tail: queue -> rtph264pay -> sink_element (srtpenc's next rtp_sink, or a
  * test's sink), plus the RTCP appsrc. A camera head (tm_video_tx_start) links to tm->vtx_queue.
  * Returns the RTP and RTCP outputs to link, or FALSE. */
@@ -1081,6 +1102,9 @@ static gboolean tm_video_tx_start(gpointer user)
     GstPad *ghost = src ? gst_ghost_pad_new("src", src) : NULL;
     if (src) gst_object_unref(src);
     if (out) gst_object_unref(out);
+    if (ghost)
+        gst_pad_add_probe(ghost, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM | GST_PAD_PROBE_TYPE_EVENT_FLUSH,
+                          tm_probe_vtx_door, tm, NULL);
     if (!ghost || !gst_element_add_pad(head, ghost)) {
         gst_object_unref(gst_object_ref_sink(head));
         g_free(desc);

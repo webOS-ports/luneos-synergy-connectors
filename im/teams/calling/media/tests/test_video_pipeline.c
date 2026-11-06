@@ -512,10 +512,23 @@ static void test_tx(const char *h264, const char *dir)
         gst_buffer_unref(b);
         CHECK(wait_for(keyunit_seen, 2000));
 
+        /* droidcamsrc sends a FLUSH_START out of the camera head as it stops, and no FLUSH_STOP
+         * after it. Through the funnel that left the whole send tail flushing on sargo: audio
+         * stopped with the camera, and a camera turned on again sent a few frames and no more. */
+        GstElement *out = gst_bin_get_by_name(GST_BIN(g_tm.vtx_head), "tmvout");
+        GstPad *outsrc = out ? gst_element_get_static_pad(out, "src") : NULL;
+        CHECK(outsrc != NULL);
+        if (outsrc) gst_pad_push_event(outsrc, gst_event_new_flush_start());
+        if (outsrc) gst_object_unref(outsrc);
+        if (out) gst_object_unref(out);
+
         tm_set_video(&g_tm, FALSE);
         while (g_main_context_iteration(g_tm.ctx, FALSE)) {}
         CHECK(g_tm.vtx_head == NULL);
         CHECK(events_with("VTX 0") == 1);
+        GstPad *tail = gst_element_get_static_pad(vsink, "sink");
+        CHECK(!GST_PAD_IS_FLUSHING(tail));                     /* the camera took no one with it */
+        gst_object_unref(tail);
         g_print("tx round %d: camera on, self-view, %d packets, keyframe request, camera off\n",
                 round, g_atomic_int_get(&tx_pkts));
     }
