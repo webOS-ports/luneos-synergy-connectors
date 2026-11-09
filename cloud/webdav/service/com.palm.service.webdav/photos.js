@@ -59,7 +59,7 @@ function photoMethods({ config, adapter, withAccount, log = console, now = Date.
 	const albumName = () => config.PHOTO_ALBUM_NAME || "Camera Uploads";
 	const tmpDir = () => config.PHOTO_TMP_DIR || PHOTO_DIR;
 	return {
-		listAlbums: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const { out } = await withAccount(p, async (s) => {
 				try { return await adapter.photoAlbums(s, log); }
 				catch (e) { log.log("webdav: listAlbums - photo folder unavailable: " + ((e && (e.status || e.errorCode)) || e)); return null; }
@@ -70,7 +70,7 @@ function photoMethods({ config, adapter, withAccount, log = console, now = Date.
 			return { albums: albums.length ? albums : [{ aid: "", name: albumName(), size: { images: 0 } }] };
 		} },
 
-		listPhotos: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			if (p.aid === undefined || p.aid === null || p.aid === "") { return { photos: [] }; }
 			const dir = albumDir(tmpDir(), p.aid);
 			const have = new Set(Array.isArray(p.have) ? p.have.map(String) : []);

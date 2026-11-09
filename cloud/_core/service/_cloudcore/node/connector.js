@@ -29,9 +29,10 @@ function connector(spec) {
 	let running = null;
 
 	// A new instance on `palmbus` each time (a test starts many); run() starts the one.
-	// timeouts: { timeoutMs, idleTimeoutMs } for http.js (tests shorten them).
-	function start({ palmbus, fetch, exit, idleMs, log = console, random, timeouts = {} } = {}) {
-		const bus = createBus({ palmbus, name: config.SERVICE_NAME, exit, idleMs, log });
+	// timeouts: { timeoutMs, idleTimeoutMs } for http.js, jobOptions the listings' job clocks
+	// (jobs.js): tests shorten them.
+	function start({ palmbus, fetch, exit, idleMs, log = console, random, timeouts = {}, jobOptions } = {}) {
+		const bus = createBus({ palmbus, name: config.SERVICE_NAME, exit, idleMs, log, jobOptions });
 		const http = createHttp(Object.assign({ fetch, errorCode: spec.errorCode, describe: spec.describe }, timeouts));
 		const oauth = (spec.oauth === false || !config.TOKEN_URL) ? null : createOAuth({ config, http, random });
 		const adapter = spec.adapter({ config, http, errors });

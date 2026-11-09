@@ -11,6 +11,7 @@
 module.exports = Object.assign({},
 	require("./errors.js"),
 	require("./bus.js"),
+	require("./jobs.js"),
 	require("./http.js"),
 	require("./oauth.js"),
 	require("./creds.js"),

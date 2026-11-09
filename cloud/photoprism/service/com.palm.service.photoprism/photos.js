@@ -60,7 +60,7 @@ function toPhotoEntry(config, server, tokens, p) {
 
 function photoMethods({ config, api, resolve, log = console }) {
 	return {
-		listAlbums: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const creds = await resolve(p);
 			const albums = [], seen = new Set();
 			for (const type of config.ALBUM_TYPES) {
@@ -82,7 +82,7 @@ function photoMethods({ config, api, resolve, log = console }) {
 			return { albums };
 		} },
 
-		listPhotos: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const creds = await resolve(p);
 			let raw, cfg;
 			try {

@@ -51,7 +51,7 @@ async function nickOf(api, creds) {
 
 function photoMethods({ api, resolve, log = console }) {
 	return {
-		listAlbums: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const creds = await resolve(p);
 			let list = [];
 			try { list = await api.albums(creds, await nickOf(api, creds)); }
@@ -64,7 +64,7 @@ function photoMethods({ api, resolve, log = console }) {
 			return { albums };
 		} },
 
-		listPhotos: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const creds = await resolve(p);
 			let raw;
 			try { raw = await api.albumImages(creds, p.aid); }

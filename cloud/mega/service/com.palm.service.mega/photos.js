@@ -59,7 +59,7 @@ async function prune(dir, keep, log, recursive) {
 function photoMethods({ config, adapter, withAccount, log = console }) {
 	const albumName = () => config.PHOTO_ALBUM_NAME || "Camera Uploads";
 	return {
-		listAlbums: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const { out } = await withAccount(p, async (s) => {
 				try { return await adapter.photoAlbums(s); }
 				catch (e) { log.log("mega: listAlbums - tree unavailable: " + ((e && (e.errorCode || e.status)) || e)); return null; }
@@ -74,7 +74,7 @@ function photoMethods({ config, adapter, withAccount, log = console }) {
 			return { albums: albums.length ? albums : [{ aid: "", name: albumName(), size: { images: 0 } }] };
 		} },
 
-		listPhotos: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			if (p.aid === undefined || p.aid === null || p.aid === "") { return { photos: [] }; }
 			const dir = albumDir(config.PHOTO_TMP_DIR || PHOTO_DIR, p.aid);
 			const have = new Set(Array.isArray(p.have) ? p.have.map(String) : []);

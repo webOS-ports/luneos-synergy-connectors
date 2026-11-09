@@ -57,7 +57,7 @@ const list = (v) => (Array.isArray(v) ? v : []);
 
 function photoMethods({ api, resolve, log = console }) {
 	return {
-		listAlbums: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const creds = await resolve(p);
 			let data = {};
 			try { data = (await api.listPhotosets(creds)) || {}; }
@@ -75,7 +75,7 @@ function photoMethods({ api, resolve, log = console }) {
 		} },
 
 		// people.getPhotos answers data.photos.photo[], photosets.getPhotos data.photoset.photo[].
-		listPhotos: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const aid = p.aid || ALL_PHOTOS_AID;
 			const creds = await resolve(p);
 			let data;
