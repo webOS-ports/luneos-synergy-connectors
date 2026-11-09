@@ -55,13 +55,16 @@ async function prune(dir, keep, log, recursive) {
 	}
 }
 
-function photoMethods({ config, adapter, withAccount, log = console, now = Date.now }) {
+function photoMethods({ config, adapter, withAccount, mapLimit, log = console, now = Date.now }) {
 	const albumName = () => config.PHOTO_ALBUM_NAME || "Camera Uploads";
 	const tmpDir = () => config.PHOTO_TMP_DIR || PHOTO_DIR;
 	return {
-		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p, ctx = {}) => {
 			const { out } = await withAccount(p, async (s) => {
-				try { return await adapter.photoAlbums(s, log); }
+				try {
+					return await adapter.photoAlbums(s, log, { mapLimit, signal: ctx.signal,
+						progress: ctx.progress && ((n) => ctx.progress({ folders: n })) });
+				}
 				catch (e) { log.log("webdav: listAlbums - photo folder unavailable: " + ((e && (e.status || e.errorCode)) || e)); return null; }
 			});
 			// Only a folder that could be read says which albums are gone.
@@ -70,28 +73,29 @@ function photoMethods({ config, adapter, withAccount, log = console, now = Date.
 			return { albums: albums.length ? albums : [{ aid: "", name: albumName(), size: { images: 0 } }] };
 		} },
 
-		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		// The downloads, Config.CONCURRENCY at a time.
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p, ctx = {}) => {
 			if (p.aid === undefined || p.aid === null || p.aid === "") { return { photos: [] }; }
 			const dir = albumDir(tmpDir(), p.aid);
 			const have = new Set(Array.isArray(p.have) ? p.have.map(String) : []);
 			const until = now() + (config.PHOTO_FETCH_BUDGET_MS || BUDGET_MS);
 			const { out } = await withAccount(p, async (s) => {
 				const entries = (((await adapter.listFolder(s, p.aid)) || {}).entries || []).filter(isImage);
-				const photos = [], keep = new Set();
+				const keep = new Set();
 				let late = 0;
-				for (const e of entries) {
+				const photos = (await mapLimit(entries, config.CONCURRENCY, async (e) => {
 					const dest = path.join(dir, localName(e));
 					const link = "file://" + dest;
 					const photo = { pid: e.id, src_big: link, src_small: link, caption: e.name, type: "image", fileName: e.name };
-					if (have.has(String(e.id))) { photos.push(photo); continue; }
-					if (now() > until) { late++; continue; }
+					if (have.has(String(e.id))) { return photo; }
+					if (now() > until) { late++; return null; }
 					try {
 						await fsp.mkdir(dir, { recursive: true, mode: 0o755 });
 						await adapter.photoToLocal(s, e.id, dest);
-					} catch (err) { log.log("webdav: listPhotos - could not fetch a photo: " + ((err && (err.errorCode + " " + (err.status || ""))) || err)); continue; }
+					} catch (err) { log.log("webdav: listPhotos - could not fetch a photo: " + ((err && (err.errorCode + " " + (err.status || ""))) || err)); return null; }
 					keep.add(path.basename(dest));
-					photos.push(Object.assign(photo, { temporary: true }));
-				}
+					return Object.assign(photo, { temporary: true });
+				}, { signal: ctx.signal, progress: ctx.progress && ((n) => ctx.progress({ photos: n })) })).filter(Boolean);
 				if (late) { log.log("webdav: listPhotos - " + late + " photo(s) left for the next sync (out of time)"); }
 				// What the caller has, the server no longer has, and what a download left
 				await prune(dir, keep, log, false);

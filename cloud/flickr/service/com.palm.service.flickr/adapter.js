@@ -64,10 +64,11 @@ function createAdapter({ config, http, errors, oauth1 }) {
 		// The calling user, on tokens that still sign valid requests.
 		testLogin: (creds) => rest("flickr.test.login", null, creds),
 		listPhotosets: (creds) => rest("flickr.photosets.getList", { user_id: "me" }, creds),
-		photosetPhotos: (creds, photosetId) => rest("flickr.photosets.getPhotos",
-			{ photoset_id: photosetId, user_id: "me", extras: PHOTO_EXTRAS, per_page: "500" }, creds),
-		allPhotos: (creds, perPage) => rest("flickr.people.getPhotos",
-			{ user_id: "me", extras: PHOTO_EXTRAS, per_page: (perPage || "500") }, creds),
+		// page: 1 and up (left out for the first, as before)
+		photosetPhotos: (creds, photosetId, page) => rest("flickr.photosets.getPhotos",
+			Object.assign({ photoset_id: photosetId, user_id: "me", extras: PHOTO_EXTRAS, per_page: "500" }, page > 1 ? { page: String(page) } : {}), creds),
+		allPhotos: (creds, perPage, page) => rest("flickr.people.getPhotos",
+			Object.assign({ user_id: "me", extras: PHOTO_EXTRAS, per_page: (perPage || "500") }, page > 1 ? { page: String(page) } : {}), creds),
 	};
 }
 

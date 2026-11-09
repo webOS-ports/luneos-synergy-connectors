@@ -21,6 +21,8 @@
  */
 "use strict";
 
+const { MAX_ITEMS } = require("./adapter.js");
+
 const TIMEOUT_MS = 300000;
 const ID = /^[0-9a-f-]{8,64}$/i;
 
@@ -66,11 +68,14 @@ function photoMethods({ config, api, resolve, log = console }) {
 			return { albums };
 		} },
 
-		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p, ctx = {}) => {
 			const creds = await resolve(p);
 			let raw;
-			try { raw = await api.albumAssets(creds, p.aid); }
-			catch (e) { log.log("immich: listPhotos - album '" + p.aid + "' unavailable: " + why(e)); return { photos: [] }; }
+			try {
+				raw = await api.albumAssets(creds, p.aid, { signal: ctx.signal,
+					progress: ctx.progress && ((n) => ctx.progress({ photos: n })) });
+			} catch (e) { log.log("immich: listPhotos - album '" + p.aid + "' unavailable: " + why(e)); return { photos: [] }; }
+			if (raw.length >= MAX_ITEMS) { log.log("immich: listPhotos - album '" + p.aid + "' has more than " + MAX_ITEMS + " assets, the rest left out"); }
 			return { photos: raw.filter(isImage).map((a) => toPhotoEntry(config, creds, a)).filter(Boolean) };
 		} },
 	};

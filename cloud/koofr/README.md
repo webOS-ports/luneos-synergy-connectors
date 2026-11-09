@@ -49,7 +49,7 @@ The service directory:
 under it that holds images; the `aid` is the folder path URL-encoded, since the Photos service
 makes a local folder from it with a non-recursive mkdir. With no images anywhere there is one
 empty album (`aid` `""`, "Camera Uploads"). `listPhotos` decodes the `aid` and gives one
-`files/download` link per image; `upload` decodes the `aid` too, and without one makes
+`files/download` link per image, 4 asked at a time (as the folders are counted); `upload` decodes the `aid` too, and without one makes
 "Camera Uploads" at the root and uploads there. `deletePhoto` removes the photo by path.
 
 ## Tests

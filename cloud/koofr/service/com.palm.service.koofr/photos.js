@@ -17,7 +17,7 @@
  * counts as no images; credentials that cannot be found are still an error.
  *
  * pid is the photo's path, which deletePhoto takes; src_big/src_small are Koofr's files/download
- * links, asked for one after the other; fileName keeps the real name and extension.
+ * links, asked for Config.CONCURRENCY at a time; fileName keeps the real name and extension.
  */
 "use strict";
 
@@ -40,7 +40,7 @@ function aidPath(aid) {
 }
 
 // deps: connector.js's, plus core (_cloudcore/node), for the generic upload.
-function photoMethods({ core, config, adapter, store, oauth, withAccount, log = console }) {
+function photoMethods({ core, config, adapter, store, oauth, withAccount, mapLimit, log = console }) {
 	const generic = core.createCommands({ config, adapter, store, oauth });
 
 	// A folder's entries, or none when it cannot be listed.
@@ -50,16 +50,17 @@ function photoMethods({ core, config, adapter, store, oauth, withAccount, log = 
 	}
 
 	return {
-		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		// The folders counted Config.CONCURRENCY at a time.
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p, ctx = {}) => {
 			const { out } = await withAccount(p, async (s) => {
 				const albums = [];
 				const top = await entriesOr(s, config.ROOT_FOLDER);
 				const rootImages = top.filter(isImage).length;
 				if (rootImages) { albums.push({ aid: "/", name: "Koofr", images: rootImages }); }
-				for (const f of top.filter((e) => e && e.type === "folder")) {
-					const n = (await entriesOr(s, f.id)).filter(isImage).length;
-					if (n) { albums.push({ aid: f.id, name: f.name, images: n }); }
-				}
+				const folders = top.filter((e) => e && e.type === "folder");
+				const counts = await mapLimit(folders, config.CONCURRENCY, async (f) => (await entriesOr(s, f.id)).filter(isImage).length,
+					{ signal: ctx.signal, progress: ctx.progress && ((n) => ctx.progress({ folders: n })) });
+				folders.forEach((f, i) => { if (counts[i]) { albums.push({ aid: f.id, name: f.name, images: counts[i] }); } });
 				return albums;
 			});
 			const albums = out.map((a) => ({ aid: encodeURIComponent(a.aid), name: a.name, size: { images: a.images } }));
@@ -69,19 +70,18 @@ function photoMethods({ core, config, adapter, store, oauth, withAccount, log = 
 
 		// No aid (the empty album) is no photos, asked of nobody. A folder that cannot be listed
 		// is no photos either; a photo whose link cannot be had is left out.
-		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p, ctx = {}) => {
 			if (p.aid === undefined || p.aid === null || p.aid === "") { return { photos: [] }; }
 			const album = aidPath(p.aid);
 			const { out } = await withAccount(p, async (s) => {
-				const photos = [];
-				for (const e of (await entriesOr(s, album)).filter(isImage)) {
+				const photos = await mapLimit((await entriesOr(s, album)).filter(isImage), config.CONCURRENCY, async (e) => {
 					let link = null;
 					try { link = ((await adapter.getTemporaryLink(s, e.id)) || {}).link || null; }
 					catch (err) { link = null; }
-					if (!link) { log.log("koofr: listPhotos - no link for " + e.id); continue; }
-					photos.push({ pid: e.id, src_big: link, src_small: link, caption: e.name, type: "image", fileName: e.name });
-				}
-				return photos;
+					if (!link) { log.log("koofr: listPhotos - no link for " + e.id); return null; }
+					return { pid: e.id, src_big: link, src_small: link, caption: e.name, type: "image", fileName: e.name };
+				}, { signal: ctx.signal, progress: ctx.progress && ((n) => ctx.progress({ photos: n })) });
+				return photos.filter(Boolean);
 			});
 			return { photos: out };
 		} },

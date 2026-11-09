@@ -40,8 +40,11 @@ it too); this connector has no upload method.
   photos and refuses sign-in, saying so.
 - **Photos only, read-only**: videos are left out (a live photo comes over as its still);
   nothing is uploaded. An album's count in the list is PhotoPrism's and includes its videos; a
-  folder has no count, so its photos are counted, and an empty one is left out.
-- **At most 5000 photos per album** and 200 albums (and 200 folders) are listed.
+  folder has no count (PhotoPrism gives 0), so the folders are counted from one listing of every
+  photo, by the photo's folder, as a folder's own search does (that folder alone, no private
+  photos); an empty one is left out.
+- **Every photo of an album** is listed, up to 100000, and up to 20000 albums and 20000 folders
+  (past that the rest are left out, and logged). The listing is a job (`_cloudcore/node/jobs.js`): the Photos service asks after it until it is done, so a large album need not be listed within one call.
 
 ## Components
 
@@ -84,5 +87,5 @@ sign-in ended, not its result (which holds the app password).
 
 `tests/unit/photoprism.test.js`: every method over a stand-in bus and fetch, with the reply
 shapes a PhotoPrism 261029 server gave: both sign-in paths, the session always closed, the
-redirect handling, Go's zero time as "not deleted", folders counted, originals against
+redirect handling, Go's zero time as "not deleted", folders counted from one listing, originals against
 thumbnails, paging, the error cases. Every request of every method also fails in turn.

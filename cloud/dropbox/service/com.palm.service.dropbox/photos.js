@@ -10,7 +10,7 @@
  *   listAlbums { accountId }      -> { albums:[{ aid:"/Camera Uploads", name, size:{ images } }] }
  *   listPhotos { accountId, aid } -> { photos:[{ pid, src_big, src_small, caption, type:"image", fileName }] }
  * pid is the Dropbox file id ("id:..."), which deletePhoto hands to delete_v2. src_big/src_small
- * are temporary links (no token, ~4 h), fetched one after the other; fileName keeps the real
+ * are temporary links (no token, ~4 h), asked for Config.CONCURRENCY at a time; fileName keeps the real
  * name and extension, which the link does not have.
  */
 "use strict";
@@ -25,7 +25,7 @@ function isImage(e) {
 	return !!(e && e[".tag"] === "file" && IMAGE_RE.test(e.name || ""));
 }
 
-function photoMethods({ adapter, withAccount, log = console }) {
+function photoMethods({ config = {}, adapter, withAccount, mapLimit, log = console }) {
 	return {
 		// The album is always there: a folder that is missing (path/not_found) or cannot be listed
 		// shows as 0 images, so the source still appears in Photos. Credentials that cannot be
@@ -41,19 +41,19 @@ function photoMethods({ adapter, withAccount, log = console }) {
 		} },
 
 		// A photo whose link cannot be had is left out; the listing failing fails the call.
-		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		// The links, Config.CONCURRENCY at a time.
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p, ctx = {}) => {
 			const aid = p.aid || ALBUM_PATH;
 			const { out } = await withAccount(p, async (s) => {
 				const data = await adapter.listFolderRaw(s, aid);
-				const photos = [];
-				for (const e of (data.entries || []).filter(isImage)) {
+				const photos = await mapLimit((data.entries || []).filter(isImage), config.CONCURRENCY, async (e) => {
 					let link = null;
 					try { link = ((await adapter.getTemporaryLink(s, e.path_lower)) || {}).link || null; }
 					catch (err) { link = null; }
-					if (!link) { log.log("dropbox: listPhotos - no temporary link for " + e.path_lower); continue; }
-					photos.push({ pid: e.id, src_big: link, src_small: link, caption: e.name, type: "image", fileName: e.name });
-				}
-				return photos;
+					if (!link) { log.log("dropbox: listPhotos - no temporary link for " + e.path_lower); return null; }
+					return { pid: e.id, src_big: link, src_small: link, caption: e.name, type: "image", fileName: e.name };
+				}, { signal: ctx.signal, progress: ctx.progress && ((n) => ctx.progress({ photos: n })) });
+				return photos.filter(Boolean);
 			});
 			return { photos: out };
 		} },

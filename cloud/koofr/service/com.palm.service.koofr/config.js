@@ -44,6 +44,8 @@ var Config = {
 
 	// --- _cloudcore generic wiring (read by _cloudcore/node) -----------------------------
 	SERVICE_NAME:  "com.palm.service.koofr",
+	// Photos listings: how many requests (a link per photo, a count per folder) go at once.
+	CONCURRENCY: 4,
 	DISPLAY_NAME:  "Koofr",
 	STATE:         "koofr",
 	// Koofr's Hydra accepts EXACTLY ONE scope: "public". Requesting "offline_access" makes the

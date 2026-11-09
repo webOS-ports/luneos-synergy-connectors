@@ -55,6 +55,8 @@ var Config = {
 
 	// --- _cloudcore generic wiring (read by _cloudcore/node) ----------------------------
 	SERVICE_NAME:  "com.palm.service.yandexdisk",
+	// Photos listings: how many requests (a link per photo, a count per folder) go at once.
+	CONCURRENCY: 4,
 	DISPLAY_NAME:  "Yandex Disk",
 	STATE:         "yandex",
 	ROOT_FOLDER:   "disk:/",                  // generic commands' default folderId (= ROOT_PATH)

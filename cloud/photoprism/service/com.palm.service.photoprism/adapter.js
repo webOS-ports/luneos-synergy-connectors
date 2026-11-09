@@ -8,8 +8,15 @@
  *
  *   albums(creds, type)     GET /albums?type=album|folder, paged by count/offset
  *   albumPhotos(creds, uid) GET /photos?s=<album uid>&merged=true, paged, at most MAX_ITEMS
+ *   allPhotos(creds)        GET /photos?merged=true&public=true, paged, at most MAX_ITEMS: every
+ *                           photo a folder's search finds (a folder is path:<Path> public:true),
+ *                           so listAlbums counts the folders from one listing
  *   config(creds)           GET /config: the download and preview tokens for photo links
  *   createSession / mintToken / endSession: sign-in (login.js)
+ *
+ * MAX_ITEMS is a ceiling against a server that pages for ever, not a limit a real library reaches.
+ * A paged listing stops at once when `signal` aborts (the listing's job was given up), and tells
+ * `progress` how many items it has.
  *
  * Credentials ("common", as login stores them): { server, token, userId, username, name };
  * server is "http(s)://host[:port][/path]" with no trailing slash and no /api/v1. A caller passes
@@ -21,7 +28,7 @@
 const ERROR = "PHOTOPRISM_HTTP_ERROR";
 const ACCOUNTS = "luna://com.palm.service.accounts/";
 const PAGE = 500;
-const MAX_ITEMS = 5000;
+const MAX_ITEMS = 100000;
 const REDIRECTS = [301, 302, 303, 307, 308];
 
 const oneLine = (s, n) => { const t = String(s || "").replace(/\s+/g, " ").trim(); return t.length > n ? t.slice(0, n) + "..." : t; };
@@ -79,12 +86,14 @@ function createAdapter({ config, http, errors }) {
 	const call = (creds, method, path, json) => send(creds.server, creds.token, method, path, json);
 
 	// GET path&count=PAGE&offset=n until a short page, at most `max` items.
-	async function paged(creds, path, max) {
+	async function paged(creds, path, max, { signal = null, progress = null } = {}) {
 		const items = [];
 		for (let offset = 0; items.length < max; offset += PAGE) {
+			if (signal && signal.aborted) { throw signal.reason || new Error("aborted"); }
 			const d = await call(creds, "GET", path + "&count=" + PAGE + "&offset=" + offset);
 			const got = (Array.isArray(d) ? d : []).filter((i) => i && typeof i === "object");
 			items.push(...got);
+			if (progress) { progress(items.length); }
 			if (got.length < PAGE) { break; }
 		}
 		return items.slice(0, max);
@@ -117,11 +126,12 @@ function createAdapter({ config, http, errors }) {
 		session: (server, token) => send(server, token, "GET", "/session"),
 
 		config: (creds) => call(creds, "GET", "/config"),
-		albums: (creds, type) => paged(creds, "/albums?type=" + encodeURIComponent(type) + "&order=name", config.MAX_ALBUMS || 200),
-		albumPhotos(creds, uid) {
+		albums: (creds, type, opts) => paged(creds, "/albums?type=" + encodeURIComponent(type) + "&order=name", config.MAX_ALBUMS || 20000, opts),
+		albumPhotos(creds, uid, opts) {
 			if (typeof uid !== "string" || !/^[a-z0-9]{8,32}$/.test(uid)) { throw errors.badArgs("aid: a PhotoPrism album id"); }
-			return paged(creds, "/photos?merged=true&s=" + uid, MAX_ITEMS);
+			return paged(creds, "/photos?merged=true&s=" + uid, MAX_ITEMS, opts);
 		},
+		allPhotos: (creds, opts) => paged(creds, "/photos?merged=true&public=true", MAX_ITEMS, opts),
 	};
 }
 

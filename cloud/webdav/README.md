@@ -34,7 +34,7 @@ server, user name and password.
   password along), so a server that moves later answers an error asking to sign in again.
 - **Photos come from one folder**: `Photos` (the folder Nextcloud and ownCloud make for a new
   user), or the one named in the form. Its images are one album and each folder directly in it
-  that holds images is another (at most 50 looked at; deeper folders are not albums). Uploads
+  that holds images is another (up to 20000, 4 counted at a time; deeper folders are not albums). Uploads
   from Photos with no album go to `<photo folder>/Camera Uploads/`.
 - **Photos are copied twice on their way in.** The Photos service fetches photo URLs without a
   header, and WebDAV wants the password on every request, so `listPhotos` downloads each new

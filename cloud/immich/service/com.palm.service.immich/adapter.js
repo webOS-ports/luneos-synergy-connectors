@@ -11,7 +11,10 @@
  * take the flat { albumIds:[id], size, page } and page by nextPage, which 3.2 calls deprecated
  * (to go in v4). The server's version (GET /server/version, open) picks the shape, once per
  * server for the life of the service. A server whose search cannot filter by album at all gets
- * GET /albums/<id>, which listed the assets itself before Immich 3. At most MAX_ITEMS assets.
+ * GET /albums/<id>, which listed the assets itself before Immich 3. At most MAX_ITEMS assets: a
+ * ceiling against a server that pages for ever, not a limit a real album reaches. A paged listing
+ * stops at once when `signal` aborts (the listing's job was given up), and tells `progress` how
+ * many assets it has.
  *
  * Credentials ("common", as login stores them): { server, apiKey, userId, email, name }; server
  * is "http(s)://host[:port][/path]" with no trailing slash and no /api. A caller passes them
@@ -23,7 +26,7 @@
 const ERROR = "IMMICH_HTTP_ERROR";
 const ACCOUNTS = "luna://com.palm.service.accounts/";
 const PAGE = 500;
-const MAX_ITEMS = 5000;
+const MAX_ITEMS = 100000;
 const REDIRECTS = [301, 302, 303, 307, 308];
 
 const oneLine = (s, n) => { const t = String(s || "").replace(/\s+/g, " ").trim(); return t.length > n ? t.slice(0, n) + "..." : t; };
@@ -111,13 +114,14 @@ function createAdapter({ config, http, errors }) {
 	}
 
 	// Every asset of an album, page after page, at most MAX_ITEMS.
-	async function albumAssets(creds, albumId) {
+	async function albumAssets(creds, albumId, { signal = null, progress = null } = {}) {
 		if (typeof albumId !== "string" || !albumId) { throw errors.badArgs("aid: a non-empty string"); }
 		const filterShape = atLeast(await versionFor(creds), config.FILTER_SEARCH_SINCE);
 		const items = [];
 		let next = null;
 		try {
 			do {
+				if (signal && signal.aborted) { throw signal.reason || new Error("aborted"); }
 				const body = filterShape
 					? Object.assign({ filter: { albumIds: { any: [albumId] } }, size: PAGE }, next ? { cursor: next } : {})
 					: { albumIds: [albumId], size: PAGE, page: next ? parseInt(next, 10) : 1 };
@@ -125,6 +129,7 @@ function createAdapter({ config, http, errors }) {
 				const a = (d && d.assets) || {};
 				const got = (Array.isArray(a.items) ? a.items : []).filter((i) => i && typeof i === "object");
 				items.push(...got);
+				if (progress) { progress(items.length); }
 				next = filterShape ? a.nextCursor : a.nextPage;
 				if (!got.length) { break; }
 			} while (next && items.length < MAX_ITEMS);

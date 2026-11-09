@@ -11,7 +11,7 @@
  *   listAlbums { accountId }      -> { albums:[{ aid:0, name:"pCloud", size:{ images } }] }
  *   listPhotos { accountId, aid } -> { photos:[{ pid, src_big, src_small, caption, type:"image", fileName }] }
  * pid is the numeric fileid, which deletePhoto hands to deletefile. src_big/src_small are
- * getfilelink URLs (no token, short-lived), asked for one after the other; fileName keeps the
+ * getfilelink URLs (no token, short-lived), asked for Config.CONCURRENCY at a time; fileName keeps the
  * real name and extension, which the link does not have. A folder that cannot be listed is 0
  * images and no photos, as before; credentials that cannot be found are still an error.
  */
@@ -32,7 +32,7 @@ function isImage(e) {
 const contentsOf = (data) => ((data && data.metadata && Array.isArray(data.metadata.contents)) ? data.metadata.contents : []);
 const why = (e) => (e && (e.result || e.status || e.errorCode)) || e;
 
-function photoMethods({ adapter, withAccount, log = console }) {
+function photoMethods({ config = {}, adapter, withAccount, mapLimit, log = console }) {
 	return {
 		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const album = { aid: ALBUM_FOLDER, name: ALBUM_NAME, size: { images: 0 } };
@@ -44,22 +44,21 @@ function photoMethods({ adapter, withAccount, log = console }) {
 			return { albums: [album] };
 		} },
 
-		// A photo whose link cannot be had is left out.
-		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		// A photo whose link cannot be had is left out. The links, Config.CONCURRENCY at a time.
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p, ctx = {}) => {
 			const aid = (p.aid !== undefined && p.aid !== null) ? p.aid : ALBUM_FOLDER;
 			const { out } = await withAccount(p, async (s) => {
 				let data;
 				try { data = await adapter.listFolderRaw(s, aid); }
 				catch (e) { log.log("pcloud: listPhotos - folder " + aid + " unavailable: " + why(e)); return []; }
-				const photos = [];
-				for (const e of contentsOf(data).filter(isImage)) {
+				const photos = await mapLimit(contentsOf(data).filter(isImage), config.CONCURRENCY, async (e) => {
 					let link = null;
 					try { link = ((await adapter.getFileLink(s, e.fileid)) || {}).url || null; }
 					catch (err) { link = null; }
-					if (!link) { log.log("pcloud: listPhotos - no link for fileid " + e.fileid); continue; }
-					photos.push({ pid: e.fileid, src_big: link, src_small: link, caption: e.name, type: "image", fileName: e.name });
-				}
-				return photos;
+					if (!link) { log.log("pcloud: listPhotos - no link for fileid " + e.fileid); return null; }
+					return { pid: e.fileid, src_big: link, src_small: link, caption: e.name, type: "image", fileName: e.name };
+				}, { signal: ctx.signal, progress: ctx.progress && ((n) => ctx.progress({ photos: n })) });
+				return photos.filter(Boolean);
 			});
 			return { photos: out };
 		} },

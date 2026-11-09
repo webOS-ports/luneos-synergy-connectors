@@ -28,7 +28,7 @@ same Atlas sign-in flow, the same Photos contract.
   still processing, are left out.
 - **A request token lives 5 minutes.** A sign-in that takes longer fails at the last step and
   has to be started again with Sign In.
-- **At most 5000 photos per album**, and 5000 albums, are listed.
+- **Every album and every photo of an album** is listed, up to 100000 of each (a ceiling against a server that pages for ever; past it the rest are left out, and logged). The listing is a job (`_cloudcore/node/jobs.js`): the Photos service asks after it until it is done, so a large album need not be listed within one call.
 - **Not yet run on a device.** The live checks ran the service on a host with node 22; the
   sign-in app through Atlas is Flickr's flow, untried with SmugMug.
 
@@ -48,7 +48,7 @@ same Atlas sign-in flow, the same Photos contract.
 | `getAuthorizeUrl` | auth app | OAuth 1.0a **leg 1** (`getRequestToken`): the consent URL (`Access=Full&Permissions=Read`) and the request token + secret to carry across the login. |
 | `exchangeCode` | account validator | **Leg 3** (`getAccessToken`), then `!authuser`: SmugMug's token reply names no user, and the albums are listed under the user's NickName. Returns `credentials.common` = `{ oauthToken, oauthTokenSecret, userId (NickName), username, fullname }`. |
 | `checkCredentials` | accounts | `!authuser` with the stored token. Tokens do not expire; a failure means access was revoked. |
-| `listAlbums` / `listPhotos` | Photos service | `user/<NickName>!albums`, `album/<AlbumKey>!images` (paged, at most 5000 items). |
+| `listAlbums` / `listPhotos` | Photos service | `user/<NickName>!albums`, `album/<AlbumKey>!images` (paged, at most 100000 items). |
 | `downloadFile` | Photos app | Fetches a photo URL to a local path, unsigned. |
 
 ## Photos

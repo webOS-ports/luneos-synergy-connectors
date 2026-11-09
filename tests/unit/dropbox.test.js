@@ -16,7 +16,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
-const { fakePalmbus, fakeFetch, ask, json } = require("./lib/fakes.js");
+const { fakePalmbus, fakeFetch, ask, json, slowly } = require("./lib/fakes.js");
 
 const SVC = path.join(__dirname, "../../cloud/dropbox/service/com.palm.service.dropbox");
 const service = require(SVC);   // through package.json "main", as the launcher does
@@ -398,7 +398,7 @@ test("listAlbums: a folder that cannot be listed is the album with 0 images; no 
 	assert.strictEqual((await start([], { stored: null }).call("listAlbums", { accountId: "acc" }, PHOTOS)).errorCode, "NO_STORED_CREDENTIALS");
 });
 
-test("listPhotos: one temporary link per image, in turn; an image without a link is left out", async () => {
+test("listPhotos: one temporary link per image, asked in the folder's order; an image without a link is left out", async () => {
 	const { call, requests } = start([
 		["POST", /list_folder$/, () => ({ status: 200, body: { entries: [JPG, FILE, Object.assign({}, JPG, { id: "id:P2", name: "b.png", path_lower: "/camera uploads/b.png" })] } })],
 		["POST", /get_temporary_link$/, (q) => (body(q).path === "/camera uploads/b.png" ? { status: 409, body: {} } : { status: 200, body: { link: "https://dl.example.test/1" } })],
@@ -408,6 +408,18 @@ test("listPhotos: one temporary link per image, in turn; an image without a link
 		caption: "IMG_1.JPG", type: "image", fileName: "IMG_1.JPG" }] });
 	assert.deepStrictEqual(requests.map((q) => q.url.replace(API, "")), ["/files/list_folder", "/files/get_temporary_link", "/files/get_temporary_link"]);
 	assert.deepStrictEqual(body(requests[1]), { path: "/camera uploads/img_1.jpg" });
+});
+
+test("listPhotos: the links Config.CONCURRENCY at a time, the photos in the folder's order", async () => {
+	// Later requests answer first: the photos still come in the folder's order.
+	const imgs = Array.from({ length: 10 }, (_, i) => ({ ".tag": "file", name: "P" + i + ".jpg", id: "id:" + i, path_lower: "/camera uploads/p" + i + ".jpg" }));
+	const links = slowly((q) => ({ status: 200, body: { link: "https://dl.example.test/" + body(q).path.split("/").pop() } }), (q, n) => 40 - 3 * n);
+	const { call } = start([["POST", /list_folder$/, () => ({ status: 200, body: { entries: imgs } })], ["POST", /get_temporary_link$/, links.handler]]);
+	const r = await call("listPhotos", { accountId: "acc", aid: "/Camera Uploads" }, PHOTOS);
+	assert.deepStrictEqual(r.photos.map((p) => p.pid), imgs.map((e) => e.id));
+	assert.deepStrictEqual(r.photos.map((p) => p.src_big), imgs.map((e) => "https://dl.example.test/" + e.path_lower.split("/").pop()));
+	assert.strictEqual(links.max, Config.CONCURRENCY);
+	assert.ok(Config.CONCURRENCY > 1);
 });
 
 test("listPhotos: the listing failing fails the call", async () => {

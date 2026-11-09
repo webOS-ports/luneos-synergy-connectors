@@ -23,6 +23,7 @@ const SVC = path.join(__dirname, "../../cloud/flickr/service/com.palm.service.fl
 const service = require(SVC);   // through package.json "main", as the launcher does
 const Config = require(path.join(SVC, "config.js")).Config;
 const oauth1 = require(path.join(SVC, "oauth1.js"));
+const photos = require(path.join(SVC, "photos.js"));
 const REST = "https://api.flickr.com/services/rest/";
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "flickr-test-"));
@@ -365,6 +366,34 @@ test("listPhotos: a photoset is photosets.getPhotos with its id, encoded and sig
 	// An id that cannot be encoded fails the listing, which is absorbed like any other failure.
 	assert.deepStrictEqual(await call("listPhotos", { accountId: "acc", aid: "\ud800" }, PHOTOS), { returnValue: true, photos: [] });
 	assert.strictEqual(requests.length, 2);
+});
+
+test("listPhotos: every page of an album, page=2 and on; a page that fails is no photos; MAX_PAGES at most", async () => {
+	const photo = (n) => ({ id: String(n), secret: "s", server: "1", title: "", url_b: "https://live.staticflickr.com/1/" + n + "_s_b.jpg" });
+	const answer = (key, pages, fail) => (q) => {
+		const page = Number(query(q.url).page || 1);
+		if (page === fail) { return { status: 200, body: { stat: "fail", code: 105, message: "Service currently unavailable" } }; }
+		return { status: 200, body: { stat: "ok", [key]: { page, pages, perpage: 500, photo: Array.from({ length: page < pages ? 500 : 3 }, (_, i) => photo(page * 1000 + i)) } } };
+	};
+	const all = start([["GET", /rest/, answer("photos", 3)]]);
+	const r = await all.call("listPhotos", { accountId: "acc" }, PHOTOS);
+	assert.strictEqual(r.photos.length, 1003);
+	assert.deepStrictEqual(all.requests.map((q) => query(q.url).page), [undefined, "2", "3"]);
+	assert.ok(all.requests.every((q) => query(q.url).per_page === "500"));
+	all.requests.forEach((q) => assertSigned(q, "tsec-1", "tok-1"));
+
+	const set = start([["GET", /rest/, answer("photoset", 2)]]);
+	assert.strictEqual((await set.call("listPhotos", { accountId: "acc", aid: "721" }, PHOTOS)).photos.length, 503);
+	assert.deepStrictEqual(set.requests.map((q) => [query(q.url).method, query(q.url).photoset_id, query(q.url).page]),
+		[["flickr.photosets.getPhotos", "721", undefined], ["flickr.photosets.getPhotos", "721", "2"]]);
+
+	const broken = start([["GET", /rest/, answer("photoset", 3, 2)]]);
+	assert.deepStrictEqual(await broken.call("listPhotos", { accountId: "acc", aid: "721" }, PHOTOS), { returnValue: true, photos: [] });
+
+	const endless = start([["GET", /rest/, (q) => ({ status: 200, body: { stat: "ok", photos: { page: Number(query(q.url).page || 1), pages: 99999,
+		photo: [photo(Number(query(q.url).page || 1))] } } })]]);
+	assert.strictEqual((await endless.call("listPhotos", { accountId: "acc" }, PHOTOS)).photos.length, photos.MAX_PAGES);
+	assert.strictEqual(endless.requests.length, photos.MAX_PAGES);
 });
 
 test("listPhotos: an album that cannot be listed has no photos (not an error); no credentials is an error", async () => {

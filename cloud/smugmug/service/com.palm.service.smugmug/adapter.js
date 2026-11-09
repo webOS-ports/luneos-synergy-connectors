@@ -10,7 +10,8 @@
  * errorText or the log: an error carries SmugMug's Message alone.
  *
  * Lists come in pages (?start=1&count=N, Response.Pages { Total, Start, Count, NextPage }); all()
- * follows them up to MAX_ITEMS. An _expand'ed object comes beside Response, in Expansions keyed
+ * follows them up to MAX_ITEMS (a ceiling against a server that pages for ever, not a limit a real
+ * account reaches), and stops at once when `signal` aborts. An _expand'ed object comes beside Response, in Expansions keyed
  * by its Uri, so albumImages asks for LargestImage in the same request and puts its Url on each
  * image as LargestImageUrl.
  *
@@ -26,7 +27,7 @@
 const ERROR = "SMUGMUG_HTTP_ERROR";
 const ACCOUNTS = "luna://com.palm.service.accounts/";
 const PAGE = 100;
-const MAX_ITEMS = 5000;
+const MAX_ITEMS = 100000;
 
 const oneLine = (s, n) => { const t = String(s || "").replace(/\s+/g, " ").trim(); return t.length > n ? t.slice(0, n) + "..." : t; };
 
@@ -96,14 +97,16 @@ function createAdapter({ config, http, errors, oauth1 }) {
 
 	// Every item of a paged list (Response[key]), page after page, at most MAX_ITEMS; each item
 	// through each(item, expansions) when given.
-	async function all(path, params, creds, key, each) {
+	async function all(path, params, creds, key, each, { signal = null, progress = null } = {}) {
 		const items = [];
 		for (let start = 1; items.length < MAX_ITEMS;) {
+			if (signal && signal.aborted) { throw signal.reason || new Error("aborted"); }
 			const data = await call(path, Object.assign({}, params, { start: String(start), count: String(PAGE) }), creds);
 			const resp = data.Response;
 			const exp = (data.Expansions && typeof data.Expansions === "object") ? data.Expansions : {};
 			const got = (Array.isArray(resp[key]) ? resp[key] : []).filter((i) => i && typeof i === "object");
 			items.push(...(each ? got.map((i) => each(i, exp)) : got));
+			if (progress) { progress(items.length); }
 			const pages = resp.Pages || {};
 			if (!got.length || !pages.NextPage || items.length >= (parseInt(pages.Total, 10) || 0)) { break; }
 			start += got.length;
@@ -115,9 +118,9 @@ function createAdapter({ config, http, errors, oauth1 }) {
 		call, get, all,
 		// The user the token is for: { NickName, Name, ... }.
 		authUser: async (creds) => (await get("/api/v2!authuser", null, creds)).User || {},
-		albums: (creds, nick) => all("/api/v2/user/" + segment(errors, "user", nick) + "!albums", null, creds, "Album"),
-		albumImages: (creds, albumKey) => all("/api/v2/album/" + segment(errors, "aid", albumKey) + "!images",
-			{ _expand: "LargestImage" }, creds, "AlbumImage", withLargest),
+		albums: (creds, nick, opts) => all("/api/v2/user/" + segment(errors, "user", nick) + "!albums", null, creds, "Album", null, opts),
+		albumImages: (creds, albumKey, opts) => all("/api/v2/album/" + segment(errors, "aid", albumKey) + "!images",
+			{ _expand: "LargestImage" }, creds, "AlbumImage", withLargest, opts),
 	};
 }
 

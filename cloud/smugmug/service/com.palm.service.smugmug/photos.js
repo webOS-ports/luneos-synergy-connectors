@@ -21,6 +21,8 @@
  */
 "use strict";
 
+const { MAX_ITEMS } = require("./adapter.js");
+
 const TIMEOUT_MS = 300000;
 
 const why = (e) => (e && (e.status || e.errorCode || e.message)) || e;
@@ -51,11 +53,14 @@ async function nickOf(api, creds) {
 
 function photoMethods({ api, resolve, log = console }) {
 	return {
-		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p, ctx = {}) => {
 			const creds = await resolve(p);
 			let list = [];
-			try { list = await api.albums(creds, await nickOf(api, creds)); }
-			catch (e) { log.log("smugmug: listAlbums - albums unavailable: " + why(e)); }
+			try {
+				list = await api.albums(creds, await nickOf(api, creds), { signal: ctx.signal,
+					progress: ctx.progress && ((n) => ctx.progress({ albums: n })) });
+			} catch (e) { log.log("smugmug: listAlbums - albums unavailable: " + why(e)); }
+			if (list.length >= MAX_ITEMS) { log.log("smugmug: listAlbums - more than " + MAX_ITEMS + " albums, the rest left out"); }
 			const albums = list.filter((a) => str(a.AlbumKey)).map((a) => ({
 				aid: a.AlbumKey,
 				name: str(a.Name) || str(a.Title) || a.AlbumKey,
@@ -64,11 +69,14 @@ function photoMethods({ api, resolve, log = console }) {
 			return { albums };
 		} },
 
-		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p, ctx = {}) => {
 			const creds = await resolve(p);
 			let raw;
-			try { raw = await api.albumImages(creds, p.aid); }
-			catch (e) { log.log("smugmug: listPhotos - album '" + p.aid + "' unavailable: " + why(e)); return { photos: [] }; }
+			try {
+				raw = await api.albumImages(creds, p.aid, { signal: ctx.signal,
+					progress: ctx.progress && ((n) => ctx.progress({ photos: n })) });
+			} catch (e) { log.log("smugmug: listPhotos - album '" + p.aid + "' unavailable: " + why(e)); return { photos: [] }; }
+			if (raw.length >= MAX_ITEMS) { log.log("smugmug: listPhotos - album '" + p.aid + "' has more than " + MAX_ITEMS + " images, the rest left out"); }
 			return { photos: raw.filter(isImage).map(toPhotoEntry).filter(Boolean) };
 		} },
 	};
