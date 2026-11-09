@@ -18,7 +18,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
-const { fakePalmbus, fakeFetch, ask } = require("./lib/fakes.js");
+const { fakePalmbus, fakeFetch, ask, slowly } = require("./lib/fakes.js");
 
 const SVC = path.join(__dirname, "../../cloud/koofr/service/com.palm.service.koofr");
 const service = require(SVC);   // through package.json "main", as the launcher does
@@ -422,7 +422,7 @@ test("listAlbums: no images anywhere, or nothing listable, is one empty album; n
 	assert.strictEqual((await start([], { stored: null }).call("listAlbums", { accountId: "acc" }, PHOTOS)).errorCode, "NO_STORED_CREDENTIALS");
 });
 
-test("listPhotos: the aid decoded to the folder, one files/download link per image in turn; one without a link is left out", async () => {
+test("listPhotos: the aid decoded to the folder, one files/download link per image, asked in the folder's order; one without a link is left out", async () => {
 	const { call, requests } = start([
 		["GET", /files\/list/, () => ok({ files: [JPG, FILE, PNG_NO_TYPE, DIR, TIFF] })],
 		["GET", /files\/download/, (r) => (/b\.png$/.test(r.url) ? status(500) : ok({ link: "https://dl.example.test/" + q(new URL(r.url).searchParams.get("path")) }))],
@@ -435,6 +435,30 @@ test("listPhotos: the aid decoded to the folder, one files/download link per ima
 	] });
 	assert.deepStrictEqual(urls(requests), ["GET " + files("list", "/My pictures"), "GET " + files("download", "/My pictures/IMG_1.JPG"),
 		"GET " + files("download", "/My pictures/b.png"), "GET " + files("download", "/My pictures/scan.tiff")]);
+});
+
+test("listPhotos: the links Config.CONCURRENCY at a time, the photos in the folder's order", async () => {
+	// Later requests answer first: the photos still come in the folder's order.
+	const imgs = Array.from({ length: 10 }, (_, i) => Object.assign({}, JPG, { name: "P" + i + ".jpg" }));
+	const links = slowly((r) => ok({ link: "https://dl.example.test/" + q(new URL(r.url).searchParams.get("path")) }), (r, n) => 40 - 3 * n);
+	const { call } = start([["GET", /files\/list/, () => ok({ files: imgs })], ["GET", /files\/download/, links.handler]]);
+	const r = await call("listPhotos", { accountId: "acc", aid: "%2FA" }, PHOTOS);
+	assert.deepStrictEqual(r.photos.map((p) => p.pid), imgs.map((e) => "/A/" + e.name));
+	assert.deepStrictEqual(r.photos.map((p) => p.src_big), imgs.map((e) => "https://dl.example.test/" + q("/A/" + e.name)));
+	assert.strictEqual(links.max, Config.CONCURRENCY);
+	assert.ok(Config.CONCURRENCY > 1);
+});
+
+test("listAlbums: the folders counted Config.CONCURRENCY at a time, in the root's order", async () => {
+	const dirs = Array.from({ length: 9 }, (_, i) => ({ name: "D" + i, type: "dir", size: 0, modified: 1 }));
+	const lists = slowly((r) => {
+		const p = new URL(r.url).searchParams.get("path");
+		return ok({ files: p === "/" ? dirs : Array.from({ length: Number(p.slice(2)) + 1 }, () => JPG) });
+	}, (r, n) => (n ? 40 - 3 * n : 1));
+	const { call } = start([["GET", /files\/list/, lists.handler]]);
+	const r = await call("listAlbums", { accountId: "acc" }, PHOTOS);
+	assert.deepStrictEqual(r.albums.map((a) => [a.name, a.size.images]), dirs.map((d, i) => [d.name, i + 1]));
+	assert.strictEqual(lists.max, Config.CONCURRENCY);
 });
 
 test("listPhotos: no aid is no photos and asks nobody; a folder that cannot be listed is no photos; an undecodable aid is a path", async () => {

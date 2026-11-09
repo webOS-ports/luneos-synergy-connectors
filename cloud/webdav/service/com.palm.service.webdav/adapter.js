@@ -359,9 +359,10 @@ function createAdapter({ config, http, errors }) {
 		},
 
 		// The albums: the photo folder itself when it holds images, then each folder in it that
-		// does (sorted by name, at most PHOTO_MAX_ALBUMS looked at). -> [{ aid, name, images }]
+		// does (sorted by name, at most PHOTO_MAX_ALBUMS looked at, and logged past that; listed
+		// `mapLimit` CONCURRENCY at a time when given). -> [{ aid, name, images }]
 		// A photo folder that is not there is no albums; one album that cannot be listed is left out.
-		async photoAlbums(s, log = console) {
+		async photoAlbums(s, log = console, { mapLimit = null, signal = null, progress = null } = {}) {
 			const top = adapter.photoFolder(s);
 			let entries;
 			try { entries = (await adapter.listFolder(s, top)).entries; }
@@ -369,14 +370,18 @@ function createAdapter({ config, http, errors }) {
 			const albums = [];
 			const here = entries.filter(isImage).length;
 			if (here) { albums.push({ aid: top, name: top === "/" ? (config.DISPLAY_NAME || "WebDAV") : leaf(top), images: here }); }
-			const folders = entries.filter((e) => e.type === "folder").sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0))
-				.slice(0, config.PHOTO_MAX_ALBUMS || 50);
-			for (const f of folders) {
-				try {
-					const n = (await adapter.listFolder(s, f.id)).entries.filter(isImage).length;
-					if (n) { albums.push({ aid: f.id, name: f.name, images: n }); }
-				} catch (e) { log.log("webdav: album " + f.id + " unavailable: " + ((e && (e.status || e.errorCode)) || e)); }
-			}
+			const max = config.PHOTO_MAX_ALBUMS || 20000;
+			const all = entries.filter((e) => e.type === "folder").sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
+			if (all.length > max) { log.log("webdav: " + all.length + " album folders, the first " + max + " only"); }
+			const folders = all.slice(0, max);
+			const count = async (f) => {
+				try { return (await adapter.listFolder(s, f.id)).entries.filter(isImage).length; }
+				catch (e) { log.log("webdav: album " + f.id + " unavailable: " + ((e && (e.status || e.errorCode)) || e)); return 0; }
+			};
+			const counts = mapLimit
+				? await mapLimit(folders, config.CONCURRENCY, count, { signal, progress })
+				: await folders.reduce(async (acc, f) => (await acc).concat(await count(f)), Promise.resolve([]));
+			folders.forEach((f, i) => { if (counts[i]) { albums.push({ aid: f.id, name: f.name, images: counts[i] }); } });
 			return albums;
 		},
 

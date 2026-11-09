@@ -36,11 +36,12 @@ var Config = {
 	},
 
 	// Photos: the folder Photos reads. Its images are one album and each folder in it another
-	// (one level down, at most PHOTO_MAX_ALBUMS); uploads with no album go to PHOTO_ALBUM_NAME in it.
+	// (one level down, at most PHOTO_MAX_ALBUMS, logged past that); uploads with no album go to
+	// PHOTO_ALBUM_NAME in it. The listing is a job (_cloudcore jobs.js): it need not fit in one call.
 	// "Photos" is the folder Nextcloud and ownCloud make for a new user.
 	PHOTO_FOLDER:     "Photos",
 	PHOTO_ALBUM_NAME: "Camera Uploads",
-	PHOTO_MAX_ALBUMS: 50,
+	PHOTO_MAX_ALBUMS: 20000,
 	// The Photos service fetches photo URLs with no header, and WebDAV wants Basic auth on every
 	// request, so listPhotos downloads each photo here first and gives file:// links (as cloud/
 	// mega does). The folder is under /media/internal, where the Photos service copies from.
@@ -51,6 +52,8 @@ var Config = {
 
 	// --- _cloudcore generic wiring (read by _cloudcore/node) ----------------------------
 	SERVICE_NAME:  "com.palm.service.webdav",
+	// Photos listings: how many requests (a link per photo, a count per folder) go at once.
+	CONCURRENCY: 4,
 	DISPLAY_NAME:  "WebDAV",
 	STATE:         "webdav",
 	// WebDAV has no OAuth webview: its OWN auth app collects the server, user name and password.

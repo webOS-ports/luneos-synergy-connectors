@@ -52,6 +52,8 @@ var Config = {
 
 	// --- _cloudcore generic wiring (read by _cloudcore/node) ----------------------------
 	SERVICE_NAME:  "com.palm.service.pcloud",
+	// Photos listings: how many requests (a link per photo, a count per folder) go at once.
+	CONCURRENCY: 4,
 	DISPLAY_NAME:  "pCloud",                 // exchangeCode username fallback
 	STATE:         "pcloud",                 // OAuth `state` + Atlas result-key stem
 	// pCloud's auth is LOCAL (region host, no PKCE, no refresh) so _cloudcore/node/oauth.js is

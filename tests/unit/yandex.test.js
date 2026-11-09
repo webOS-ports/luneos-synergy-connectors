@@ -16,7 +16,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
-const { fakePalmbus, fakeFetch, ask } = require("./lib/fakes.js");
+const { fakePalmbus, fakeFetch, ask, slowly } = require("./lib/fakes.js");
 
 const SVC = path.join(__dirname, "../../cloud/yandex/service/com.palm.service.yandexdisk");
 const service = require(SVC);   // through package.json "main", as the launcher does
@@ -457,7 +457,7 @@ test("listAlbums: no photostream, or one not there, or no disk.info: disk:/Pictu
 	assert.strictEqual((await start([], { stored: null }).call("listAlbums", { accountId: "acc" }, PHOTOS)).errorCode, "NO_STORED_CREDENTIALS");
 });
 
-test("listPhotos: the aid as disk:/<aid>; one download href per image, in turn; an image without one is left out", async () => {
+test("listPhotos: the aid as disk:/<aid>; one download href per image, asked in the folder's order; an image without one is left out", async () => {
 	const t = scripted([
 		[list("disk:/Pictures"), ok({ _embedded: { items: [jpg("disk:/Pictures/a.jpg"), res("disk:/Pictures/d.pdf", "file"), jpg("disk:/Pictures/b.jpg")], total: 3 } })],
 		[`GET ${API}/resources/download?path=${enc("disk:/Pictures/a.jpg")}`, ok(link(DL))],
@@ -467,6 +467,19 @@ test("listPhotos: the aid as disk:/<aid>; one download href per image, in turn; 
 	assert.deepStrictEqual(await call("listPhotos", { accountId: "acc", aid: "Pictures" }, PHOTOS), { returnValue: true, photos: [
 		{ pid: "disk:/Pictures/a.jpg", src_big: DL, src_small: DL, caption: "a.jpg", type: "image", fileName: "a.jpg" }] });
 	assert.strictEqual(t.left.length, 0);
+});
+
+test("listPhotos: the links Config.CONCURRENCY at a time, the photos in the folder's order", async () => {
+	// Later requests answer first: the photos still come in the folder's order.
+	const imgs = Array.from({ length: 10 }, (_, i) => jpg("disk:/Pictures/p" + i + ".jpg"));
+	const links = slowly((q) => ok(link("https://downloader.disk.yandex.ru/" + new URL(q.url).searchParams.get("path").split("/").pop())), (q, n) => 40 - 3 * n);
+	const { call } = start([["GET", /\/resources\/download\?/, links.handler],
+		["GET", /\/resources\?path=/, () => ok({ _embedded: { items: imgs, total: imgs.length } })]]);
+	const r = await call("listPhotos", { accountId: "acc", aid: "Pictures" }, PHOTOS);
+	assert.deepStrictEqual(r.photos.map((p) => p.pid), imgs.map((e) => e.path));
+	assert.deepStrictEqual(r.photos.map((p) => p.src_big), imgs.map((e) => "https://downloader.disk.yandex.ru/" + e.name));
+	assert.strictEqual(links.max, Config.CONCURRENCY);
+	assert.ok(Config.CONCURRENCY > 1);
 });
 
 test("listPhotos: no aid is no photos and no request; the listing failing fails the call", async () => {

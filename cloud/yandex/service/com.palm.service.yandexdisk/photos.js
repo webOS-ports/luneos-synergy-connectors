@@ -27,7 +27,7 @@ function isImage(e) {
 	return IMAGE_RE.test(e.name || "");
 }
 
-function photoMethods({ adapter, withAccount, log = console }) {
+function photoMethods({ config = {}, adapter, withAccount, mapLimit, log = console }) {
 	return {
 		// The album is always there: a folder that is missing or cannot be listed shows as 0
 		// images. Credentials that cannot be found are still an error.
@@ -44,20 +44,19 @@ function photoMethods({ adapter, withAccount, log = console }) {
 		} },
 
 		// No aid is no photos. A photo whose link cannot be had is left out; the listing failing
-		// fails the call.
-		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		// fails the call. The links, Config.CONCURRENCY at a time.
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p, ctx = {}) => {
 			if (p.aid === undefined || p.aid === null || p.aid === "") { return { photos: [] }; }
 			const { out } = await withAccount(p, async (s) => {
 				const { entries } = await adapter.listFolder(s, p.aid);
-				const photos = [];
-				for (const e of (entries || []).filter(isImage)) {
+				const photos = await mapLimit((entries || []).filter(isImage), config.CONCURRENCY, async (e) => {
 					let link = null;
 					try { link = (await adapter.getTemporaryLink(s, e.path)).link || null; }
 					catch (err) { link = null; }
-					if (!link) { log.log("yandex: listPhotos - no temporary link for " + e.path); continue; }
-					photos.push({ pid: e.path, src_big: link, src_small: link, caption: e.name, type: "image", fileName: e.name });
-				}
-				return photos;
+					if (!link) { log.log("yandex: listPhotos - no temporary link for " + e.path); return null; }
+					return { pid: e.path, src_big: link, src_small: link, caption: e.name, type: "image", fileName: e.name };
+				}, { signal: ctx.signal, progress: ctx.progress && ((n) => ctx.progress({ photos: n })) });
+				return photos.filter(Boolean);
 			});
 			return { photos: out };
 		} },

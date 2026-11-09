@@ -18,7 +18,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
-const { fakePalmbus, fakeFetch, ask } = require("./lib/fakes.js");
+const { fakePalmbus, fakeFetch, ask, slowly } = require("./lib/fakes.js");
 
 const SVC = path.join(__dirname, "../../cloud/pcloud/service/com.palm.service.pcloud");
 const service = require(SVC);   // through package.json "main", as the launcher does
@@ -398,7 +398,19 @@ test("listAlbums: the root (folderid 0) as one album, 'pCloud', counting its ima
 	assert.strictEqual((await start([], { stored: null }).call("listAlbums", { accountId: "acc" }, PHOTOS)).errorCode, "NO_STORED_CREDENTIALS");
 });
 
-test("listPhotos: one getfilelink per image, in turn, pid the fileid; one without a link is left out; a listing failure is no photos", async () => {
+test("listPhotos: the links Config.CONCURRENCY at a time, the photos in the folder's order", async () => {
+	// Later requests answer first: the photos still come in the folder's order.
+	const imgs = Array.from({ length: 10 }, (_, i) => ({ isfolder: false, fileid: 100 + i, name: "P" + i + ".jpg", contenttype: "image/jpeg" }));
+	const links = slowly((r) => ok({ hosts: ["c.example.test"], path: "/p" + new URL(r.url).searchParams.get("fileid") }), (r, n) => 40 - 3 * n);
+	const { call } = start([["GET", /listfolder/, () => ok({ metadata: { contents: imgs } })], ["GET", /getfilelink/, links.handler]]);
+	const r = await call("listPhotos", { accountId: "acc", aid: 0 }, PHOTOS);
+	assert.deepStrictEqual(r.photos.map((p) => p.pid), imgs.map((e) => e.fileid));
+	assert.deepStrictEqual(r.photos.map((p) => p.src_big), imgs.map((e) => "https://c.example.test/p" + e.fileid));
+	assert.strictEqual(links.max, Config.CONCURRENCY);
+	assert.ok(Config.CONCURRENCY > 1);
+});
+
+test("listPhotos: one getfilelink per image, asked in the folder's order, pid the fileid; one without a link is left out; a listing failure is no photos", async () => {
 	const { call, requests } = start([
 		["GET", /listfolder/, () => ok({ metadata: { contents: [JPG, FILE, HEIC, PNG] } })],
 		["GET", /getfilelink/, (r) => (new URL(r.url).searchParams.get("fileid") === "12" ? apiErr(2009, "File not found.") : ok({ hosts: ["c.example.test"], path: "/p" + new URL(r.url).searchParams.get("fileid") }))],

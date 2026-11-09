@@ -16,7 +16,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
-const { fakePalmbus, fakeFetch, ask } = require("./lib/fakes.js");
+const { fakePalmbus, fakeFetch, ask, slowly } = require("./lib/fakes.js");
 
 const SVC = path.join(__dirname, "../../cloud/webdav/service/com.palm.service.webdav");
 const service = require(SVC);   // through package.json "main", as the launcher does
@@ -576,6 +576,38 @@ test("webdav listAlbums: an account's own photo folder; none at all is the empty
 	r = await start(server({ "/Photos/A/a.jpg": 1, "/Photos/B/b.jpg": 1 }, { hook: (q, rel) => (rel === "/Photos/A/" ? { status: 500, body: "" } : null) }).reply)
 		.call("listAlbums", { accountId: "acc" }, PHOTOS);
 	assert.deepStrictEqual(r.albums.map((a) => a.aid), ["/Photos/B/"]);
+});
+
+test("webdav listAlbums: every folder, not the first 50, counted Config.CONCURRENCY at a time; past PHOTO_MAX_ALBUMS logged", async () => {
+	const files = {};
+	for (let i = 0; i < 60; i++) { files["/Photos/A" + String(i).padStart(2, "0") + "/x.jpg"] = 1; }
+	const srv = server(files);
+	const slow = slowly((q) => srv.reply(q), (q, n) => (n ? 20 - (n % 7) : 1));
+	const { call } = start(slow.handler);
+	const r = await call("listAlbums", { accountId: "acc" }, PHOTOS);
+	assert.deepStrictEqual(r.albums.map((a) => a.name), Object.keys(files).map((f) => f.split("/")[2]));
+	assert.strictEqual(slow.max, Config.CONCURRENCY);
+	const keep = Config.PHOTO_MAX_ALBUMS;
+	Config.PHOTO_MAX_ALBUMS = 10;
+	try {
+		const logs = [];
+		const few = await start(server(files).reply, { logs }).call("listAlbums", { accountId: "acc" }, PHOTOS);
+		assert.strictEqual(few.albums.length, 10);
+		assert.ok(logs.some((l) => /60 album folders, the first 10 only/.test(l)), logs.join("\n"));
+	} finally { Config.PHOTO_MAX_ALBUMS = keep; }
+});
+
+test("webdav listPhotos: the downloads Config.CONCURRENCY at a time, the photos in the folder's order", async () => {
+	const files = {};
+	for (let i = 0; i < 10; i++) { files["/Photos/T/p" + i + ".jpg"] = JPG(50 + i); }
+	const srv = server(files);
+	const gets = slowly((q) => srv.reply(q), (q, n) => 30 - 2 * n);
+	const { call } = start((q) => (q.method === "GET" ? gets.handler(q) : srv.reply(q)));
+	const r = await call("listPhotos", { accountId: "acc", aid: "/Photos/T/" }, PHOTOS);
+	assert.deepStrictEqual(r.photos.map((p) => p.pid), Object.keys(files));
+	r.photos.forEach((p, i) => assert.ok(fs.readFileSync(p.src_big.slice(7)).equals(files[p.pid]), "photo " + i));
+	assert.strictEqual(gets.max, Config.CONCURRENCY);
+	assert.ok(Config.CONCURRENCY > 1);
 });
 
 test("webdav listPhotos: each image copied to a local file, handed as a temporary file:// link", async () => {
