@@ -50,7 +50,7 @@ function photoMethods({ core, config, adapter, store, oauth, withAccount, log = 
 	}
 
 	return {
-		listAlbums: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const { out } = await withAccount(p, async (s) => {
 				const albums = [];
 				const top = await entriesOr(s, config.ROOT_FOLDER);
@@ -69,7 +69,7 @@ function photoMethods({ core, config, adapter, store, oauth, withAccount, log = 
 
 		// No aid (the empty album) is no photos, asked of nobody. A folder that cannot be listed
 		// is no photos either; a photo whose link cannot be had is left out.
-		listPhotos: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			if (p.aid === undefined || p.aid === null || p.aid === "") { return { photos: [] }; }
 			const album = aidPath(p.aid);
 			const { out } = await withAccount(p, async (s) => {

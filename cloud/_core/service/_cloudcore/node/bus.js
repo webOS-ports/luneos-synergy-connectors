@@ -15,10 +15,14 @@
  * the method's deadline. The payload must be a JSON object. A method's `allow` is a list of
  * caller globs (* ? as in the account templates, as acl.js matched them); none means open.
  * `quit` and `info` are there for the installer, which asks a service to quit before an update.
+ * A method with `job: true` runs as a job (jobs.js): a caller that says continuable gets
+ * pending and a jobId while it is still working, and comes back for it; a running job keeps the
+ * service from leaving as a request in flight does.
  */
 "use strict";
 
 const { CloudError, toReply, isUnexpected } = require("./errors.js");
+const { createJobs } = require("./jobs.js");
 
 const IDLE_MS = 30000;
 const CALL_TIMEOUT_MS = 30000;
@@ -56,12 +60,15 @@ function decodePayload(text) {
 }
 
 function createBus({ palmbus, name, idleMs = IDLE_MS, callTimeoutMs = CALL_TIMEOUT_MS,
-	exit = (code) => process.exit(code), log = console } = {}) {
+	exit = (code) => process.exit(code), log = console, jobOptions = {} } = {}) {
 	const handle = new palmbus.Handle(name);
 	let methods = {};
 	let inflight = 0;
 	let idle = null;
 	let stopped = false;
+	const jobs = createJobs(Object.assign({ log,
+		hold: () => { inflight++; touch(); },
+		release: () => { inflight--; touch(); } }, jobOptions));
 
 	// The idle clock runs only while no request is being worked on: an upload can take minutes.
 	// Leaving must not drop a request the hub is already sending us, or its caller gets "Message
@@ -133,7 +140,8 @@ function createBus({ palmbus, name, idleMs = IDLE_MS, callTimeoutMs = CALL_TIMEO
 				log.error(name + ": " + method + " did not finish in " + ms + " ms");
 				send({ returnValue: false, errorCode: "TIMEOUT", errorText: method + " timed out after " + Math.round(ms / 1000) + " s" });
 			}, ms);
-			const out = await spec.handler(params, { caller, method, call: bus.call });
+			const ctx = { caller, method, call: bus.call };
+			const out = spec.job ? await jobs.run(spec, params, ctx) : await spec.handler(params, ctx);
 			const reply = Object.assign({ returnValue: true }, (out && typeof out === "object") ? out : {});
 			reply.returnValue = true;
 			send(reply);
@@ -186,8 +194,10 @@ function createBus({ palmbus, name, idleMs = IDLE_MS, callTimeoutMs = CALL_TIMEO
 			});
 		},
 
-		// Tests: stop the idle clock.
-		stop() { stopped = true; if (idle) { clearTimeout(idle); idle = null; } },
+		// Tests: stop the idle clock, give up every job.
+		stop() { stopped = true; if (idle) { clearTimeout(idle); idle = null; } jobs.stop(); },
+
+		jobs,
 
 		get inflight() { return inflight; },
 	};

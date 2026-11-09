@@ -34,7 +34,7 @@ const why = (e) => (e && (e.result || e.status || e.errorCode)) || e;
 
 function photoMethods({ adapter, withAccount, log = console }) {
 	return {
-		listAlbums: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const album = { aid: ALBUM_FOLDER, name: ALBUM_NAME, size: { images: 0 } };
 			const { out } = await withAccount(p, async (s) => {
 				try { return await adapter.listFolderRaw(s, ALBUM_FOLDER); }
@@ -45,7 +45,7 @@ function photoMethods({ adapter, withAccount, log = console }) {
 		} },
 
 		// A photo whose link cannot be had is left out.
-		listPhotos: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const aid = (p.aid !== undefined && p.aid !== null) ? p.aid : ALBUM_FOLDER;
 			const { out } = await withAccount(p, async (s) => {
 				let data;

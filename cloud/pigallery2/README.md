@@ -40,7 +40,7 @@ Flickr carry it too); this connector has no upload method.
   original, byte for byte. A gallery without 1080 among its thumbnail sizes gives its smallest.
 - **Photos only, read-only**: videos are left out (by their metadata, or by name); nothing is
   uploaded. A folder with no photos in it or below it is no album.
-- **At most 500 folders** are read, 4 at a time; the rest are left out (and logged).
+- **Every folder** is read, 4 at a time, up to 20000 (past that the rest are left out, and logged). The walk is a job (`_cloudcore/node/jobs.js`): the Photos service asks after it until it is done, so a large gallery need not be walked within one call.
 - **Only folders**: PiGallery2's saved-search albums, faces and sharing links are not used.
 
 ## Screenshots

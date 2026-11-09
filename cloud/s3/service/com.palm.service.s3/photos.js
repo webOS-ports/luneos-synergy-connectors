@@ -29,7 +29,7 @@ function photoMethods({ adapter, withAccount, log = console }) {
 	return {
 		// The album is always there: a prefix with nothing under it, or one that cannot be
 		// listed, shows as 0 images. Credentials that cannot be found are still an error.
-		listAlbums: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const { out } = await withAccount(p, async (s) => {
 				const album = await adapter.resolvePhotoAlbum(s, log);
 				const aid = String(album.path).replace(/\/+$/, "");
@@ -44,7 +44,7 @@ function photoMethods({ adapter, withAccount, log = console }) {
 		} },
 
 		// No aid is no photos. The listing failing fails the call.
-		listPhotos: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			if (p.aid === undefined || p.aid === null || p.aid === "") { return { photos: [] }; }
 			const prefix = String(p.aid).replace(/\/+$/, "") + "/";
 			const { out } = await withAccount(p, async (s) => {

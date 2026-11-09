@@ -92,7 +92,7 @@ function routes({ tree = TREE, open = false, password = PASSWORD } = {}) {
 
 // The service on a stand-in bus. fetch's init is recorded too (redirect). Accounts:
 // readCredentials gives `stored`. -> { handle, requests, inits, call(method, payload, caller) }
-function start(rts, { stored = STORED, timeouts, now, logs } = {}) {
+function start(rts, { stored = STORED, timeouts, now, logs, jobOptions } = {}) {
 	const f = fakeFetch(rts);
 	const inits = [];
 	const fetch = (url, init = {}) => { inits.push(init); return f.fetch(url, init); };
@@ -101,7 +101,8 @@ function start(rts, { stored = STORED, timeouts, now, logs } = {}) {
 		return { returnValue: false, errorCode: -1, errorText: "Unknown service" };
 	} });
 	const log = { log: (m) => { if (logs) { logs.push(String(m)); } }, error: (m) => { if (logs) { logs.push(String(m)); } } };
-	const s = service.start({ palmbus: pb, fetch, idleMs: 0, exit: () => {}, log, timeouts, now });
+	const s = service.start({ palmbus: pb, fetch, idleMs: 0, exit: () => {}, log, timeouts, now, jobOptions });
+	test.after(() => s.bus.stop());
 	const handle = pb.handles[0];
 	return { s, handle, requests: f.requests, inits, call: (method, payload, caller = {}) => ask(handle, method, payload, caller) };
 }
@@ -326,6 +327,28 @@ test("listAlbums: at most CONCURRENCY folders at a time, at most MAX_ALBUMS fold
 		assert.ok(r.albums.every((a) => !a.parentAid || r.albums.some((b) => b.aid === a.parentAid)), "no album's parent is left out");
 		assert.ok(logs.some((m) => /more than 11 folders/.test(m)));
 	} finally { Config.MAX_ALBUMS = max; }
+});
+
+test("listAlbums: a gallery that takes longer than a call to walk is pending with how many folders are read, then the albums", async () => {
+	const rts = routes();
+	const list = rts[2][2];
+	rts[2] = ["GET", /\/pgapi\/gallery\/content\//, (q) => new Promise((res) => setTimeout(() => res(list(q)), 40))];
+	const { call, requests } = start(rts, { jobOptions: { waitMs: 30 } });
+	const first = await call("listAlbums", { accountId: "acc", continuable: true }, PHOTOS);
+	assert.strictEqual(first.pending, true, JSON.stringify(first));
+	let r = first, polls = 0, seen = 0;
+	while (r.pending) {
+		assert.strictEqual(r.jobId, first.jobId);
+		if (r.progress) { assert.ok(r.progress.folders >= seen, "the count only goes up"); seen = r.progress.folders; }
+		r = await call("listAlbums", { accountId: "acc", continuable: true, jobId: first.jobId }, PHOTOS);
+		polls++;
+	}
+	assert.ok(polls >= 2, "it took more than one call");
+	assert.ok(seen > 0, "and said how far it had got");
+	const plain = await start(routes()).call("listAlbums", { accountId: "acc" }, PHOTOS);
+	assert.deepStrictEqual(r, plain, "the same albums as in one call");
+	const walked = requests.filter((q) => /gallery\/content/.test(q.url)).length;
+	assert.strictEqual(walked, Object.keys(TREE).length, "every folder read once, however often it was asked after");
 });
 
 test("listAlbums: a folder gone since its parent was read is left out; one that cannot be read fails the call", async () => {

@@ -30,7 +30,7 @@ function photoMethods({ adapter, withAccount, log = console }) {
 	return {
 		// The album is always there: a folder that cannot be listed shows as 0 images, so the
 		// source still appears in Photos. Credentials that cannot be found are still an error.
-		listAlbums: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const album = { aid: ALBUM_FOLDER, name: ALBUM_NAME, size: { images: 0 } };
 			const { out } = await withAccount(p, async (s) => {
 				try { return await adapter.listFolder(s, ALBUM_FOLDER); }
@@ -41,7 +41,7 @@ function photoMethods({ adapter, withAccount, log = console }) {
 		} },
 
 		// The listing failing fails the call.
-		listPhotos: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const aid = p.aid || ALBUM_FOLDER;
 			const { out } = await withAccount(p, async (s) => {
 				const data = await adapter.listFolder(s, aid);

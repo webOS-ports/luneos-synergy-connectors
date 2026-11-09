@@ -52,9 +52,10 @@ function createMethods({ api, resolve, log }) {
 }
 
 // A new instance on `palmbus` each time (a test starts many); run() starts the one.
-// timeouts: { timeoutMs, idleTimeoutMs } for http.js; now: the clock the sessions age by.
-function start({ palmbus, fetch, exit, idleMs, log = console, timeouts = {}, now } = {}) {
-	const bus = core.createBus({ palmbus, name: SERVICE_NAME, exit, idleMs, log });
+// timeouts: { timeoutMs, idleTimeoutMs } for http.js; now: the clock the sessions age by;
+// jobOptions: the listings' job clocks (jobs.js; tests shorten them).
+function start({ palmbus, fetch, exit, idleMs, log = console, timeouts = {}, now, jobOptions } = {}) {
+	const bus = core.createBus({ palmbus, name: SERVICE_NAME, exit, idleMs, log, jobOptions });
 	const http = core.createHttp(Object.assign({ fetch, errorCode: createAdapter.ERROR, describe: createAdapter.describe }, timeouts));
 	const api = createAdapter({ config, http, errors: core, now });
 	const resolve = (p) => createAdapter.resolveCredentials(bus.call, core, p);

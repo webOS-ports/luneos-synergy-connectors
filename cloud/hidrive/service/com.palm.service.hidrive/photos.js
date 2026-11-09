@@ -30,7 +30,7 @@ function isImage(e) {
 function photoMethods({ config, adapter, withAccount, log = console }) {
 	return {
 		// Credentials that cannot be found are an error; anything after that shows as no albums.
-		listAlbums: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const { out } = await withAccount(p, async (s) => {
 				try { return await adapter.photoAlbums(s, isImage); }
 				catch (e) { log.log("hidrive: listAlbums - " + ((e && (e.status || e.errorCode)) || e)); return []; }
@@ -41,7 +41,7 @@ function photoMethods({ config, adapter, withAccount, log = console }) {
 		} },
 
 		// No aid (the empty album) is no photos. The listing failing fails the call.
-		listPhotos: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			if (p.aid === undefined || p.aid === null || p.aid === "") { return { photos: [] }; }
 			let aid = String(p.aid);
 			try { aid = decodeURIComponent(aid); } catch (e) { /* a plain path already */ }

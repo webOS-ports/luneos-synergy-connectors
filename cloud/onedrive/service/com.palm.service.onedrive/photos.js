@@ -36,7 +36,7 @@ function photoMethods({ adapter, withAccount, log = console }) {
 	});
 
 	return {
-		listAlbums: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const album = { aid: ALBUM_FOLDER, name: ALBUM_NAME, size: { images: 0 } };
 			const { out } = await withAccount(p, (s) => items(s, ALBUM_FOLDER, "listAlbums"));
 			if (out) { album.size.images = out.filter(isImage).length; }
@@ -44,7 +44,7 @@ function photoMethods({ adapter, withAccount, log = console }) {
 		} },
 
 		// An image without a download URL is left out.
-		listPhotos: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const { out } = await withAccount(p, (s) => items(s, p.aid || ALBUM_FOLDER, "listPhotos"));
 			const photos = (out || []).filter(isImage).map((e) => {
 				const url = e["@microsoft.graph.downloadUrl"];

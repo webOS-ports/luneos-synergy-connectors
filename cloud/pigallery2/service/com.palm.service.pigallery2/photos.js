@@ -69,15 +69,17 @@ function toPhotoEntry(config, adapter, server, dir, m) {
 
 function photoMethods({ config, adapter, resolve, CloudError, log = console }) {
 	// Every folder from the top, Config.CONCURRENCY at a time, at most Config.MAX_ALBUMS:
-	// Map path -> { name, parent, images (its own photos), children:[path] }.
-	async function folderTree(creds) {
+	// Map path -> { name, parent, images (its own photos), children:[path] }. `progress` hears
+	// how many folders have been read; once `signal` aborts no folder more is asked for.
+	async function folderTree(creds, { progress = () => {}, signal = null } = {}) {
 		return adapter.withSession(creds, async (cookie) => {
 			const folders = new Map();
 			let capped = false;
 			const queue = [{ path: "", parent: null, name: "" }];
-			let active = 0, failure = null;
+			let active = 0, failure = null, read = 0;
 			await new Promise((resolveAll) => {
 				const pump = () => {
+					if (!failure && signal && signal.aborted) { failure = signal.reason || new Error("aborted"); }
 					if (failure) { if (!active) { resolveAll(); } return; }
 					while (queue.length && active < config.CONCURRENCY) {
 						if (folders.size >= config.MAX_ALBUMS) { capped = true; queue.length = 0; break; }
@@ -86,6 +88,7 @@ function photoMethods({ config, adapter, resolve, CloudError, log = console }) {
 						active++;
 						adapter.directory(creds.server, cookie, f.path).then((d) => {
 							const me = folders.get(f.path);
+							progress({ folders: ++read });
 							if (!d) { folders.delete(f.path); return; }   // gone since its parent was listed
 							me.images = (Array.isArray(d.media) ? d.media : []).filter((m) => isPhoto(config, m)).length;
 							for (const sub of Array.isArray(d.directories) ? d.directories : []) {
@@ -110,9 +113,10 @@ function photoMethods({ config, adapter, resolve, CloudError, log = console }) {
 	}
 
 	return {
-		listAlbums: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		// A job (bus.js): a large gallery takes longer than one call
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p, ctx = {}) => {
 			const creds = await resolve(p);
-			const folders = await folderTree(creds);
+			const folders = await folderTree(creds, { progress: ctx.progress, signal: ctx.signal });
 			// Photos in a folder or below it: a folder with none is left out, and so are its sub-folders.
 			const total = new Map();
 			const count = (path) => {
@@ -135,7 +139,7 @@ function photoMethods({ config, adapter, resolve, CloudError, log = console }) {
 			return { albums };
 		} },
 
-		listPhotos: { timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
 			const dir = folderOf(p.aid);
 			if (dir === null) { throw new CloudError("BAD_ARGS", "aid: a PiGallery2 folder"); }
 			const creds = await resolve(p);

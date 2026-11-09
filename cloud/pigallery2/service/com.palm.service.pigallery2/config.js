@@ -19,8 +19,10 @@ var Config = {
 	// photos with it right after the listing.
 	SESSION_MAX_AGE_MS: 60 * 60 * 1000,
 
-	// Every folder is an album: at most this many folders are read, this many at a time.
-	MAX_ALBUMS:  500,
+	// Every folder is an album: at most this many folders are read, this many at a time. The
+	// walk is a job (_cloudcore jobs.js), so it need not fit in one bus call; the cap is there
+	// for a gallery with a loop or a runaway tree, not to keep the walk short.
+	MAX_ALBUMS:  20000,
 	CONCURRENCY: 4,
 	// The gallery's own top folder, when it has photos itself.
 	ROOT_ALBUM_NAME: "Gallery",
