@@ -755,8 +755,29 @@ enyo.kind({
 		this.done = true;
 		this.stopPoll();
 		if (this._oauthWindow) { this._oauthWindow.close(); this._oauthWindow = null; }
-		mlog("sendResult: " + JSON.stringify(result));
+		mlog("sendResult: " + this.loggableResult(result));
 		try { this.$.crossAppResult.sendResult(result); } catch (e) { mlog("sendResult threw: " + e); }
+	},
+	// The result as it may go to the log: the credentials (tokens, an ARL, a password) by the
+	// names of their fields only. The system log is readable well beyond this app.
+	loggableResult: function (result) {
+		var out = {}, k, c, kind, names;
+		for (k in result) {
+			if (Object.prototype.hasOwnProperty.call(result, k) && k !== "credentials") { out[k] = result[k]; }
+		}
+		if (result && result.credentials) {
+			c = {};
+			for (kind in result.credentials) {
+				if (!Object.prototype.hasOwnProperty.call(result.credentials, kind)) { continue; }
+				names = [];
+				for (k in (result.credentials[kind] || {})) {
+					if (Object.prototype.hasOwnProperty.call(result.credentials[kind], k)) { names.push(k); }
+				}
+				c[kind] = names;
+			}
+			out.credentials = c;
+		}
+		try { return JSON.stringify(out); } catch (e) { return "(unprintable)"; }
 	},
 	removeDone: function () { this.$.crossAppResult.sendResult({ returnValue: false }); },
 	cancel: function () {

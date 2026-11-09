@@ -29,6 +29,7 @@ function load({ plugin }) {
 	const popups = [];
 	const timers = [];
 	const listeners = {};
+	const logs = [];
 	const win = {
 		navigator: { mimeTypes: plugin ? { "application/x-palm-browser": {} } : {} },
 		open(url, name, features) {
@@ -48,12 +49,12 @@ function load({ plugin }) {
 	const enyo = {
 		kind(def) { proto = def; },
 		bind: (self, fn) => fn.bind(self),
-		log() {},
+		log(m) { logs.push(String(m)); },
 		BasicWebView: { prototype: { create() {} } },
 	};
 	win.window = win;
 	win.enyo = enyo;
-	win.console = { log() {} };
+	win.console = { log(m) { logs.push(String(m)); } };
 	vm.createContext(win);
 	for (const f of ["source/oauthWindow.js", "source/musicAuth.js"]) {
 		vm.runInContext(fs.readFileSync(path.join(APP, f), "utf8"), win, { filename: f });
@@ -67,7 +68,7 @@ function load({ plugin }) {
 	// What WAM does for a watched window: a webOSOAuthWindow event in this page.
 	const fire = (state, url) => (listeners.webOSOAuthWindow || []).slice()
 		.forEach((fn) => fn({ detail: { state, url } }));
-	return { card, opened, popups, tick, proto, fire };
+	return { card, opened, popups, tick, proto, fire, logs };
 }
 
 test("depends.js loads oauthWindow.js before musicAuth.js", () => {
@@ -409,4 +410,21 @@ test("spotify: an address that is no app's page connects nothing", () => {
 		assert.strictEqual(card.takeDashboardApp(u, true), false, u);
 	}
 	assert.strictEqual(calls.posted.length, 0);
+});
+
+test("the result goes to the log without the credentials' values", () => {
+	const r = load({ plugin: false });
+	const result = { returnValue: true, templateId: "org.webosports.app.music.spotify", username: "me@example.com",
+		credentials: { common: { accessToken: "AT-secret-value", refreshToken: "RT-secret-value", expiry: "2026-11-09T16:00:00Z" } } };
+	const line = r.card.loggableResult(result);
+	assert.doesNotMatch(line, /secret-value/);
+	assert.match(line, /"accessToken","refreshToken","expiry"/);
+	assert.match(line, /me@example\.com/);
+	assert.ok(r.card.loggableResult({ returnValue: false }).indexOf("credentials") < 0);
+	// and finish() logs that, while sending the credentials themselves
+	r.card.finish(result);
+	assert.strictEqual(r.card.$.crossAppResult.sent[0].credentials.common.refreshToken, "RT-secret-value");
+	// mlog writes to enyo.log and console.log
+	assert.ok(r.logs.some((l) => l.indexOf("sendResult") >= 0));
+	for (const l of r.logs) assert.doesNotMatch(l, /secret-value/);
 });
