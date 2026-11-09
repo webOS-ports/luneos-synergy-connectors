@@ -65,16 +65,25 @@
 			return !!m && !/^(file|about|data|blob|javascript|ws|wss|chrome|filesystem|view-source)$/i.test(m[1]);
 		},
 
+		// A redirect pattern (a PCRE pattern the url must match from its start, for where no
+		// prefix tells the redirect from the pages before it) can only go into the features
+		// without what splits them: commas, white space and "=".
+		patternFits: function (pattern) {
+			return !!pattern && !/[,=\s]/.test(pattern);
+		},
+
 		// The window.open() features: the caller's, plus WAM's redirect watch where it applies.
-		// Chromium lowercases the whole string before WAM sees it; WAM accepts the key and
-		// matches the prefix either way, and reports the redirect with its case intact.
+		// Chromium lowercases the whole string before WAM sees it; WAM accepts the keys and
+		// matches the prefix and the pattern either way, and reports the redirect with its case
+		// intact. A WAM without redirectPattern ignores it and watches nothing for it.
 		features: function (opts) {
-			var f = opts.features || "";
-			if (!this.watchable(opts.redirectPrefix) || f.toLowerCase().indexOf("attributes=") >= 0) {
-				return f;
-			}
-			var watch = "attributes=" + JSON.stringify({ redirectPrefix: opts.redirectPrefix });
-			return f ? f + "," + watch : watch;
+			var f = opts.features || "", watch = {}, any = false;
+			if (f.toLowerCase().indexOf("attributes=") >= 0) { return f; }
+			if (this.watchable(opts.redirectPrefix)) { watch.redirectPrefix = opts.redirectPrefix; any = true; }
+			if (this.patternFits(opts.redirectPattern)) { watch.redirectPattern = opts.redirectPattern; any = true; }
+			if (!any) { return f; }
+			var attrs = "attributes=" + JSON.stringify(watch);
+			return f ? f + "," + attrs : attrs;
 		},
 
 		// A redirect_uri that nothing on the device serves (Box's http://localhost/...) fails to
@@ -91,8 +100,14 @@
 		// A redirect matches when it starts with the expected redirect_uri. With no prefix to go
 		// on, fall back to "carries an OAuth result", which is what the native-scheme providers
 		// give us — the engine reports those URLs verbatim.
-		matches: function (url, prefix) {
+		matches: function (url, prefix, pattern) {
 			if (!url) { return false; }
+			if (pattern) {
+				var re;
+				try { re = new RegExp("^(?:" + pattern + ")", "i"); } catch (e) { return false; }
+				if (!re.test(url)) { return false; }
+				if (!prefix) { return true; }
+			}
 			if (prefix) { return url.indexOf(prefix) === 0; }
 			return url.indexOf("code=") >= 0 || url.indexOf("error=") >= 0;
 		},
@@ -102,6 +117,8 @@
 		 *
 		 *   url             authorize URL to load
 		 *   redirectPrefix  expected redirect_uri; omit to match any URL carrying code=/error=
+ *   redirectPattern a PCRE (and JavaScript) pattern the redirect matches from its start, with
+ *                   no commas, spaces or "=" (see patternFits); with a prefix, both must hold
 		 *   onRedirect(url) called once, with the captured redirect URL
 		 *   onError(msg)    called once, on failure/timeout/user-closed
 		 *   timeoutMs       overall deadline (default 240s, matching the inline WebView flow)
@@ -144,7 +161,7 @@
 
 			function onExternal(ev) {
 				var url = ev && ev.detail && ev.detail.url;
-				if (self.matches(url, opts.redirectPrefix)) { hit(url); }
+				if (self.matches(url, opts.redirectPrefix, opts.redirectPattern)) { hit(url); }
 			}
 
 			function onWatch(ev) {
@@ -191,13 +208,13 @@
 				// A cross-origin location throws (the renderers keep web security); only WAM's
 				// load-error page, same-origin with this one, reads.
 				try { here = self.unwrapLoadError(String(win.location.href)); } catch (e) {}
-				if (self.matches(here, opts.redirectPrefix)) { hit(here); return; }
+				if (self.matches(here, opts.redirectPrefix, opts.redirectPattern)) { hit(here); return; }
 
 				// WAM also stamps the aborted native-scheme URL onto the window, which covers a
 				// redirect that fired before the listener was attached.
 				var stamped = null;
 				try { stamped = win.webOSExternalProtocolUrl || window.webOSExternalProtocolUrl; } catch (e2) {}
-				if (self.matches(stamped, opts.redirectPrefix)) { hit(stamped); return; }
+				if (self.matches(stamped, opts.redirectPrefix, opts.redirectPattern)) { hit(stamped); return; }
 
 				var closed = false;
 				try { closed = win.closed; } catch (e3) {}

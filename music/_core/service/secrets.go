@@ -36,6 +36,7 @@ var secretMu sync.Mutex
 var secretPaths = func() []string {
 	return []string{
 		tokenPath,
+		clientIDPath, // with the token it was issued for (clientid.go)
 		librespotTokenPath,
 		qobuzAuthFile,
 		deezerArlFile,

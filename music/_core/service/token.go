@@ -71,7 +71,7 @@ func (s *savingTokenSource) Token() (*oauth2.Token, error) {
 // only needs the client id + refresh token, no code_verifier.
 func oauthConfig() *oauth2.Config {
 	return &oauth2.Config{
-		ClientID:    cfg.clientID,
+		ClientID:    spotifyClientID(),
 		RedirectURL: cfg.redirectURL,
 		Scopes:      authScopes,
 		Endpoint: oauth2.Endpoint{

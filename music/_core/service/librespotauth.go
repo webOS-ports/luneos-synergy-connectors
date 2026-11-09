@@ -14,7 +14,7 @@ import (
 
 // librespot's own sign-in, chained onto the Spotify one in the same browser window.
 //
-// The token from cfg.clientID drives the Web API, but librespot cannot use it for Connect:
+// The token from the user's client id (clientid.go) drives the Web API, but librespot cannot use it for Connect:
 // its Spirc asks login5 for a token with the stored credentials the access point hands back,
 // and login5 accepts those only under a Spotify client id (it answers INVALID_CREDENTIALS
 // under librespot's id, BAD_REQUEST under ours). So librespot gets a token of its own, from

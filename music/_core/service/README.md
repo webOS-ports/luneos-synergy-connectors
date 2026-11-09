@@ -27,6 +27,19 @@ Status: **compiles clean for host and ARMv7**; the ARM binary runs and binds on
 the topaz TouchPad. API usage (`Search`, `PlayOpt`, `SeekOpt`, `VolumeOpt`,
 `PlayerCurrentlyPlaying`, `spotifyauth`) validated by the compiler.
 
+## Spotify sign-in: the user's own developer app
+
+Spotify keeps a developer app in development mode to five users, and only
+considers lifting that for services with 250k monthly users. Its Web API also
+answers librespot's client id with 429 on every call (tried 2026-11-09). So each
+user registers a free app of their own at developer.spotify.com/dashboard, with
+the redirect URI `http://127.0.0.1:8730/auth/callback` and the Web API, and
+gives its client id in the Spotify account's sign-in (musicauth), which posts
+it to `/auth/client-id` (`clientid.go`). PKCE needs no secret. The client id is
+kept in `spotify-client-id` and keymanager, and changing it signs out the Web
+API session, whose refresh token belongs to the old one. librespot signs in
+under its own client id and is not affected.
+
 ## ⚠️ Runtime prerequisite: `accept4` syscall (kernel one-liner)
 
 On the stock `2.6.35-palm-tenderloin` kernel the service starts, logs
