@@ -19,7 +19,7 @@ import (
 //                                 token, builds the spotify.Client, stores session.
 //   3. app  GET  /auth/status   -> {authenticated: true|false}
 //
-// No client secret is used (PKCE). Configure with -client-id and -redirect.
+// No client secret is used (PKCE). The client id is the user's own app (clientid.go).
 
 type pkceState struct {
 	mu       sync.Mutex
@@ -42,7 +42,7 @@ var authScopes = []string{
 
 func newAuthenticator() *spotifyauth.Authenticator {
 	return spotifyauth.New(
-		spotifyauth.WithClientID(cfg.clientID),
+		spotifyauth.WithClientID(spotifyClientID()),
 		spotifyauth.WithRedirectURL(cfg.redirectURL),
 		spotifyauth.WithScopes(authScopes...),
 	)
@@ -50,8 +50,8 @@ func newAuthenticator() *spotifyauth.Authenticator {
 
 // GET /auth/login -> {authUrl}
 func handleAuthLogin(w http.ResponseWriter, r *http.Request) {
-	if cfg.clientID == "" {
-		httpErr(w, http.StatusPreconditionFailed, "no client id; start the service with -client-id")
+	if spotifyClientID() == "" {
+		httpErr(w, http.StatusPreconditionFailed, "no Spotify client id; give one in the Spotify account's sign-in")
 		return
 	}
 	verifier := oauth2.GenerateVerifier()
@@ -71,8 +71,8 @@ func handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 // user navigation, which always loads — unlike an app relaunch that Atlas may
 // drop). Generates fresh PKCE just like /auth/login.
 func handleLoginRedirect(w http.ResponseWriter, r *http.Request) {
-	if cfg.clientID == "" {
-		http.Error(w, "no client id; start the service with -client-id", http.StatusPreconditionFailed)
+	if spotifyClientID() == "" {
+		http.Error(w, "no Spotify client id; give one in the Spotify account's sign-in", http.StatusPreconditionFailed)
 		return
 	}
 	// Signed in to the Web API already (restored at start-up) but librespot never was: only

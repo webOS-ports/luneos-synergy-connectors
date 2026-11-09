@@ -235,3 +235,148 @@ test("radio: a list the service refuses keeps the card open with its reason", ()
 	other.performPrimary();
 	assert.match(other.$.errorMessage.content, /could not be read/);
 });
+
+// Spotify: the user's own developer app (/auth/client-id), asked for before the sign-in.
+function input(v) {
+	const c = control();
+	c.value = v || "";
+	c.getValue = () => c.value;
+	c.setValue = (x) => { c.value = x; };
+	c.forceFocus = () => {};
+	return c;
+}
+
+function spotifyCard({ app, status, plugin }) {
+	const r = load({ plugin: !!plugin });
+	const { card } = r;
+	for (const n of ["spotifySetup", "changeAppButton", "headerIcon", "title", "removeAccountButton"]) card.$[n] = control();
+	card.$.redirectUri = input();
+	card.$.clientId = input();
+	card.$.headerIcon.setSrc = () => {};
+	card.$.signInButton.setCaption = (v) => { card.$.signInButton.caption = v; };
+	card.$.signInButton.setDisabled = (v) => { card.$.signInButton.disabled = v; };
+	r.calls = { finished: 0, login: 0, attempted: 0, posted: [] };
+	card.get = (url, cb) => {
+		if (url.endsWith("/auth/client-id")) return app ? cb(true, app) : cb(false, null);
+		if (url.endsWith("/auth/status")) return cb(true, status || { authenticated: false, librespot: false });
+		throw new Error("unexpected GET " + url);
+	};
+	card.fetchTokenAndFinish = () => { r.calls.finished++; };
+	card.startLogin = () => { r.calls.login++; };
+	const attempt = card.attemptFinish;
+	card.attemptFinish = function (start) { r.calls.attempted++; return attempt.call(this, start); };
+	card.handleLaunch({ template: { templateId: "org.webosports.app.music.spotify", loc_name: "Spotify" } });
+	return r;
+}
+
+const REDIRECT = "http://127.0.0.1:8730/auth/callback";
+const DASHBOARD = "https://developer.spotify.com/dashboard";
+const ID = "0123456789abcdef0123456789abcdef";
+
+test("spotify: no client id of the user's opens the setup, with the redirect URI to register", () => {
+	const { card, calls } = spotifyCard({ app: { clientId: "", source: "", redirectUri: REDIRECT, dashboardUrl: DASHBOARD } });
+	assert.strictEqual(card.$.spotifySetup.showing, true);
+	assert.strictEqual(card.$.redirectUri.value, REDIRECT);
+	assert.strictEqual(card.$.signInButton.caption, "Save and Connect");
+	assert.strictEqual(card.$.signInButton.disabled, true);
+	assert.strictEqual(calls.attempted, 0);
+	// the field is for copying: an edit is put back
+	card.$.redirectUri.value = "http://example.com/";
+	card.keepRedirectUri();
+	assert.strictEqual(card.$.redirectUri.value, REDIRECT);
+});
+
+test("spotify: only a 32-hex client id enables saving, and it is posted as Spotify writes it", () => {
+	const { card, calls } = spotifyCard({ app: { clientId: "", source: "", redirectUri: REDIRECT, dashboardUrl: DASHBOARD } });
+	for (const bad of ["", "abc", ID + "0", ID.slice(1) + "g", "Client ID " + ID]) {
+		card.$.clientId.value = bad;
+		card.validateInput();
+		assert.strictEqual(card.$.signInButton.disabled, true, bad);
+	}
+	card.$.clientId.value = "  " + ID.toUpperCase() + "\n";
+	card.validateInput();
+	assert.strictEqual(card.$.signInButton.disabled, false);
+	card.post = (url, body, cb) => { calls.posted.push({ url, body }); cb(true, { clientId: ID, source: "device", redirectUri: REDIRECT }); };
+	card.performPrimary();
+	assert.strictEqual(calls.posted.length, 1);
+	assert.strictEqual(calls.posted[0].url, "http://127.0.0.1:8730/auth/client-id");
+	assert.strictEqual(calls.posted[0].body.clientId, ID);
+	assert.strictEqual(card.$.spotifySetup.showing, false);
+	assert.strictEqual(card.$.changeAppButton.showing, true);
+	assert.strictEqual(calls.login, 1);
+});
+
+test("spotify: a client id the backend refuses keeps the setup open with its reason", () => {
+	const { card, calls } = spotifyCard({ app: { clientId: "", source: "", redirectUri: REDIRECT } });
+	card.$.clientId.value = ID;
+	card.post = (url, body, cb) => cb(false, { error: "the service was started with -client-id" });
+	card.performPrimary();
+	assert.strictEqual(calls.login, 0);
+	assert.strictEqual(card.$.spotifySetup.showing, true);
+	assert.match(card.$.errorMessage.content, /-client-id/);
+});
+
+test("spotify: the user's own client id signs in straight away, and can be changed", () => {
+	const { card, calls } = spotifyCard({ app: { clientId: ID, source: "device", redirectUri: REDIRECT },
+		status: { authenticated: true, librespot: true } });
+	assert.notStrictEqual(card.$.spotifySetup.showing, true);
+	assert.strictEqual(card.$.changeAppButton.showing, true);
+	assert.strictEqual(calls.finished, 1);
+	card.changeSpotifyApp();
+	assert.strictEqual(card.$.spotifySetup.showing, true);
+	assert.strictEqual(card.$.clientId.value, ID);
+});
+
+test("spotify: an image's client id finishes a session made with it, and otherwise asks for the user's", () => {
+	let r = spotifyCard({ app: { clientId: ID, source: "image", redirectUri: REDIRECT },
+		status: { authenticated: true, librespot: true } });
+	assert.strictEqual(r.calls.finished, 1);
+	assert.notStrictEqual(r.card.$.spotifySetup.showing, true);
+	r = spotifyCard({ app: { clientId: ID, source: "image", redirectUri: REDIRECT } });
+	assert.strictEqual(r.calls.finished, 0);
+	assert.strictEqual(r.card.$.spotifySetup.showing, true);
+	assert.strictEqual(r.card.$.clientId.value, "", "the image's id is not the user's to keep");
+});
+
+test("spotify: a backend without /auth/client-id signs in as before", () => {
+	const { card, calls } = spotifyCard({ app: null });
+	assert.strictEqual(calls.attempted, 1);
+	assert.notStrictEqual(card.$.spotifySetup.showing, true);
+});
+
+test("spotify: /auth/login without a client id goes back to the setup", () => {
+	const { card, proto } = spotifyCard({ app: { clientId: ID, source: "device", redirectUri: REDIRECT } });
+	card.startLogin = proto.startLogin;
+	card.get = (url, cb) => cb(false, { error: "no Spotify client id" });
+	card.startLogin();
+	assert.strictEqual(card.$.spotifySetup.showing, true);
+});
+
+test("spotify: a cancelled sign-in names INVALID_CLIENT and the redirect URI for the user's app", () => {
+	const { card } = spotifyCard({ app: { clientId: ID, source: "device", redirectUri: REDIRECT } });
+	card.webWindowFailed("Sign-in was cancelled.");
+	assert.match(card.$.errorMessage.content, /INVALID_CLIENT/);
+	assert.ok(card.$.errorMessage.content.indexOf(REDIRECT) >= 0);
+});
+
+test("spotify: the dashboard opens in a window, which cancelling the card closes", () => {
+	const r = spotifyCard({ app: { clientId: "", source: "", redirectUri: REDIRECT, dashboardUrl: DASHBOARD } });
+	r.card.openDashboard();
+	assert.deepStrictEqual(r.opened.map((o) => o.url), [DASHBOARD]);
+	r.card.cancel();
+	assert.strictEqual(r.popups[0].closed, true);
+});
+
+test("spotify (legacy webOS): the app's dashboard page fills its client id in", () => {
+	const { card, opened } = spotifyCard({ plugin: true, app: { clientId: "", source: "", redirectUri: REDIRECT, dashboardUrl: DASHBOARD } });
+	card.openDashboard();
+	assert.strictEqual(opened.length, 0);
+	card.onWebLoad(null, DASHBOARD + "/create");
+	assert.strictEqual(card.$.clientId.value, "");
+	card.onWebLoad(null, DASHBOARD + "/" + ID.toUpperCase() + "/settings");
+	assert.strictEqual(card.$.clientId.value, ID);
+	assert.strictEqual(card.$.signInButton.disabled, false);
+	// one typed in already is left alone
+	card.onWebLoad(null, DASHBOARD + "/fedcba9876543210fedcba9876543210");
+	assert.strictEqual(card.$.clientId.value, ID);
+});

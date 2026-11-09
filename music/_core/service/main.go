@@ -131,21 +131,8 @@ func main() {
 	librespotHeal = newLibrespotHealer()
 	go librespotHeal.watch(nil)
 	cfg.addr = *addr
-	cfg.clientID = *clientID
 	cfg.redirectURL = *redirect
-	clientIDFrom := "-client-id"
-	if cfg.clientID == "" {
-		paths := configPaths("spotify-client-id")
-		if *clientIDFile != "" {
-			paths = []string{*clientIDFile}
-		}
-		cfg.clientID, clientIDFrom = readFirstNonEmpty(paths...)
-	}
-	if cfg.clientID != "" {
-		log.Printf("OAuth client id loaded (%d chars) from %s; redirect=%s", len(cfg.clientID), clientIDFrom, cfg.redirectURL)
-	} else {
-		log.Printf("no client id set — /auth/login will 412 until you provide one")
-	}
+	loadSpotifyClientID(*clientID, *clientIDFile) // clientid.go
 
 	registerProvider(&spotifyProvider{})
 	registerProvider(&youtubeProvider{})
@@ -219,6 +206,7 @@ func main() {
 	mux.HandleFunc("/mediastream", handleMediaStream)                        // Jellyfin/Emby/Plex song, the sign-in added (gst/Qt only)
 	mux.HandleFunc("/mediaart", handleMediaArt)                              // Jellyfin/Emby/Plex cover, the sign-in added
 	mux.HandleFunc("/dzauth/login", withCORS(handleDeezerAuthLogin))         // Deezer email+password -> ARL
+	mux.HandleFunc("/auth/client-id", withCORS(handleClientID))              // the user's own Spotify app (clientid.go)
 	mux.HandleFunc("/auth/login", withCORS(handleAuthLogin))
 	mux.HandleFunc("/auth/callback", handleAuthCallback) // browser redirect target (no CORS)
 	mux.HandleFunc("/auth/done", handleAuthDone)         // where the sign-in window ends up

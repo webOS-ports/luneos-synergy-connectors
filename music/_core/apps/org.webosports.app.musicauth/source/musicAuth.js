@@ -7,7 +7,10 @@
  * for that styling.
  *
  * Per service (serviceId = last dotted segment of the templateId):
- *   spotify -> OAuth (backend /login web flow, poll /auth/status).
+ *   spotify -> OAuth (backend /login web flow, poll /auth/status), through the
+ *              user's own Spotify developer app: Spotify keeps an app in
+ *              development mode to five users, so each user registers one and
+ *              gives its client id here first (/auth/client-id).
  *   tidal   -> device-code, shown WhatsApp "link-code" style (code + instructions);
  *              polls /tidalauth/poll, then names the account with the real username.
  *   qobuz   -> email + password -> /qobuzauth/login.
@@ -72,6 +75,26 @@ enyo.kind({
 		{ kind: "Scroller", flex: 1, components: [
 			// ------- credential / info entry -------
 			{ name: "entryBox", className: "box-center", components: [
+				// Spotify: the user's own developer app, asked for before the sign-in when the
+				// backend has no client id of the user's (setupSpotifyApp).
+				{ name: "spotifySetup", showing: false, components: [
+					{ name: "setupText", className: "accounts-body-text", style: "padding: 12px 16px; line-height: 1.4;", allowHtml: true, content:
+						"Spotify lets one developer app be used by five people only, so you sign in through an app of your own. " +
+						"It is free and takes a minute, here or on a computer:" +
+						"<ol style='margin:8px 0 0; padding-left:22px;'>" +
+						"<li>Open the Spotify dashboard and log in with your Spotify account.</li>" +
+						"<li><b>Create app</b>: any name and description, the redirect URI below, tick <b>Web API</b>, accept the terms and save.</li>" +
+						"<li>Copy the app's <b>Client ID</b> into the box below.</li></ol>" },
+					{ name: "dashboardButton", kind: "Button", caption: "Open Spotify Dashboard", className: "accounts-btn", onclick: "openDashboard" },
+					{ kind: "RowGroup", caption: "REDIRECT URI", className: "accounts-group", components: [
+						{ kind: "Input", name: "redirectUri", spellcheck: false, autocorrect: false,
+						  autoWordComplete: false, autoCapitalize: "lowercase", onchange: "keepRedirectUri" }
+					]},
+					{ kind: "RowGroup", caption: "CLIENT ID", className: "accounts-group", components: [
+						{ kind: "Input", name: "clientId", hint: "32 letters and digits", spellcheck: false,
+						  autocorrect: false, autoWordComplete: false, autoCapitalize: "lowercase", oninput: "validateInput" }
+					]}
+				]},
 				{ name: "serverGroup", showing: false, kind: "RowGroup", caption: "SERVER", className: "accounts-group", components: [
 					{ kind: "Input", name: "server", hint: "nas.local:4533", spellcheck: false,
 					  autocorrect: false, autoWordComplete: false, autoCapitalize: "lowercase", oninput: "validateInput" }
@@ -103,6 +126,8 @@ enyo.kind({
 				{ name: "bodyText", className: "accounts-body-text", style: "padding: 12px 16px; line-height: 1.4;", allowHtml: true, content: "" },
 				{ name: "signInButton", kind: "ActivityButton", caption: "Sign In", disabled: false, active: false,
 				  className: "enyo-button-dark accounts-btn", onclick: "performPrimary" },
+				{ name: "changeAppButton", kind: "Button", caption: "Use a Different Spotify App", showing: false,
+				  className: "accounts-btn", onclick: "changeSpotifyApp" },
 				{ name: "removeAccountButton", kind: "Accounts.RemoveAccount", className: "accounts-btn",
 				  showing: false, style: "padding-top:6px;", onAccountsRemove_Done: "removeDone" }
 			]},
@@ -195,8 +220,7 @@ enyo.kind({
 			case "spotify":
 				this.$.bodyText.setContent("Connect your <b>Spotify</b> account. A sign-in page opens if needed.");
 				this.$.signInButton.setCaption("Connect Spotify");
-				// Backend usually already holds a session — try to finish immediately.
-				this.attemptFinish(false);
+				this.checkSpotifyApp();
 				break;
 			case "tidal":
 				this.$.entryBox.setShowing(false);
@@ -231,6 +255,8 @@ enyo.kind({
 				ok = this.trim(this.$.email.getValue()).length > 0 && this.trim(this.$.password.getValue()).length > 0;
 			}
 			this.$.signInButton.setDisabled(!ok);
+		} else if (this.mode === "spotify" && this._spotifySetup) {
+			this.$.signInButton.setDisabled(!this.clientIdOf(this.$.clientId.getValue()));
 		} else if (this.mode === "subsonic") {
 			// The password as typed: spaces in it are its own.
 			this.$.signInButton.setDisabled(!(this.trim(this.$.server.getValue()) && this.trim(this.$.user.getValue()) &&
@@ -256,7 +282,7 @@ enyo.kind({
 			case "subsonic": this.doSubsonic(); break;
 			case "radio": this.doRadio(); break;
 			case "deezer": this._deezerFallback ? this.doDeezerArl() : this.doDeezer(); break;
-			case "spotify": this.attemptFinish(true); break;
+			case "spotify": this._spotifySetup ? this.saveSpotifyApp() : this.attemptFinish(true); break;
 			default: this.finishService(this.serviceName); // noauth
 		}
 		return true;
@@ -402,6 +428,94 @@ enyo.kind({
 		}));
 	},
 
+	// --- Spotify: the user's own developer app ---
+	// A client id as Spotify gives it (32 hex digits), or "" for anything else.
+	clientIdOf: function (v) {
+		v = this.trim(v).toLowerCase();
+		return /^[0-9a-f]{32}$/.test(v) ? v : "";
+	},
+	// The backend has a client id of the user's: sign in with it (a session it already
+	// holds finishes at once). One built into the image serves Spotify's five users at
+	// most, so without a session made with it the user sets up their own.
+	checkSpotifyApp: function () {
+		this.get(BACKEND + "/auth/client-id", enyo.bind(this, function (ok, j) {
+			if (!ok || !j) {
+				// A backend without /auth/client-id: as before.
+				this.attemptFinish(false);
+				return;
+			}
+			this._spotifyApp = j;
+			if (j.clientId && j.source !== "image") {
+				this.$.changeAppButton.setShowing(j.source === "device");
+				this.attemptFinish(false);
+				return;
+			}
+			this.get(BACKEND + "/auth/status", enyo.bind(this, function (sok, st) {
+				if (sok && st && st.authenticated && st.librespot !== false) { this.fetchTokenAndFinish(); }
+				else { this.setupSpotifyApp(); }
+			}));
+		}));
+	},
+	setupSpotifyApp: function () {
+		var app = this._spotifyApp || {};
+		this._spotifySetup = true;
+		this.$.spotifySetup.setShowing(true);
+		this.$.changeAppButton.setShowing(false);
+		this.$.redirectUri.setValue(app.redirectUri || "");
+		this.$.clientId.setValue(app.source === "device" ? (app.clientId || "") : "");
+		this.$.bodyText.setContent("");
+		this.$.signInButton.setCaption("Save and Connect");
+		this.validateInput();
+	},
+	changeSpotifyApp: function () {
+		this.showError("");
+		this.setupSpotifyApp();
+		return true;
+	},
+	// The field is there to be copied from; an edit to it changes nothing.
+	keepRedirectUri: function () {
+		this.$.redirectUri.setValue((this._spotifyApp && this._spotifyApp.redirectUri) || "");
+	},
+	// The dashboard in a window of its own (the sign-in's, on LuneOS) for as long as the
+	// user needs; closing it brings them back here to paste the client id. No redirect
+	// ends it: the dashboard changes page inside itself, out of WAM's sight.
+	openDashboard: function () {
+		var url = (this._spotifyApp && this._spotifyApp.dashboardUrl) || "https://developer.spotify.com/dashboard";
+		this.showError("");
+		if (window.OAuthWindow && !window.OAuthWindow.hasPluginWebView()) {
+			if (this._dashboardWindow) { this._dashboardWindow.close(); }
+			var self = this;
+			this._dashboardWindow = window.OAuthWindow.open({
+				url: url, name: "spotifyDashboard", redirectPrefix: "about:never", timeoutMs: 30 * 60000,
+				onRedirect: function () { self._dashboardWindow = null; },
+				onError: function () { self._dashboardWindow = null; try { self.$.clientId.forceFocus(); } catch (e) {} }
+			});
+			return true;
+		}
+		this.openWeb(url);
+		return true;
+	},
+	saveSpotifyApp: function () {
+		var id = this.clientIdOf(this.$.clientId.getValue());
+		if (!id) { return; }
+		this.busy(true);
+		this.post(BACKEND + "/auth/client-id", { clientId: id }, enyo.bind(this, function (ok, j) {
+			this.busy(false);
+			if (!(ok && j)) {
+				this.showError((j && j.error) || "The music backend did not keep the client id - try again.");
+				return;
+			}
+			if (this._dashboardWindow) { this._dashboardWindow.close(); this._dashboardWindow = null; }
+			this.teardownWeb();
+			this._spotifyApp = j;
+			this._spotifySetup = false;
+			this.$.spotifySetup.setShowing(false);
+			this.$.changeAppButton.setShowing(true);
+			this.$.signInButton.setCaption("Connect Spotify");
+			this.startLogin();
+		}));
+	},
+
 	// --- Spotify OAuth ---
 	attemptFinish: function (startLoginIfNeeded) {
 		this.get(BACKEND + "/auth/status", enyo.bind(this, function (ok, j) {
@@ -422,9 +536,9 @@ enyo.kind({
 		this.get(BACKEND + "/auth/login", enyo.bind(this, function (ok, j) {
 			if (!ok) {
 				this.busy(false);
+				if (j && j.error && this._spotifyApp) { this.setupSpotifyApp(); return; } // no client id
 				this.showError("Spotify can't be signed in to on this device yet: " +
-					((j && j.error) || "the music backend is not answering") +
-					". The Spotify client id goes in /media/cryptofs/spotify-webos/spotify-client-id.");
+					((j && j.error) || "the music backend is not answering") + ".");
 				return;
 			}
 			this.openWeb(BACKEND + "/login");
@@ -450,10 +564,19 @@ enyo.kind({
 			this.stopPoll();
 			this.teardownWeb();
 			this.busy(false);
-			this.showError("Spotify sign-in timed out. Check that the backend has a valid client id configured (see the sign-in page for details) and try again.");
+			this.showError("Spotify sign-in timed out. " + this.spotifyAppHint());
 			return;
 		}
 		this.attemptFinish(false);
+	},
+
+	// Spotify answers a sign-in to an app it does not know, or one that does not list the
+	// redirect URI, with INVALID_CLIENT on its own page, which this app cannot see.
+	spotifyAppHint: function () {
+		var app = this._spotifyApp;
+		if (!app || app.source !== "device") { return ""; }
+		return "If Spotify said INVALID_CLIENT, check the client ID and that your app lists " +
+			app.redirectUri + " as a redirect URI, or use a different Spotify app.";
 	},
 
 	// --- embedded Atlas/WPE WebView (same lifecycle as spotifyView.js) ---
@@ -531,7 +654,7 @@ enyo.kind({
 		if (this.mode === "spotify") {
 			this.busy(false);
 			this.$.bodyText.setContent("Tap <b>Connect Spotify</b> to sign in.");
-			this.showError(msg);
+			this.showError(msg + " " + this.spotifyAppHint());
 			return;
 		}
 		this.webStatus(msg);
@@ -563,6 +686,13 @@ enyo.kind({
 
 	onWebLoad: function (s, u) {
 		if (u && u.indexOf("/auth/callback") !== -1) { this.$.codeStatus.setContent("Finishing…"); }
+		// The embedded view (legacy webOS) sees the dashboard's pages: an app's own page is
+		// /dashboard/<client id>, so its id fills itself in.
+		var app = this._spotifySetup && /^https:\/\/developer\.spotify\.com\/dashboard\/([0-9a-f]{32})(?:[\/?#]|$)/i.exec(u || "");
+		if (app && !this.clientIdOf(this.$.clientId.getValue())) {
+			this.$.clientId.setValue(app[1].toLowerCase());
+			this.validateInput();
+		}
 		// Tidal PKCE: the login redirects to tidal.com/login/auth?code=… — grab the code.
 		if (this.mode === "tidal" && u && u.indexOf("tidal.com/login/auth") !== -1 && u.indexOf("code=") !== -1) {
 			var code = this._extractParam(u, "code");
@@ -610,7 +740,10 @@ enyo.kind({
 		try { this.$.crossAppResult.sendResult(result); } catch (e) { mlog("sendResult threw: " + e); }
 	},
 	removeDone: function () { this.$.crossAppResult.sendResult({ returnValue: false }); },
-	cancel: function () { this.finish({ returnValue: false }); },
+	cancel: function () {
+		if (this._dashboardWindow) { this._dashboardWindow.close(); this._dashboardWindow = null; }
+		this.finish({ returnValue: false });
+	},
 
 	// --- xhr helpers ---
 	get: function (url, cb) {
