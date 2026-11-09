@@ -115,4 +115,17 @@ function fakeFetch(routes) {
 
 const json = (o) => JSON.parse(JSON.stringify(o));
 
-module.exports = { fakePalmbus, fakeFetch, ask, json };
+// A fakeFetch route handler that answers answer(req) after ms(req, n) (n: the requests before
+// it), counting how many are open at once: { handler, open, max, count }.
+function slowly(answer, ms = () => 15) {
+	const g = { open: 0, max: 0, count: 0 };
+	g.handler = (req) => {
+		const n = g.count++;
+		g.open++;
+		g.max = Math.max(g.max, g.open);
+		return new Promise((resolve) => setTimeout(() => { g.open--; resolve(answer(req)); }, ms(req, n)));
+	};
+	return g;
+}
+
+module.exports = { fakePalmbus, fakeFetch, ask, json, slowly };

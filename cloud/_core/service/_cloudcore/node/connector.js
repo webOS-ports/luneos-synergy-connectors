@@ -12,7 +12,8 @@
  * directory with a package.json, then calls the module's run(appId). Nothing starts on require,
  * so a test can require the service and start() it on a stand-in bus and fetch.
  *
- * deps, for the methods factory: { config, http, adapter, oauth, store, log, withAccount, call }.
+ * deps, for the methods factory: { config, http, adapter, oauth, store, log, withAccount, call,
+ *   mapLimit (pool.js) }.
  * oauth is null for a connector whose Config has no TOKEN_URL (or that passes oauth:false).
  */
 "use strict";
@@ -23,6 +24,7 @@ const { createHttp } = require("./http.js");
 const { createOAuth } = require("./oauth.js");
 const { createAccountStore } = require("./creds.js");
 const { createCommands, createAccountRunner } = require("./commands.js");
+const { mapLimit } = require("./pool.js");
 
 function connector(spec) {
 	const { config } = spec;
@@ -37,7 +39,7 @@ function connector(spec) {
 		const oauth = (spec.oauth === false || !config.TOKEN_URL) ? null : createOAuth({ config, http, random });
 		const adapter = spec.adapter({ config, http, errors });
 		const store = createAccountStore({ call: bus.call, log });
-		const deps = { config, http, adapter, oauth, store, log, call: bus.call,
+		const deps = { config, http, adapter, oauth, store, log, call: bus.call, mapLimit,
 			withAccount: createAccountRunner({ store, oauth }) };
 		const methods = Object.assign(createCommands({ config, adapter, store, oauth }),
 			spec.methods ? spec.methods(deps) : {});
