@@ -28,16 +28,17 @@ function load({ plugin }) {
 	const opened = [];
 	const popups = [];
 	const timers = [];
+	const listeners = {};
 	const win = {
 		navigator: { mimeTypes: plugin ? { "application/x-palm-browser": {} } : {} },
-		open(url, name) {
+		open(url, name, features) {
 			const p = { closed: false, location: { href: url }, close() { p.closed = true; } };
-			opened.push({ url, name });
+			opened.push({ url, name, features });
 			popups.push(p);
 			return p;
 		},
-		addEventListener() {},
-		removeEventListener() {},
+		addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+		removeEventListener(type, fn) { listeners[type] = (listeners[type] || []).filter((f) => f !== fn); },
 		setInterval(fn) { timers.push(fn); return timers.length; },
 		clearInterval() {},
 		setTimeout() { return 0; },
@@ -63,7 +64,10 @@ function load({ plugin }) {
 		"kbButton", "errorBox", "errorMessage", "signInButton"]) card.$[n] = control();
 	card.$.crossAppResult = { sent: [], sendResult(r) { this.sent.push(r); } };
 	const tick = () => timers.slice().forEach((fn) => fn());
-	return { card, opened, popups, tick, proto };
+	// What WAM does for a watched window: a webOSOAuthWindow event in this page.
+	const fire = (state, url) => (listeners.webOSOAuthWindow || []).slice()
+		.forEach((fn) => fn({ detail: { state, url } }));
+	return { card, opened, popups, tick, proto, fire };
 }
 
 test("depends.js loads oauthWindow.js before musicAuth.js", () => {
@@ -362,7 +366,7 @@ test("spotify: a cancelled sign-in names INVALID_CLIENT and the redirect URI for
 test("spotify: the dashboard opens in a window, which cancelling the card closes", () => {
 	const r = spotifyCard({ app: { clientId: "", source: "", redirectUri: REDIRECT, dashboardUrl: DASHBOARD } });
 	r.card.openDashboard();
-	assert.deepStrictEqual(r.opened.map((o) => o.url), [DASHBOARD]);
+	assert.deepStrictEqual(r.opened.map((o) => o.url), [DASHBOARD + "/create"]);
 	r.card.cancel();
 	assert.strictEqual(r.popups[0].closed, true);
 });
@@ -371,6 +375,7 @@ test("spotify (legacy webOS): the app's dashboard page fills its client id in", 
 	const { card, opened } = spotifyCard({ plugin: true, app: { clientId: "", source: "", redirectUri: REDIRECT, dashboardUrl: DASHBOARD } });
 	card.openDashboard();
 	assert.strictEqual(opened.length, 0);
+	assert.strictEqual(card._webUrl, DASHBOARD + "/create");
 	card.onWebLoad(null, DASHBOARD + "/create");
 	assert.strictEqual(card.$.clientId.value, "");
 	card.onWebLoad(null, DASHBOARD + "/" + ID.toUpperCase() + "/settings");
@@ -379,4 +384,29 @@ test("spotify (legacy webOS): the app's dashboard page fills its client id in", 
 	// one typed in already is left alone
 	card.onWebLoad(null, DASHBOARD + "/fedcba9876543210fedcba9876543210");
 	assert.strictEqual(card.$.clientId.value, ID);
+});
+
+test("spotify: WAM is asked to watch for the app's page, whose client id then connects by itself", () => {
+	const r = spotifyCard({ app: { clientId: "", source: "", redirectUri: REDIRECT, dashboardUrl: DASHBOARD } });
+	r.card.openDashboard();
+	// what window.open got: the watch, with the pattern as it goes to WAM
+	const feat = r.opened[0].features;
+	assert.strictEqual(feat, 'attributes={"redirectPattern":"https://developer[.]spotify[.]com/dashboard/([0-9a-f]{32})([/?#]|$)"}');
+	r.calls.posted = [];
+	r.card.post = (url, body, cb) => { r.calls.posted.push(body.clientId); cb(true, { clientId: body.clientId, source: "device", redirectUri: REDIRECT }); };
+	// WAM: watching, then the redirect to the app's page
+	r.fire("watching");
+	r.fire("redirect", DASHBOARD + "/8441944613A24CA4874B640499FCA35E/settings");
+	assert.deepStrictEqual(r.calls.posted, ["8441944613a24ca4874b640499fca35e"]);
+	assert.strictEqual(r.calls.login, 1);
+	assert.strictEqual(r.card.$.spotifySetup.showing, false);
+});
+
+test("spotify: an address that is no app's page connects nothing", () => {
+	const { card, calls } = spotifyCard({ app: { clientId: "", source: "", redirectUri: REDIRECT, dashboardUrl: DASHBOARD } });
+	card.post = () => { calls.posted.push(1); };
+	for (const u of [DASHBOARD, DASHBOARD + "/create", DASHBOARD + "/" + ID + "0", "https://evil.example/" + DASHBOARD + "/" + ID]) {
+		assert.strictEqual(card.takeDashboardApp(u, true), false, u);
+	}
+	assert.strictEqual(calls.posted.length, 0);
 });

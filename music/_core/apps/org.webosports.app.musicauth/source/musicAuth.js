@@ -27,6 +27,11 @@
  */
 var BACKEND = "http://127.0.0.1:8730";
 
+// The page of an app on Spotify's developer dashboard: /dashboard/<its client id>. WAM matches
+// it from the start of the address (redirectPattern), as takeDashboardApp does; window
+// features cannot carry a comma, a space or "=", and the client id is the first group.
+var DASHBOARD_APP_PATTERN = "https://developer[.]spotify[.]com/dashboard/([0-9a-f]{32})([/?#]|$)";
+
 function mlog(s) {
 	try { enyo.log("MUSICAUTH: " + s); } catch (e) {}
 	try { console.log("MUSICAUTH: " + s); } catch (e2) {}
@@ -83,8 +88,10 @@ enyo.kind({
 						"It is free and takes a minute, here or on a computer:" +
 						"<ol style='margin:8px 0 0; padding-left:22px;'>" +
 						"<li>Open the Spotify dashboard and log in with your Spotify account.</li>" +
-						"<li><b>Create app</b>: any name and description, the redirect URI below, tick <b>Web API</b>, accept the terms and save.</li>" +
-						"<li>Copy the app's <b>Client ID</b> into the box below.</li></ol>" },
+						"<li>Create the app: any name and description, the redirect URI below, tick <b>Web API</b>, accept the terms and save. " +
+						"An app made before works as well: open it.</li>" +
+						"<li>The dashboard closes on the app's page and Music connects with it. If it stays open, " +
+						"copy the app's <b>Client ID</b> into the box below.</li></ol>" },
 					{ name: "dashboardButton", kind: "Button", caption: "Open Spotify Dashboard", className: "accounts-btn", onclick: "openDashboard" },
 					{ kind: "RowGroup", caption: "REDIRECT URI", className: "accounts-group", components: [
 						{ kind: "Input", name: "redirectUri", spellcheck: false, autocorrect: false,
@@ -477,22 +484,36 @@ enyo.kind({
 		this.$.redirectUri.setValue((this._spotifyApp && this._spotifyApp.redirectUri) || "");
 	},
 	// The dashboard in a window of its own (the sign-in's, on LuneOS) for as long as the
-	// user needs; closing it brings them back here to paste the client id. No redirect
-	// ends it: the dashboard changes page inside itself, out of WAM's sight.
+	// user needs. An app's own page is /dashboard/<its client id>, where the dashboard goes
+	// once an app is made (or one made before is opened): WAM watches for it, closes the
+	// window there and hands the address over, and the client id is taken from it. A WAM
+	// that cannot watch for it leaves the window to the user, who pastes the client id.
 	openDashboard: function () {
-		var url = (this._spotifyApp && this._spotifyApp.dashboardUrl) || "https://developer.spotify.com/dashboard";
+		var base = (this._spotifyApp && this._spotifyApp.dashboardUrl) || "https://developer.spotify.com/dashboard";
 		this.showError("");
 		if (window.OAuthWindow && !window.OAuthWindow.hasPluginWebView()) {
 			if (this._dashboardWindow) { this._dashboardWindow.close(); }
 			var self = this;
 			this._dashboardWindow = window.OAuthWindow.open({
-				url: url, name: "spotifyDashboard", redirectPrefix: "about:never", timeoutMs: 30 * 60000,
-				onRedirect: function () { self._dashboardWindow = null; },
+				url: base + "/create", name: "spotifyDashboard", timeoutMs: 30 * 60000,
+				redirectPattern: DASHBOARD_APP_PATTERN,
+				onRedirect: function (u) { self._dashboardWindow = null; self.takeDashboardApp(u, true); },
 				onError: function () { self._dashboardWindow = null; try { self.$.clientId.forceFocus(); } catch (e) {} }
 			});
 			return true;
 		}
-		this.openWeb(url);
+		this.openWeb(base + "/create");
+		return true;
+	},
+	// The client id in an address of the dashboard, if it is an app's page: filled in, and
+	// with connect, saved and signed in with at once.
+	takeDashboardApp: function (u, connect) {
+		var m = new RegExp("^(?:" + DASHBOARD_APP_PATTERN + ")", "i").exec(u || "");
+		var id = m && this.clientIdOf(m[1]);
+		if (!id) { return false; }
+		this.$.clientId.setValue(id);
+		this.validateInput();
+		if (connect) { this.saveSpotifyApp(); }
 		return true;
 	},
 	saveSpotifyApp: function () {
@@ -688,10 +709,8 @@ enyo.kind({
 		if (u && u.indexOf("/auth/callback") !== -1) { this.$.codeStatus.setContent("Finishing…"); }
 		// The embedded view (legacy webOS) sees the dashboard's pages: an app's own page is
 		// /dashboard/<client id>, so its id fills itself in.
-		var app = this._spotifySetup && /^https:\/\/developer\.spotify\.com\/dashboard\/([0-9a-f]{32})(?:[\/?#]|$)/i.exec(u || "");
-		if (app && !this.clientIdOf(this.$.clientId.getValue())) {
-			this.$.clientId.setValue(app[1].toLowerCase());
-			this.validateInput();
+		if (this._spotifySetup && !this.clientIdOf(this.$.clientId.getValue())) {
+			this.takeDashboardApp(u, false);
 		}
 		// Tidal PKCE: the login redirects to tidal.com/login/auth?code=… — grab the code.
 		if (this.mode === "tidal" && u && u.indexOf("tidal.com/login/auth") !== -1 && u.indexOf("code=") !== -1) {

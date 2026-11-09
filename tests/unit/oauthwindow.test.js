@@ -191,3 +191,52 @@ for (const file of COPIES) {
 		assert.deepStrictEqual(got, ["Sign-in was cancelled."]);
 	});
 }
+
+// A redirect pattern, for where no prefix tells the redirect from the pages before it
+// (Spotify's developer dashboard: /dashboard/<client id> after /dashboard/create).
+const DASH = "https://developer[.]spotify[.]com/dashboard/([0-9a-f]{32})([/?#]|$)";
+for (const file of COPIES) {
+	const name = path.basename(path.dirname(path.dirname(file)));
+
+	test(`${name}: a redirect pattern goes to WAM, with a prefix or without`, () => {
+		const { OAuthWindow } = load(file);
+		assert.strictEqual(OAuthWindow.features({ redirectPattern: DASH }),
+			"attributes=" + JSON.stringify({ redirectPattern: DASH }));
+		assert.strictEqual(OAuthWindow.features({ redirectPrefix: REDIRECT, redirectPattern: "[^?]*[?]code" }),
+			"attributes=" + JSON.stringify({ redirectPrefix: REDIRECT, redirectPattern: "[^?]*[?]code" }));
+		// what would split the features is no pattern
+		for (const p of ["a,b", "a b", "a=b", "a\tb", ""]) {
+			assert.strictEqual(OAuthWindow.features({ redirectPattern: p }), "", JSON.stringify(p));
+		}
+		assert.strictEqual(OAuthWindow.features({ redirectPrefix: REDIRECT, redirectPattern: "a,b" }),
+			"attributes=" + JSON.stringify({ redirectPrefix: REDIRECT }));
+	});
+
+	test(`${name}: a redirect pattern matches from the start, without regard to case`, () => {
+		const { OAuthWindow } = load(file);
+		const id = "0123456789abcdef0123456789abcdef";
+		assert.ok(OAuthWindow.matches("https://developer.spotify.com/dashboard/" + id, null, DASH));
+		assert.ok(OAuthWindow.matches("https://Developer.Spotify.com/dashboard/" + id.toUpperCase() + "/settings", null, DASH));
+		for (const u of ["https://developer.spotify.com/dashboard/create", "https://developer.spotify.com/dashboard",
+			"https://developer.spotify.com/dashboard/" + id + "0", "https://evil.example/https://developer.spotify.com/dashboard/" + id]) {
+			assert.ok(!OAuthWindow.matches(u, null, DASH), u);
+		}
+		// with a prefix, both hold
+		assert.ok(OAuthWindow.matches(REDIRECT + "?code=1", REDIRECT, "[^?]*[?]code"));
+		assert.ok(!OAuthWindow.matches(REDIRECT + "?state=1", REDIRECT, "[^?]*[?]code"));
+		assert.ok(!OAuthWindow.matches("https://other.example/cb?code=1", REDIRECT, "[^?]*[?]code"));
+		// a pattern JavaScript cannot compile matches nothing
+		assert.ok(!OAuthWindow.matches("https://x/(", null, "https://x/("));
+	});
+
+	test(`${name}: a pattern-watched window hands over the redirect WAM reports`, () => {
+		const { OAuthWindow, wam, popups } = load(file);
+		const got = [];
+		OAuthWindow.open({ url: "https://developer.spotify.com/dashboard/create", redirectPattern: DASH,
+			onRedirect: (u) => got.push(u), onError: (m) => got.push("error: " + m) });
+		assert.match(popups[0].features, /redirectPattern/);
+		wam("watching");
+		wam("redirect", "https://developer.spotify.com/dashboard/0123456789abcdef0123456789abcdef");
+		assert.deepStrictEqual(got, ["https://developer.spotify.com/dashboard/0123456789abcdef0123456789abcdef"]);
+	});
+}
