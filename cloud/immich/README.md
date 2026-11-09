@@ -27,7 +27,7 @@ No upload, no documents/files role.
 - **Photos only, read-only**: videos, trashed assets and hidden ones (the video half of a live
   photo) are left out; nothing is uploaded. An album's count in the list includes its videos
   (Immich does not count them apart).
-- **At most 5000 photos per album** are listed.
+- **Every photo of an album** is listed, up to 100000 (a ceiling against a server that pages for ever; past it the rest are left out, and logged). The listing is a job (`_cloudcore/node/jobs.js`): the Photos service asks after it until it is done, so a large album need not be listed within one call.
 - **Immich versions**: 3.2 and later are asked with the new search shape (`filter`/`cursor`);
   older ones with the flat `albumIds`/`page` one, which Immich will drop in v4; a server whose
   search cannot take an album at all lists it through `GET /albums/<id>`. Only 3.3.5 was tried.

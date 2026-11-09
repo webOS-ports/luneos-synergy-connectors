@@ -8,8 +8,10 @@
  * The albums are PhotoPrism's albums, then its folders (Config.ALBUM_TYPES):
  *   listAlbums { accountId }      -> { albums:[{ aid, name, size:{ images } }] }
  *   listPhotos { accountId, aid } -> { photos:[{ pid, src_big, src_small, caption, type:"image", fileName, createdTime }] }
- * aid and pid are PhotoPrism's uids. A folder's count is not kept by PhotoPrism, so a folder's
- * photos are counted (and an empty folder left out). src_big is the original (/dl/<hash>) where
+ * aid and pid are PhotoPrism's uids. A folder's count is not kept by PhotoPrism (its PhotoCount
+ * is 0), so the folders are counted from one listing of every photo, by each photo's Path: a
+ * folder's search is path:<Path> public:true, that path alone (not its sub-folders) and no
+ * private photo, and the listing is public=true. An empty folder is left out. src_big is the original (/dl/<hash>) where
  * it is a type the Photos app shows (Config.ORIGINAL_MIME_TYPES), else the 1920 px thumbnail;
  * src_small the 720 px one. The Photos service fetches URLs as they are, with no header: these
  * carry the server's download or preview token (from /config, asked on every listing, so a token
@@ -20,6 +22,8 @@
  * found are an error.
  */
 "use strict";
+
+const { MAX_ITEMS } = require("./adapter.js");
 
 const TIMEOUT_MS = 300000;
 const HASH = /^[0-9a-f]{40,64}$/i;
@@ -60,20 +64,30 @@ function toPhotoEntry(config, server, tokens, p) {
 
 function photoMethods({ config, api, resolve, log = console }) {
 	return {
-		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p, ctx = {}) => {
 			const creds = await resolve(p);
 			const albums = [], seen = new Set();
+			const opts = { signal: ctx.signal };
+			let perPath = null;      // Path -> images, read once, for the folders
 			for (const type of config.ALBUM_TYPES) {
 				let list = [];
-				try { list = await api.albums(creds, type); }
+				try { list = await api.albums(creds, type, opts); }
 				catch (e) { log.log("photoprism: listAlbums - " + type + "s unavailable: " + why(e)); continue; }
+				if (list.length >= (config.MAX_ALBUMS || 20000)) { log.log("photoprism: listAlbums - " + type + "s: the first " + list.length + " only, the rest left out"); }
+				if (type === "folder" && list.length) {
+					try {
+						const all = await api.allPhotos(creds, { signal: ctx.signal, progress: ctx.progress && ((n) => ctx.progress({ photos: n })) });
+						if (all.length >= MAX_ITEMS) { log.log("photoprism: listAlbums - more than " + MAX_ITEMS + " photos, the folders counted from those"); }
+						perPath = new Map();
+						for (const x of all) { if (isImage(x)) { perPath.set(str(x.Path), (perPath.get(str(x.Path)) || 0) + 1); } }
+					} catch (e) { log.log("photoprism: listAlbums - folders uncounted, left out: " + why(e)); continue; }
+				}
 				for (const a of list) {
 					if (!UID.test(str(a.UID)) || seen.has(a.UID) || deleted(a.DeletedAt)) { continue; }
 					seen.add(a.UID);
 					let images = parseInt(a.PhotoCount, 10) || 0;
 					if (type === "folder") {
-						try { images = (await api.albumPhotos(creds, a.UID)).filter(isImage).length; }
-						catch (e) { log.log("photoprism: listAlbums - folder unavailable: " + why(e)); continue; }
+						images = perPath.get(str(a.Path)) || 0;
 						if (!images) { continue; }
 					}
 					albums.push({ aid: a.UID, name: str(a.Title) || str(a.Path) || a.UID, size: { images } });
@@ -82,13 +96,14 @@ function photoMethods({ config, api, resolve, log = console }) {
 			return { albums };
 		} },
 
-		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p, ctx = {}) => {
 			const creds = await resolve(p);
 			let raw, cfg;
 			try {
 				cfg = (await api.config(creds)) || {};
-				raw = await api.albumPhotos(creds, p.aid);
+				raw = await api.albumPhotos(creds, p.aid, { signal: ctx.signal, progress: ctx.progress && ((n) => ctx.progress({ photos: n })) });
 			} catch (e) { log.log("photoprism: listPhotos - album unavailable: " + why(e)); return { photos: [] }; }
+			if (raw.length >= MAX_ITEMS) { log.log("photoprism: listPhotos - album '" + p.aid + "' has more than " + MAX_ITEMS + " photos, the rest left out"); }
 			const tokens = { download: str(cfg.downloadToken), preview: str(cfg.previewToken) };
 			if (!tokens.download || !tokens.preview) { log.log("photoprism: listPhotos - the server gives no download/preview token"); return { photos: [] }; }
 			return { photos: raw.map((x) => toPhotoEntry(config, creds.server, tokens, x)).filter(Boolean) };

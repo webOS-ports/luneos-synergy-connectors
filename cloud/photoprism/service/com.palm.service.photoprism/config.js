@@ -22,8 +22,10 @@ var Config = {
 	SCOPE:       "albums config photos",
 
 	// The albums Photos shows: PhotoPrism's albums, then its folders (Library -> Folders).
+	// At most MAX_ALBUMS of each (past that the rest are left out, and logged). The listing is a
+	// job (_cloudcore jobs.js), so it need not fit in one bus call.
 	ALBUM_TYPES: ["album", "folder"],
-	MAX_ALBUMS:  200,
+	MAX_ALBUMS:  20000,
 
 	// Originals of these types go to the Photos app as they are; any other image (HEIC, RAW,
 	// TIFF, SVG, ...) as PhotoPrism's 1920 px JPEG thumbnail.

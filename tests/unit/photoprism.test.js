@@ -268,30 +268,32 @@ test("downloadFile: only the Photos app; the URL fetched as is (its token in it)
 
 // --- photos ---------------------------------------------------------------------------------------
 
-test("listAlbums: albums by name, then folders with their photos counted; deleted, repeated, empty and odd ones left out", async () => {
+test("listAlbums: albums by name, then folders counted from one listing by Path; deleted, repeated, empty and odd ones left out", async () => {
+	// A folder's search is path:<Path> public:true: that path alone, not its sub-folders
 	const { call, requests, handle } = start([
 		["GET", /\/albums\?type=album&/, () => ({ status: 200, body: [album(1, { Title: "Holiday" }), album(2, { Title: "", PhotoCount: "3" }),
 			album(3, { DeletedAt: "2026-08-01T12:00:00Z" }), album(1, { Title: "Holiday again" }), { UID: "../x", Title: "bad" }, null, { Title: "no uid" }] })],
-		["GET", /\/albums\?type=folder&/, () => ({ status: 200, body: [album(4, { Title: "", Path: "2026/Trip", PhotoCount: 0 }), album(5, { Title: "Empty" }), album(1)] })],
-		["GET", new RegExp("/photos\\?merged=true&s=" + uid("a", 4)), () => ({ status: 200, body: [photo(1), photo(2), photo(3, { Type: "video" })] })],
-		["GET", new RegExp("/photos\\?merged=true&s=" + uid("a", 5)), () => ({ status: 200, body: [photo(4, { Type: "video" })] })]]);
+		["GET", /\/albums\?type=folder&/, () => ({ status: 200, body: [album(4, { Title: "", Path: "2026/Trip", PhotoCount: 0 }), album(5, { Title: "Empty", Path: "Empty" }), album(1)] })],
+		["GET", /\/photos\?merged=true&public=true&/, () => ({ status: 200, body: [photo(1, { Path: "2026/Trip" }), photo(2, { Path: "2026/Trip" }),
+			photo(3, { Type: "video", Path: "2026/Trip" }), photo(4, { Type: "video", Path: "Empty" }), photo(5, { Path: "2026/Trip/Day 2" }), photo(6, { Path: "" })] })]]);
 	assert.deepStrictEqual(await call("listAlbums", { accountId: "acc-1" }, PHOTOS), { returnValue: true, albums: [
 		{ aid: uid("a", 1), name: "Holiday", size: { images: 1 } }, { aid: uid("a", 2), name: uid("a", 2), size: { images: 3 } },
 		{ aid: uid("a", 4), name: "2026/Trip", size: { images: 2 } }] });
 	assert.deepStrictEqual(handle.calls, [{ uri: "luna://com.palm.service.accounts/readCredentials", args: { accountId: "acc-1", name: "common" } }]);
 	assert.deepStrictEqual(requests.map((q) => q.url), [
 		API + "/albums?type=album&order=name&count=500&offset=0", API + "/albums?type=folder&order=name&count=500&offset=0",
-		API + "/photos?merged=true&s=" + uid("a", 4) + "&count=500&offset=0", API + "/photos?merged=true&s=" + uid("a", 5) + "&count=500&offset=0"]);
+		API + "/photos?merged=true&public=true&count=500&offset=0"]);
 	assert.ok(requests.every((q) => q.headers.Authorization === "Bearer " + TOKEN));
 });
 
 test("listAlbums: albums or folders that cannot be listed are none; credentials are needed", async () => {
-	const half = start([["GET", /type=album/, () => ({ status: 500, body: {} })], ["GET", /type=folder/, () => ({ status: 200, body: [album(4)] })],
-		["GET", /photos/, () => ({ status: 200, body: [photo(1)] })]]);
+	const half = start([["GET", /type=album/, () => ({ status: 500, body: {} })], ["GET", /type=folder/, () => ({ status: 200, body: [album(4, { Path: "x" })] })],
+		["GET", /photos/, () => ({ status: 200, body: [photo(1, { Path: "x" })] })]]);
 	assert.deepStrictEqual((await half.call("listAlbums", { accountId: "acc" }, PHOTOS)).albums.map((a) => a.aid), [uid("a", 4)]);
-	const folderDown = start([["GET", /type=album/, () => ({ status: 200, body: [] })], ["GET", /type=folder/, () => ({ status: 200, body: [album(4), album(5)] })],
-		["GET", new RegExp(uid("a", 4)), () => ({ status: 500, body: {} })], ["GET", /photos/, () => ({ status: 200, body: [photo(1)] })]]);
-	assert.deepStrictEqual((await folderDown.call("listAlbums", { accountId: "acc" }, PHOTOS)).albums.map((a) => a.aid), [uid("a", 5)]);
+	// The photos cannot be listed: the folders cannot be counted, and are left out; the albums stay
+	const uncounted = start([["GET", /type=album/, () => ({ status: 200, body: [album(1)] })], ["GET", /type=folder/, () => ({ status: 200, body: [album(4, { Path: "x" })] })],
+		["GET", /photos/, () => ({ status: 500, body: {} })]]);
+	assert.deepStrictEqual((await uncounted.call("listAlbums", { accountId: "acc" }, PHOTOS)).albums.map((a) => a.aid), [uid("a", 1)]);
 	const odd = start([["GET", /albums/, () => ({ status: 200, body: { not: "a list" } })]]);
 	assert.deepStrictEqual((await odd.call("listAlbums", { accountId: "acc" }, PHOTOS)).albums, []);
 	assert.strictEqual((await start([], { stored: null }).call("listAlbums", { accountId: "acc" }, PHOTOS)).errorCode, "NO_STORED_CREDENTIALS");
@@ -352,7 +354,8 @@ test("paging stops at MAX_ITEMS, and on a short page", async () => {
 	const albums = start([["GET", /type=album/, (q) => { const off = Number(new URL(q.url).searchParams.get("offset"));
 		return { status: 200, body: Array.from({ length: adapter.PAGE }, (_, i) => album(off + i + 1)) }; }], ["GET", /type=folder/, () => ({ status: 200, body: [] })]]);
 	assert.strictEqual((await albums.call("listAlbums", { accountId: "acc" }, PHOTOS)).albums.length, Config.MAX_ALBUMS);
-	assert.strictEqual(albums.requests.filter((q) => /type=album/.test(q.url)).length, 1);
+	assert.strictEqual(albums.requests.filter((q) => /type=album/.test(q.url)).length, Config.MAX_ALBUMS / adapter.PAGE);
+	assert.ok(!albums.requests.some((q) => /\/api\/v1\/photos/.test(q.url)), "no folders: the photos are not listed to count them");
 });
 
 test("photos.js: Go's zero time is not deleted; the primary file, else the one with the photo's hash, else the first", () => {

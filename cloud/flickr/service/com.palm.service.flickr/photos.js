@@ -11,7 +11,8 @@
  *   listPhotos { accountId, aid } -> { photos:[{ pid, src_big, src_small, caption, type:"image", fileName }] }
  * src_big/src_small are live.staticflickr.com URLs that need no token (the id_secret pair is
  * the capability), from the extras the listing inlines; fileName is <id>.<ext>, as a Flickr
- * photo has no file name. Videos are left out.
+ * photo has no file name. Videos are left out. An album comes 500 photos a page, and every page
+ * is read (at most MAX_PAGES, a ceiling against a server that pages for ever).
  *
  * Failures are absorbed as before, so the source stays in Photos: photosets that cannot be
  * listed leave only "All Photos", a count that cannot be read is 0, and an album that cannot
@@ -22,6 +23,7 @@
 const ALL_PHOTOS_AID = "__all__";
 const ALL_PHOTOS_NAME = "All Photos";
 const TIMEOUT_MS = 300000;
+const MAX_PAGES = 200;
 
 const why = (e) => (e && (e.status || e.errorCode || e.message)) || e;
 
@@ -55,6 +57,21 @@ function toPhotoEntry(p) {
 
 const list = (v) => (Array.isArray(v) ? v : []);
 
+// Every page of a listing: fetch(page) answers { <key>: { page, pages, photo:[] } }.
+async function allPages(fetch, key, { signal = null, progress = null, log = console, what = "" } = {}) {
+	const out = [];
+	for (let page = 1; ; page++) {
+		if (signal && signal.aborted) { throw signal.reason || new Error("aborted"); }
+		const box = ((await fetch(page)) || {})[key] || {};
+		const got = list(box.photo);
+		out.push(...got);
+		if (progress) { progress(out.length); }
+		if (!got.length || page >= (parseInt(box.pages, 10) || 1)) { break; }
+		if (page >= MAX_PAGES) { log.log("flickr: listPhotos - " + what + ": the first " + MAX_PAGES + " pages only, the rest left out"); break; }
+	}
+	return out;
+}
+
 function photoMethods({ api, resolve, log = console }) {
 	return {
 		listAlbums: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
@@ -74,17 +91,21 @@ function photoMethods({ api, resolve, log = console }) {
 			return { albums };
 		} },
 
-		// people.getPhotos answers data.photos.photo[], photosets.getPhotos data.photoset.photo[].
-		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p) => {
+		// people.getPhotos answers data.photos.photo[], photosets.getPhotos data.photoset.photo[],
+		// a page at a time.
+		listPhotos: { job: true, timeoutMs: TIMEOUT_MS, handler: async (p, ctx = {}) => {
 			const aid = p.aid || ALL_PHOTOS_AID;
 			const creds = await resolve(p);
-			let data;
-			try { data = (await (aid === ALL_PHOTOS_AID ? api.allPhotos(creds, "500") : api.photosetPhotos(creds, aid))) || {}; }
-			catch (e) { log.log("flickr: listPhotos - album '" + aid + "' unavailable: " + why(e)); return { photos: [] }; }
-			const raw = list((data.photos && data.photos.photo) || (data.photoset && data.photoset.photo));
+			const all = aid === ALL_PHOTOS_AID;
+			let raw;
+			try {
+				raw = await allPages((page) => (all ? api.allPhotos(creds, "500", page) : api.photosetPhotos(creds, aid, page)),
+					all ? "photos" : "photoset", { signal: ctx.signal, log, what: "album '" + aid + "'",
+						progress: ctx.progress && ((n) => ctx.progress({ photos: n })) });
+			} catch (e) { log.log("flickr: listPhotos - album '" + aid + "' unavailable: " + why(e)); return { photos: [] }; }
 			return { photos: raw.filter(isImage).map(toPhotoEntry).filter(Boolean) };
 		} },
 	};
 }
 
-module.exports = Object.assign(photoMethods, { ALL_PHOTOS_AID, ALL_PHOTOS_NAME, resolveDownloadUrl, fileNameFor, isImage, toPhotoEntry });
+module.exports = Object.assign(photoMethods, { MAX_PAGES, allPages, ALL_PHOTOS_AID, ALL_PHOTOS_NAME, resolveDownloadUrl, fileNameFor, isImage, toPhotoEntry });
