@@ -564,12 +564,13 @@ void CallEngine::logStats() const {
 	const auto &m = _media.stats();
 	const auto a = _audio.stats();
 	g_message("tgcalls-lite: stats media=%s dtls-in=%llu rtp-in=%llu rtcp-in=%llu srtp-err=%llu early=%llu "
-	          "rtp-out=%llu send-err=%llu | opus enc=%llu dec=%llu dec-err=%llu last-frame=%d samples",
+	          "rtp-out=%llu send-err=%llu | opus enc=%llu dec=%llu dec-err=%llu last-frame=%d samples rx-bytes=%llu last-peak=%d",
 	          kStates[(int)_media.state()], (unsigned long long)m.dtlsIn, (unsigned long long)m.rtpIn,
 	          (unsigned long long)m.rtcpIn, (unsigned long long)m.srtpErrors,
 	          (unsigned long long)m.beforeSrtp, (unsigned long long)m.rtpOut,
 	          (unsigned long long)m.sendErrors, (unsigned long long)a.encoded,
-	          (unsigned long long)a.decoded, (unsigned long long)a.decodeErrors, a.lastDecodedSamples);
+	          (unsigned long long)a.decoded, (unsigned long long)a.decodeErrors, a.lastDecodedSamples,
+	          (unsigned long long)a.receivedBytes, a.lastPeak);
 	if (!_videoOn && _rxVideoPt < 0 && !_videoStats.ausOut && !_videoRx->stats().accessUnits) return;
 	const auto &r = _videoRx->stats();
 	uint64_t queueDrops;

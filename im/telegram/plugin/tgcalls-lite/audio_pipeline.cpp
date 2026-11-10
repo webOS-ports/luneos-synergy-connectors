@@ -1,5 +1,7 @@
 #include "audio_pipeline.h"
 
+#include <algorithm>
+
 #include <glib.h>
 #include <opus.h>
 #include <pulse/error.h>
@@ -57,6 +59,8 @@ AudioPipeline::Stats AudioPipeline::stats() const {
 	s.decoded = _decoded.load();
 	s.decodeErrors = _decodeErrors.load();
 	s.lastDecodedSamples = _lastDecodedSamples.load();
+	s.receivedBytes = _receivedBytes.load();
+	s.lastPeak = _lastPeak.load();
 	return s;
 }
 
@@ -143,6 +147,7 @@ void AudioPipeline::playbackThreadMain() {
 			_playbackQueue.pop_front();
 		}
 
+		_receivedBytes += packet.size();
 		int samples = decode_opus_packet(_decoder, packet.data(), (int)packet.size(), pcm);
 		if (samples <= 0) {
 			// Once per call; the periodic call stats carry the count.
@@ -152,6 +157,9 @@ void AudioPipeline::playbackThreadMain() {
 		}
 		_decoded++;
 		_lastDecodedSamples = samples;
+		int peak = 0;
+		for (int16_t v : pcm) peak = std::max(peak, v < 0 ? -(int)v : (int)v);
+		_lastPeak = peak;
 
 		int err = 0;
 		if (pa_simple_write(_playback, pcm.data(), pcm.size() * sizeof(int16_t), &err) < 0) {

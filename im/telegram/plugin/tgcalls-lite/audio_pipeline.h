@@ -61,6 +61,8 @@ public:
 		uint64_t decoded = 0;
 		uint64_t decodeErrors = 0;
 		int lastDecodedSamples = 0;
+		uint64_t receivedBytes = 0;  // Opus payload bytes handed to the decoder
+		int lastPeak = 0;            // loudest sample of the last decoded frame
 	};
 	Stats stats() const;
 
@@ -73,6 +75,8 @@ private:
 	OpusEncoder *_encoder = nullptr;
 	OpusDecoder *_decoder = nullptr;
 
+	std::atomic<uint64_t> _receivedBytes{0};
+	std::atomic<int> _lastPeak{0};
 	std::atomic<bool> _running{false};
 	std::thread _captureThread;
 	std::thread _playbackThread;
