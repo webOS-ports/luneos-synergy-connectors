@@ -63,7 +63,7 @@ ContentNegotiator::ContentNegotiator(bool isOutgoing, std::vector<MediaContent> 
 	: _isOutgoing(isOutgoing), _localContents(std::move(localContents)) {}
 
 std::optional<NegotiateChannelsMessage> ContentNegotiator::takeOffer(uint32_t exchangeId) {
-	if (!_needOffer || _pendingExchangeId || exchangeId == 0) return std::nullopt;
+	if (_firstOfferHeld || !_needOffer || _pendingExchangeId || exchangeId == 0) return std::nullopt;
 	_needOffer = false;
 	return makeOffer(exchangeId);
 }
@@ -109,6 +109,8 @@ std::optional<NegotiateChannelsMessage> ContentNegotiator::handleRemote(const Ne
 		if (own.second == _generation) _pendingExchangeId.reset();
 		return std::nullopt;
 	}
+	// The callee's offer, answered: the caller's own offer may go now (see holdFirstOffer()).
+	_firstOfferHeld = false;
 	if (_pendingExchangeId) {
 		// Both offered at once: the initiator wins.
 		if (_isOutgoing) return std::nullopt;

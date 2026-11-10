@@ -64,6 +64,16 @@ public:
 	// Call takeOffer() afterwards: a dropped offer is re-sent from there.
 	std::optional<NegotiateChannelsMessage> handleRemote(const NegotiateChannelsMessage &msg);
 
+	// The caller's first offer: held back until the callee's first offer has been answered, or
+	// until releaseFirstOffer(). A callee that offers at once (as current Telegram apps do) and
+	// meets the caller's offer on the way drops its own offer and never sends it again, so the
+	// caller would get the callee's media described never. Holding the caller's offer means the
+	// callee's offer is answered first and both directions are negotiated. takeOffer() returns
+	// nothing while the offer is held.
+	void holdFirstOffer() { _firstOfferHeld = true; }
+	void releaseFirstOffer() { _firstOfferHeld = false; }
+	bool firstOfferHeld() const { return _firstOfferHeld; }
+
 	// Our send-only contents changed (video on or off): offers from now on carry these, and an
 	// offer is due. An offer still unanswered is renewed with them (see renewOffer()).
 	void setLocalContents(std::vector<MediaContent> localContents);
@@ -81,6 +91,7 @@ private:
 	bool _isOutgoing;
 	std::vector<MediaContent> _localContents;
 	bool _needOffer = true;
+	bool _firstOfferHeld = false;
 	std::optional<uint32_t> _pendingExchangeId;
 	unsigned _generation = 0; // bumped by setLocalContents()
 	// Every exchangeId we offered under, with the generation of the contents it carried.

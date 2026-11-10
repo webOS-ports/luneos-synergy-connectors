@@ -39,6 +39,7 @@ int main() {
 	std::string callerSetup, calleeSetup;
 	int firstOfferFrom = 0; // 1 = caller, 2 = callee
 	uint32_t callerOfferId = 0, calleeFirstNegotiateId = 0;
+	int negotiateFrom[3] = {0, 0, 0};
 	auto spy = [&](EncryptedConnection &conn, const std::vector<uint8_t> &data, std::string &setup, int who) {
 		auto plain = conn.decrypt(data);
 		SignalingMessage m;
@@ -46,6 +47,7 @@ int main() {
 		if (m.type == SignalingMessageType::InitialSetup && !m.initialSetup.fingerprints.empty())
 			setup = m.initialSetup.fingerprints[0].setup;
 		if (m.type != SignalingMessageType::NegotiateChannels) return;
+		negotiateFrom[who]++;
 		if (firstOfferFrom == 0) firstOfferFrom = who;
 		if (who == 1 && callerOfferId == 0) callerOfferId = m.negotiateChannels.exchangeId;
 		if (who == 2 && calleeFirstNegotiateId == 0) calleeFirstNegotiateId = m.negotiateChannels.exchangeId;
@@ -89,6 +91,19 @@ int main() {
 
 	if (!callerReady || !calleeReady) {
 		fprintf(stderr, "FAIL: never reached Ready (caller=%d callee=%d)\n", (int)callerReady, (int)calleeReady);
+		return 1;
+	}
+
+	// This callee waits for the caller's offer, so the caller offers once its hold on the first
+	// offer runs out (CallEngine::kFirstOfferHoldTicks). Run on until both sides have offered and
+	// answered: the caller's offer and its answer to the callee's, and the other way round.
+	for (int i = 0; i < 8000 && !(negotiateFrom[1] >= 2 && negotiateFrom[2] >= 2); i++) {
+		g_main_context_iteration(ctx, FALSE);
+		if (i % 50 == 0) { caller.tick(); callee.tick(); }
+	}
+	if (negotiateFrom[1] < 2 || negotiateFrom[2] < 2) {
+		fprintf(stderr, "FAIL: negotiation incomplete (caller sent %d, callee %d NegotiateChannels)\n",
+		        negotiateFrom[1], negotiateFrom[2]);
 		return 1;
 	}
 

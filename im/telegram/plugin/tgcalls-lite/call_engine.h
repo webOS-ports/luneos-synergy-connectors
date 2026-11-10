@@ -178,6 +178,12 @@ private:
 	// kMaxOfferRetries times (see ContentNegotiator::renewOffer()).
 	static constexpr unsigned kOfferRetryTicks = 4; // 2 s at the usual 500 ms tick
 	static constexpr unsigned kMaxOfferRetries = 5;
+	// How long the caller waits for the callee's offer before offering first. Current Telegram
+	// apps offer as the callee within the same second as ICE and DTLS start (logged on Sargo,
+	// 2026-11-10 04:22:24 and 04:45:50), so 3 ticks (1-1.5 s) is enough, and a callee that only
+	// offers after answering costs that long before its media is negotiated.
+	static constexpr unsigned kFirstOfferHoldTicks = 3;
+	unsigned _firstOfferHoldTick = 0;
 	unsigned _offerTick = 0;
 	unsigned _offerRetries = 0;
 	void emitOffer(NegotiateChannelsMessage offer);

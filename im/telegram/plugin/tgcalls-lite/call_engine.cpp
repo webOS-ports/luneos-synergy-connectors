@@ -114,8 +114,15 @@ CallEngine::CallEngine(GMainContext *ctx, const uint8_t *key256, bool isOutgoing
 
 	_media.onGatheringDone = [this]() {
 		sendInitialSetupAndCandidates();
-		// As in tgcalls, the caller offers first; the callee offers once it has answered.
-		if (_isOutgoing) sendOfferIfNeeded();
+		// The caller offers once the callee's offer is answered, or after kFirstOfferHoldTicks if
+		// none comes (see ContentNegotiator::holdFirstOffer()): current Telegram apps offer as the
+		// callee at once, and when the two offers cross they drop theirs for good.
+		if (_isOutgoing && _peerOffered) {
+			sendOfferIfNeeded(); // the callee's offer came first and is answered
+		} else if (_isOutgoing) {
+			_negotiator->holdFirstOffer();
+			_firstOfferHoldTick = _ticks;
+		}
 	};
 	_media.onStateChanged = [this](MediaSessionState s) {
 		if (s != MediaSessionState::Ready) return;
@@ -210,7 +217,8 @@ std::vector<MediaContent> CallEngine::localContents() const {
 }
 
 bool CallEngine::negotiationStarted() const {
-	// The caller offers once gathered; the callee only after the caller's offer.
+	// The caller negotiates once gathered (its first offer may wait, see holdFirstOffer()); the
+	// callee only after the caller's offer.
 	return _sentInitialSetup && (_isOutgoing || _peerOffered);
 }
 
@@ -554,6 +562,12 @@ void CallEngine::tick() {
 	// Every 10th tick (5 s at the usual 500 ms) for the first minute, then every 60th.
 	_ticks++;
 	if (_ticks % (_ticks <= 120 ? 10 : 60) == 0) logStats();
+
+	if (_negotiator->firstOfferHeld() && _ticks - _firstOfferHoldTick >= kFirstOfferHoldTicks) {
+		_negotiator->releaseFirstOffer();
+		g_message("tgcalls-lite: no offer from the peer, offering first");
+		sendOfferIfNeeded();
+	}
 
 	if (_negotiator->offerPending() && _offerRetries < kMaxOfferRetries &&
 	    _ticks - _offerTick >= kOfferRetryTicks) {
