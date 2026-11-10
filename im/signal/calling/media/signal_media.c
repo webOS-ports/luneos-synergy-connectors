@@ -128,6 +128,8 @@ typedef struct {
     gint        tx_announced;   /* atomic: VPREVIEW sent */
     gboolean    tx_wanted;      /* VIDEO 1: the user has the camera on */
     gint        tx_cvo;         /* atomic: our CVO byte */
+    gint        tx_rot;         /* atomic: the camera's own turn (sm_tx_rotation), -1 not known yet */
+    gint        dev_turns;      /* atomic: TURN, how the phone is held (the shell's quarter turns) */
     gboolean    tx_mirrored;    /* front camera: the self-view is shown mirrored */
     gint        status_known;   /* atomic: send SenderStatus (video was asked for at least once) */
     gint        status_video;   /* atomic: SenderStatus.video_enabled we send */
@@ -153,6 +155,13 @@ typedef struct {
 } SmVideo;
 
 static SmVideo g_v;
+
+/* The received audio (sm_log_rx_audio_stats), all atomic. */
+static struct {
+    gint opus;      /* Opus packets routed to the decoder */
+    gint played;    /* buffers that reached the speaker's sink */
+    gint peak;      /* loudest sample among them since the last report */
+} g_rxa;
 
 /* Transport-cc: the receive thread records, the sender thread sends the feedback. */
 static GMutex g_tcc_lock;
@@ -471,6 +480,42 @@ static void sm_keyframe_watchdog(void)
 }
 
 /* One line of receive statistics, when anything changed since the last one. Sender thread only. */
+/* Streaming thread: what reaches the speaker's sink, so a silent far side (frames that decode to
+ * near zero, as a stuck Android microphone sends) can be told from audio lost here. */
+static GstPadProbeReturn sm_probe_rx_audio(GstPad *pad, GstPadProbeInfo *info, gpointer u)
+{
+    (void)u;
+    GstBuffer *b = GST_PAD_PROBE_INFO_BUFFER(info);
+    GstCaps *caps = gst_pad_get_current_caps(pad);
+    const gchar *fmt = caps ? gst_structure_get_string(gst_caps_get_structure(caps, 0), "format") : NULL;
+    g_atomic_int_inc(&g_rxa.played);
+    if (b && fmt && !strcmp(fmt, "S16LE")) {
+        GstMapInfo m;
+        if (gst_buffer_map(b, &m, GST_MAP_READ)) {
+            gint peak = sv_s16_peak(m.data, m.size);
+            if (peak > g_atomic_int_get(&g_rxa.peak))
+                g_atomic_int_set(&g_rxa.peak, peak);
+            gst_buffer_unmap(b, &m);
+        }
+    }
+    if (caps) gst_caps_unref(caps);
+    return GST_PAD_PROBE_OK;
+}
+
+/* The received audio since the last report: Opus packets routed to the decoder, buffers that
+ * reached the sink and their loudest sample (0..32767; a few tens is silence). */
+static void sm_log_rx_audio_stats(void)
+{
+    static gint last_opus = -1, last_played = -1;
+    gint opus = g_atomic_int_get(&g_rxa.opus), played = g_atomic_int_get(&g_rxa.played);
+    gint peak = g_atomic_int_and(&g_rxa.peak, 0);
+    if (opus == last_opus && played == last_played)
+        return;
+    last_opus = opus;
+    last_played = played;
+    g_message("signal_media: rx audio opus=%d played=%d peak=%d", opus, played, peak);
+}
+
 static void sm_log_rx_stats(void)
 {
     static gint last[9];
@@ -531,8 +576,10 @@ static gpointer sender_thread_fn(gpointer u)
     (void)u;
     guint tick = 0;
     while (g_atomic_int_get(&g_sender_run)) {
-        if (tick % 20 == 0)
+        if (tick % 20 == 0) {
             sm_log_rx_stats();
+            sm_log_rx_audio_stats();
+        }
         sm_push_tcc();
         sm_keyframe_watchdog();
         if (tick++ % 5 == 0)
@@ -760,6 +807,7 @@ static gboolean sm_rx_route(GstBuffer *buf)
     }
 
     if (r.pt == SV_PT_OPUS) {
+        g_atomic_int_inc(&g_rxa.opus);
         keep = TRUE;
     } else if (vp8) {
         const guint8 *cvo = NULL;
@@ -1164,13 +1212,27 @@ static gint sm_tx_rotation(void)
     return 0;
 }
 
+/* TURN: how the phone is held. Our CVO byte follows from the next frame; before the camera has
+ * run, the first frame takes it. Any thread. */
+static void sm_set_device_turns(gint turns)
+{
+    g_atomic_int_set(&g_v.dev_turns, turns);
+    gint rot = g_atomic_int_get(&g_v.tx_rot);
+    if (rot >= 0)
+        g_atomic_int_set(&g_v.tx_cvo, sv_cvo_from_clockwise_quarter_turns(sv_tx_quarter_turns(rot, turns)));
+    g_message("signal_media: the phone is held %d quarter turn(s) round: we send it turned %d", turns,
+              rot >= 0 ? sv_tx_quarter_turns(rot, turns) : -1);
+}
+
 /* The first self-view frame: the camera runs, so its orientation is known; say where the picture is. */
 static GstPadProbeReturn sm_tx_first_frame_probe(GstPad *pad, GstPadProbeInfo *info, gpointer u)
 {
     (void)info; (void)u;
     if (g_atomic_int_compare_and_exchange(&g_v.tx_announced, 0, 1)) {
         gint rot = sm_tx_rotation();
-        g_atomic_int_set(&g_v.tx_cvo, sv_cvo_from_clockwise_quarter_turns(rot));
+        g_atomic_int_set(&g_v.tx_rot, rot);
+        g_atomic_int_set(&g_v.tx_cvo, sv_cvo_from_clockwise_quarter_turns(
+                             sv_tx_quarter_turns(rot, g_atomic_int_get(&g_v.dev_turns))));
         GstElement *shm = gst_pad_get_parent_element(pad);
         gchar *path = NULL;
         if (shm) {
@@ -1355,6 +1417,8 @@ static void sm_video_reset(void)
     g_v.status_known = keep.status_known;
     g_v.call_id = keep.call_id;
     g_v.have_call_id = keep.have_call_id;
+    g_v.dev_turns = keep.dev_turns;
+    g_v.tx_rot = -1;
     g_v.peer_rot = -1;
     g_v.peer_video = -1;
     g_v.st_last_seq = -1;
@@ -1707,6 +1771,13 @@ static gboolean build_pipeline(SignalMedia *sm)
         }
     } else if (!gst_element_link_many(nsrc, rxcaps, sdec, rxrtp, rxjb, depay, odec, aconv, asink, NULL)) {
         g_printerr("signal_media: RX link failed\n"); return FALSE;
+    }
+    {
+        GstPad *ap = gst_element_get_static_pad(asink, "sink");
+        if (ap) {
+            gst_pad_add_probe(ap, GST_PAD_PROBE_TYPE_BUFFER, sm_probe_rx_audio, NULL, NULL);
+            gst_object_unref(ap);
+        }
     }
     if (!gst_element_link_pads(sdec, "rtcp_src", rxrtcp, "sink")) {
         g_printerr("signal_media: RX rtcp_src -> fakesink link failed\n"); return FALSE;
@@ -2236,6 +2307,11 @@ static int run_ipc(int is_caller)
         } else if (strncmp(line, "VIDEO ", 6) == 0) {
             if (strcmp(line + 6, "0") != 0 && strcmp(line + 6, "1") != 0) { emit("ERR bad-video\n"); continue; }
             signal_media_set_video(line[6] == '1');
+        } else if (strncmp(line, "TURN ", 5) == 0) {
+            /* How the phone is held (the Phone app's deviceOrientation): the orientation we send
+             * with each frame follows it from the next one. */
+            if (strlen(line) != 6 || line[5] < '0' || line[5] > '3') { emit("ERR bad-turn\n"); continue; }
+            sm_set_device_turns(line[5] - '0');
         } else if (strcmp(line, "STOP") == 0) {
             break;
         } else {

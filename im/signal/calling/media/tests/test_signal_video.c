@@ -392,6 +392,33 @@ static void test_data_msg(void)
     CHECK(sv_data_msg_decode(NULL, 0, &back) == 0 && !back.has_status);
 }
 
+static void test_tx_turns(void)
+{
+    /* sargo's front camera: 270 degrees, 3 quarter turns; one fewer for each turn of the phone */
+    CHECK(sv_tx_quarter_turns(3, 0) == 3);
+    CHECK(sv_tx_quarter_turns(3, 1) == 2);
+    CHECK(sv_tx_quarter_turns(3, 2) == 1);
+    CHECK(sv_tx_quarter_turns(3, 3) == 0);
+    CHECK(sv_tx_quarter_turns(0, 1) == 3);
+    CHECK(sv_tx_quarter_turns(1, -1) == 2);
+}
+
+static void test_s16_peak(void)
+{
+    const uint8_t quiet[] = { 0x05, 0x00, 0xfb, 0xff };          /* 5, -5 */
+    const uint8_t loud[] = { 0x00, 0x10, 0x00, 0x80, 0xff, 0x7f };  /* 4096, -32768, 32767 */
+    const uint8_t odd[] = { 0x10, 0x00, 0xff };                    /* 16 and a stray byte */
+    CHECK(sv_s16_peak(quiet, sizeof quiet) == 5);
+    CHECK(sv_s16_peak(loud, sizeof loud) == 32767);
+    CHECK(sv_s16_peak(loud, 2) == 4096);
+    CHECK(sv_s16_peak(odd, sizeof odd) == 16);
+    CHECK(sv_s16_peak(quiet, 0) == 0);
+    {
+        const uint8_t neg[] = { 0xd4, 0xfe, 0x0a, 0x00 };          /* -300, 10 */
+        CHECK(sv_s16_peak(neg, sizeof neg) == 300);
+    }
+}
+
 int main(void)
 {
     test_ssrcs();
@@ -404,6 +431,8 @@ int main(void)
     test_tcc();
     test_vp8_keyframe();
     test_data_msg();
+    test_tx_turns();
+    test_s16_peak();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
