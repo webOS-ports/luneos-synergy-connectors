@@ -504,3 +504,19 @@ int sv_data_msg_decode(const uint8_t *p, size_t n, SvDataMsg *m)
     }
     return 0;
 }
+
+int sv_s16_peak(const uint8_t *p, size_t n)
+{
+    int peak = 0;
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        int v = (int16_t)(uint16_t)(p[i] | (unsigned)p[i + 1] << 8);
+        if (v < 0) v = v == -32768 ? 32767 : -v;
+        if (v > peak) peak = v;
+    }
+    return peak;
+}
+
+int sv_tx_quarter_turns(int camera_turns, int device_turns)
+{
+    return ((camera_turns - device_turns) % 4 + 4) % 4;
+}

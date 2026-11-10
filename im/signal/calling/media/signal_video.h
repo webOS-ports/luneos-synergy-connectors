@@ -107,6 +107,15 @@ int sv_vp8_is_keyframe_start(const uint8_t *p, size_t n);
  * The Phone app's incomingVideoOrientation turns the picture back by its value COUNTER-clockwise
  * (RemoteVideo.qml rotation: -90 * quarterTurns), so the two are each other's complement. */
 int     sv_cvo_to_phone_quarter_turns(uint8_t cvo);
+
+/* The clockwise quarter turns our CVO byte says, for the front camera's own turn (sensor) with
+ * the phone held device_turns round (the shell's quarter turns: 1 = left edge up): one fewer for
+ * each, as teams_media turns the same viewfinder (checked on calls to Android, sargo 10 Nov 2026:
+ * one more for each came out half a turn off at a quarter turn). */
+int     sv_tx_quarter_turns(int camera_turns, int device_turns);
+
+/* The loudest sample of n bytes of S16LE audio, 0..32767 (32768 counts as 32767); 0 for none. */
+int     sv_s16_peak(const uint8_t *p, size_t n);
 uint8_t sv_cvo_from_clockwise_quarter_turns(int quarter_turns);
 
 /* 1 if the compound RTCP packet p asks `media_ssrc` for a keyframe (a PLI, PSFB FMT 1, naming
