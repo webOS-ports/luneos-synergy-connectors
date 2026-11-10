@@ -43,6 +43,11 @@ constexpr const char *kVideoRotationUri = "urn:3gpp:video-orientation";
 // packetization-mode=1 (the only mode h264_rtp.c depacketizes).
 std::optional<PayloadType> choose_payload_type(const MediaContent &offered);
 
+// Our send-only H.264 video content as offered: payload type 100 (packetization-mode 1,
+// 42e01f), its RTX type, CVO, and a FID group of ssrc and rtxSsrc. tgcalls' receiver takes the
+// stream's SSRCs from ssrcGroups only, so the group is what lets the peer receive our video.
+MediaContent make_video_content(uint32_t ssrc, uint32_t rtxSsrc);
+
 class ContentNegotiator {
 public:
 	// localContents: our send-only contents, as offered (ssrc and payload types set).

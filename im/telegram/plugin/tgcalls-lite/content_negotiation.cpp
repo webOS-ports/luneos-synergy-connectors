@@ -3,6 +3,7 @@
 
 #include <strings.h>
 
+#include <string>
 #include <utility>
 
 namespace tgcalls_lite {
@@ -169,6 +170,56 @@ void ContentNegotiator::applyAnswer(const NegotiateChannelsMessage &answer) {
 			}
 		}
 	}
+}
+
+namespace {
+constexpr uint8_t kH264PayloadType = 100;  // matches voipkit.cpp's kRtpPayloadType convention
+constexpr uint32_t kH264ClockRate = 90000;
+// RTX (RFC 4588) for the H.264 stream. We never retransmit, but tgcalls' receiver learns our video
+// SSRC only from the content's ssrcGroups (IncomingV2VideoChannel builds its stream's SSRC list
+// from them alone), and the FID group WebRTC offers names an RTX stream, so we offer one too.
+constexpr uint8_t kRtxPayloadType = 101;
+constexpr int kTgcallsVideoRotationExtId = 13; // the id tgcalls offers it under
+} // namespace
+
+MediaContent make_video_content(uint32_t ssrc, uint32_t rtxSsrc) {
+	MediaContent c;
+	c.type = MediaContent::Type::Video;
+	c.ssrc = ssrc;
+	// What WebRTC's AddVideoSender gives tgcalls' own offers: the main SSRC and its RTX SSRC in a
+	// FID group. Without a group a tgcalls receiver has no SSRC for the stream and drops our video.
+	SsrcGroup fid;
+	fid.semantics = "FID";
+	fid.ssrcs = {ssrc, rtxSsrc};
+	c.ssrcGroups.push_back(std::move(fid));
+	PayloadType h264;
+	h264.id = kH264PayloadType;
+	h264.name = "H264";
+	h264.clockrate = kH264ClockRate;
+	h264.parameters.push_back({"packetization-mode", "1"});
+	// Constrained Baseline, level 3.1 (42e01f) -- matches the profile most existing tgcalls/
+	// WebRTC-based H.264 hardware encoders (including this project's own OMX path, per
+	// TELEGRAM_VIDEO_STATUS.md's confirmed-live H.264 encode) default to offering.
+	h264.parameters.push_back({"profile-level-id", "42e01f"});
+	FeedbackType nack; nack.type = "nack"; nack.subtype = "";
+	h264.feedbackTypes.push_back(nack);
+	FeedbackType pli; pli.type = "nack"; pli.subtype = "pli";
+	h264.feedbackTypes.push_back(pli);
+	FeedbackType fir; fir.type = "ccm"; fir.subtype = "fir";
+	h264.feedbackTypes.push_back(fir);
+	c.payloadTypes.push_back(h264);
+	PayloadType rtx;
+	rtx.id = kRtxPayloadType;
+	rtx.name = "rtx";
+	rtx.clockrate = kH264ClockRate;
+	rtx.parameters.push_back({"apt", std::to_string(kH264PayloadType)});
+	c.payloadTypes.push_back(rtx);
+	// The receiver turns the picture by what each frame says, so we send the camera as it is.
+	RtpExtension cvo;
+	cvo.id = kTgcallsVideoRotationExtId;
+	cvo.uri = kVideoRotationUri;
+	c.rtpExtensions.push_back(cvo);
+	return c;
 }
 
 } // namespace tgcalls_lite

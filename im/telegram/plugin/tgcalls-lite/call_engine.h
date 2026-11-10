@@ -191,6 +191,8 @@ private:
 
 	uint32_t _localAudioSsrc;
 	uint32_t _localVideoSsrc;
+	uint32_t _localVideoRtxSsrc; // offered in the FID group, never sent on
+	uint32_t pick_rtx_ssrc() const;
 	uint16_t _audioSeq = 0;
 	uint32_t _audioTimestamp = 0;
 	uint16_t _videoSeq = 0;

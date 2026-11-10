@@ -15,8 +15,6 @@ namespace {
 
 constexpr uint8_t kOpusPayloadType = 111;  // what we offer; the peer's answer keeps our ids
 constexpr uint32_t kOpusClockRate = 48000;
-constexpr uint8_t kH264PayloadType = 100;  // matches voipkit.cpp's kRtpPayloadType convention
-constexpr uint32_t kH264ClockRate = 90000;
 constexpr uint32_t kOpusTimestampPerFrame = 960;  // 1:1 with sample count at 48kHz, RFC 7587
 constexpr size_t kRtpHeaderLen = 12;
 constexpr size_t kVideoRtpMtu = 1200; // matches voipkit.cpp's kRtpMtu
@@ -24,7 +22,6 @@ constexpr size_t kVideoRtpMtu = 1200; // matches voipkit.cpp's kRtpMtu
 constexpr size_t kCvoExtensionLen = 8;
 // srtp_protect() and srtp_protect_rtcp() write their trailer behind the packet.
 constexpr size_t kSrtpRoom = SRTP_MAX_TRAILER_LEN + 4;
-constexpr int kTgcallsVideoRotationExtId = 13; // the id tgcalls offers it under
 constexpr gint64 kPliMinIntervalUs = G_USEC_PER_SEC;
 
 int rotation_quarter_turns(int degrees) {
@@ -59,33 +56,6 @@ MediaContent build_audio_content(uint32_t ssrc) {
 	return c;
 }
 
-MediaContent build_video_content(uint32_t ssrc) {
-	MediaContent c;
-	c.type = MediaContent::Type::Video;
-	c.ssrc = ssrc;
-	PayloadType h264;
-	h264.id = kH264PayloadType;
-	h264.name = "H264";
-	h264.clockrate = kH264ClockRate;
-	h264.parameters.push_back({"packetization-mode", "1"});
-	// Constrained Baseline, level 3.1 (42e01f) -- matches the profile most existing tgcalls/
-	// WebRTC-based H.264 hardware encoders (including this project's own OMX path, per
-	// TELEGRAM_VIDEO_STATUS.md's confirmed-live H.264 encode) default to offering.
-	h264.parameters.push_back({"profile-level-id", "42e01f"});
-	FeedbackType nack; nack.type = "nack"; nack.subtype = "";
-	h264.feedbackTypes.push_back(nack);
-	FeedbackType pli; pli.type = "nack"; pli.subtype = "pli";
-	h264.feedbackTypes.push_back(pli);
-	FeedbackType fir; fir.type = "ccm"; fir.subtype = "fir";
-	h264.feedbackTypes.push_back(fir);
-	c.payloadTypes.push_back(h264);
-	// The receiver turns the picture by what each frame says, so we send the camera as it is.
-	RtpExtension cvo;
-	cvo.id = kTgcallsVideoRotationExtId;
-	cvo.uri = kVideoRotationUri;
-	c.rtpExtensions.push_back(cvo);
-	return c;
-}
 
 uint32_t random_exchange_id() {
 	uint32_t id;
@@ -108,6 +78,7 @@ CallEngine::CallEngine(GMainContext *ctx, const uint8_t *key256, bool isOutgoing
 	do {
 		_localVideoSsrc = random_ssrc();
 	} while (_localVideoSsrc == _localAudioSsrc || _localVideoSsrc == 0);
+	_localVideoRtxSsrc = pick_rtx_ssrc();
 	_videoTimestampBase = g_random_int();
 
 	_negotiator = std::make_unique<ContentNegotiator>(isOutgoing, localContents());
@@ -209,10 +180,18 @@ CallEngine::~CallEngine() {
 	_videoQueue->units.clear();
 }
 
+uint32_t CallEngine::pick_rtx_ssrc() const {
+	uint32_t ssrc;
+	do {
+		ssrc = random_ssrc();
+	} while (ssrc == 0 || ssrc == _localAudioSsrc || ssrc == _localVideoSsrc);
+	return ssrc;
+}
+
 std::vector<MediaContent> CallEngine::localContents() const {
 	std::vector<MediaContent> local;
 	local.push_back(build_audio_content(_localAudioSsrc));
-	if (_videoOn) local.push_back(build_video_content(_localVideoSsrc));
+	if (_videoOn) local.push_back(make_video_content(_localVideoSsrc, _localVideoRtxSsrc));
 	return local;
 }
 
@@ -231,6 +210,7 @@ void CallEngine::setVideoSending(bool on) {
 		do {
 			_localVideoSsrc = random_ssrc();
 		} while (_localVideoSsrc == _localAudioSsrc || _localVideoSsrc == old || _localVideoSsrc == 0);
+		_localVideoRtxSsrc = pick_rtx_ssrc();
 		_sentVideo = false;
 		std::lock_guard<std::mutex> lock(_videoQueue->mx);
 		_videoQueue->units.clear();
