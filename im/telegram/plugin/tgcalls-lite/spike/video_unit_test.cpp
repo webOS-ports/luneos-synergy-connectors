@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "../content_negotiation.h"
+#include "../signaling_message.h"
 #include "../rtp_header.h"
 #include "../video_receiver.h"
 #include "../video_rtcp.h"
@@ -284,11 +285,55 @@ static void test_negotiation() {
 	CHECK(callee.codecs().incomingVideoPt == -1, "peer camera off");
 }
 
+// What tgcalls' IncomingV2VideoChannel does with a video content: the receive stream's SSRCs are
+// the union of its ssrcGroups, and mediaContent.ssrc alone is never added.
+static bool tgcalls_receiver_knows_ssrc(const MediaContent &c) {
+	for (const auto &g : c.ssrcGroups)
+		for (auto s : g.ssrcs)
+			if (s == c.ssrc) return true;
+	return false;
+}
+
+static void test_video_offer() {
+	MediaContent v = make_video_content(0x11111111, 0x22222222);
+	CHECK(tgcalls_receiver_knows_ssrc(v), "a tgcalls receiver can find our video ssrc in the groups");
+	CHECK(v.ssrcGroups.size() == 1 && v.ssrcGroups[0].semantics == "FID" &&
+	      v.ssrcGroups[0].ssrcs.size() == 2 && v.ssrcGroups[0].ssrcs[1] == 0x22222222, "FID group of ssrc and rtx ssrc");
+	bool rtx = false;
+	for (const auto &pt : v.payloadTypes)
+		if (pt.name == "rtx")
+			for (const auto &p : pt.parameters)
+				if (p.first == "apt" && p.second == "100") rtx = true;
+	CHECK(rtx, "rtx payload type associated with H264 100");
+	auto chosen = choose_payload_type(v);
+	CHECK(chosen && chosen->id == 100, "H264, not rtx, is the video payload type");
+	// The group survives the signalling round trip.
+	SignalingMessage msg;
+	msg.type = SignalingMessageType::NegotiateChannels;
+	msg.negotiateChannels.exchangeId = 5;
+	msg.negotiateChannels.contents = {audio(1), v};
+	auto bytes = signaling_message_serialize(msg);
+	SignalingMessage back;
+	CHECK(signaling_message_parse(bytes.data(), bytes.size(), &back), "offer parses");
+	CHECK(back.negotiateChannels.contents.size() == 2 && tgcalls_receiver_knows_ssrc(back.negotiateChannels.contents[1]),
+	      "the parsed offer still names our ssrc in a group");
+	// An answer that keeps H264 and rtx (as WebRTC's answer does) enables H264 100 for sending.
+	ContentNegotiator n(true, {audio(1), v});
+	auto offer = n.takeOffer(9);
+	CHECK(offer && offer->contents.size() == 2, "offer with video");
+	NegotiateChannelsMessage answer;
+	answer.exchangeId = 9;
+	answer.contents = offer->contents;
+	n.handleRemote(answer);
+	CHECK(n.codecs().outgoingVideoPt == 100, "sending H264 100, got %d", n.codecs().outgoingVideoPt);
+}
+
 int main() {
 	test_rtcp();
 	test_rtp_header();
 	test_receiver();
 	test_negotiation();
+	test_video_offer();
 	if (failures) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;

@@ -242,6 +242,50 @@ static void test_rtp() {
 	CHECK(!parse_rtp_header(plain.data(), 11, r), "short packet refused");
 }
 
+// A callee like current Telegram apps (tgcalls v2): it offers at once, and when the caller's offer
+// meets its own it drops its offer and never sends it again. The caller holds its first offer, so
+// the callee's offer is answered first and the callee's media is negotiated too.
+static void test_caller_holds_first_offer() {
+	ContentNegotiator caller(true, {audio(11, {pt(111, "opus", 48000)})});
+	ContentNegotiator callee(false, {audio(22, {pt(111, "opus", 48000)})});
+	caller.holdFirstOffer();
+	CHECK(caller.firstOfferHeld(), "the caller's first offer is held");
+	CHECK(!caller.takeOffer(5), "no offer while it is held");
+
+	auto calleeOffer = callee.takeOffer(9);
+	REQUIRE(calleeOffer, "callee offers at once");
+	auto answer = caller.handleRemote(*calleeOffer);
+	REQUIRE(answer && answer->exchangeId == 9, "caller answers the callee's offer");
+	CHECK(caller.codecs().incomingAudioPt == 111 && caller.codecs().incomingAudioSsrc == 22,
+	      "caller receives the callee's audio");
+	CHECK(!caller.firstOfferHeld(), "answering releases the hold");
+
+	auto callerOffer = caller.takeOffer(5);
+	REQUIRE(callerOffer && callerOffer->exchangeId == 5, "caller offers after answering");
+	CHECK(!callee.handleRemote(*answer), "callee takes the answer");
+	CHECK(callee.codecs().outgoingAudioPt == 111, "callee's audio accepted");
+	auto answer2 = callee.handleRemote(*callerOffer);
+	REQUIRE(answer2 && answer2->exchangeId == 5, "callee answers the caller's offer");
+	CHECK(!caller.handleRemote(*answer2), "caller takes the answer");
+	CHECK(caller.codecs().outgoingAudioPt == 111, "caller's audio accepted");
+	CHECK(caller.codecs().incomingAudioPt == 111, "caller still receives the callee's audio");
+}
+
+// No offer from the callee: the hold times out (the engine calls releaseFirstOffer()), and the
+// offer then carries contents changed meanwhile.
+static void test_first_offer_hold_released() {
+	ContentNegotiator caller(true, {audio(11, {pt(111, "opus", 48000)})});
+	caller.holdFirstOffer();
+	PayloadType h264 = pt(100, "H264", 90000);
+	h264.parameters.push_back({"packetization-mode", "1"});
+	caller.setLocalContents({audio(11, {pt(111, "opus", 48000)}), video(12, {h264})});
+	CHECK(!caller.takeOffer(5), "still held after a contents change");
+	caller.releaseFirstOffer();
+	auto offer = caller.takeOffer(5);
+	REQUIRE(offer && offer->contents.size() == 2, "after the timeout the offer goes, with the video");
+	CHECK(caller.offerPending(), "the offer is pending");
+}
+
 int main() {
 	test_choose();
 	test_exchange();
@@ -249,6 +293,8 @@ int main() {
 	test_race();
 	test_renew();
 	test_partial_answer();
+	test_caller_holds_first_offer();
+	test_first_offer_hold_released();
 	test_rtp();
 	if (failures) {
 		fprintf(stderr, "%d check(s) FAILED\n", failures);
