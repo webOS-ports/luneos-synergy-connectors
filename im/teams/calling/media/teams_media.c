@@ -39,6 +39,9 @@
  *        VIDEO <0|1> [<w> <h> <kbps>]                        (the user turned our camera off/on;
  *                                                               optional: the size and bitrate to
  *                                                               send, from the far side's fmtp)
+ *        TURN <0..3>                                          (how the phone is held, the shell's
+ *                                                               quarter turns: what we send is
+ *                                                               turned to stay upright)
  *        STOP
  *   out: UFRAG <our_ufrag>
  *        PWD <our_pwd>
@@ -141,6 +144,8 @@ typedef struct {
     GstElement   *vtx_queue;      /* input of the persistent send tail; a camera head links here */
     GstElement   *vtx_head;       /* the camera bin while the camera is on */
     GstElement   *vtx_cam;        /* the droidcamsrc in it, if any (start-capture, orientation) */
+    GstElement   *vtx_devflip;    /* its videoflip that turns what we send with the phone, if any */
+    gint          dev_turns;      /* atomic: TURN, how the phone is held (shell quarter turns) */
     gint          vtx_cw;         /* quarter turns clockwise given to the picture before encoding;
                                    * -1: the camera's own H264, sent as the sensor gives it */
     gint          vtx_pv_w, vtx_pv_h; /* the self-view's size for this camera head */
@@ -991,15 +996,18 @@ static gchar *tm_camera_description(TeamsMedia *tm, gint cw)
             "droidcamsrc name=tmcam camera-device=1 "
             "tmcam.imgsrc ! fakesink async=false tmcam.vidsrc ! fakesink async=false "
             "tmcam.vfsrc ! video/x-raw,format=NV21,width=%d,height=%d,framerate=30/1,pixel-aspect-ratio=1/1 ! "
-            "queue leaky=downstream max-size-buffers=2 ! videoflip video-direction=%s ! videoconvert ! "
-            "videoscale ! video/x-raw,format=NV12,width=%d,height=%d,pixel-aspect-ratio=1/1 ! tee name=tmvt "
-            "tmvt. ! queue leaky=downstream max-size-buffers=2 ! droidvenc target-bitrate=%d ! "
+            "queue leaky=downstream max-size-buffers=2 ! videoflip video-direction=%s ! tee name=tmvt "
+            "tmvt. ! queue leaky=downstream max-size-buffers=2 ! "
+            "videoflip name=tmdevflip video-direction=%s ! videoconvert ! videoscale add-borders=true ! "
+            "capsfilter name=tmsendcaps caps=video/x-raw,format=NV12,width=%d,height=%d,pixel-aspect-ratio=1/1 ! "
+            "droidvenc target-bitrate=%d ! "
             "video/x-h264,stream-format=avc,alignment=au ! h264parse config-interval=-1 ! "
             "video/x-h264,stream-format=byte-stream,alignment=au ! queue name=tmvout "
             "tmvt. ! queue leaky=downstream max-size-buffers=2 ! videoconvert ! videoscale ! "
             "video/x-raw,format=I420,width=%d,height=%d,pixel-aspect-ratio=1/1 ! "
             "queue leaky=downstream max-size-buffers=2 ! shmsink name=tmpvshm",
-            TM_VIDEO_W, TM_VIDEO_H, direction[cw & 3], side ? h : w, side ? w : h, bps,
+            TM_VIDEO_W, TM_VIDEO_H, direction[cw & 3], tv_send_direction(g_atomic_int_get(&tm->dev_turns)),
+            side ? h : w, side ? w : h, bps,
             tm->vtx_pv_w, tm->vtx_pv_h);
     return g_strdup_printf(
         "droidcamsrc name=tmcam mode=2 camera-device=1 target-bitrate=%d "
@@ -1080,6 +1088,37 @@ static GstPadProbeReturn tm_probe_vpreview(GstPad *pad, GstPadProbeInfo *info, g
     return GST_PAD_PROBE_REMOVE;
 }
 
+/* Streaming thread: a caps query on its way into the hardware encoder. Once it runs, droidvenc
+ * answers them so that nothing in front of it can be negotiated again: the phone turning
+ * (tmdevflip) changed the size into videoconvert, and the camera stopped with not-negotiated
+ * (sargo, 10 Nov 2026). What it takes never changes, so the size filter in front of it answers
+ * for it with what it lets through. */
+static GstPadProbeReturn tm_probe_answer_caps(GstPad *pad, GstPadProbeInfo *info, gpointer user)
+{
+    GstQuery *q = GST_PAD_PROBE_INFO_QUERY(info);
+    GstCaps *fixed = NULL;
+    (void)pad;
+    if (GST_QUERY_TYPE(q) != GST_QUERY_CAPS && GST_QUERY_TYPE(q) != GST_QUERY_ACCEPT_CAPS)
+        return GST_PAD_PROBE_OK;
+    g_object_get(user, "caps", &fixed, NULL);
+    if (!fixed)
+        return GST_PAD_PROBE_OK;
+    if (GST_QUERY_TYPE(q) == GST_QUERY_CAPS) {
+        GstCaps *filter = NULL;
+        gst_query_parse_caps(q, &filter);
+        GstCaps *res = filter ? gst_caps_intersect_full(filter, fixed, GST_CAPS_INTERSECT_FIRST)
+                              : gst_caps_ref(fixed);
+        gst_query_set_caps_result(q, res);
+        gst_caps_unref(res);
+    } else {
+        GstCaps *c = NULL;
+        gst_query_parse_accept_caps(q, &c);
+        gst_query_set_accept_caps_result(q, c && gst_caps_can_intersect(c, fixed));
+    }
+    gst_caps_unref(fixed);
+    return GST_PAD_PROBE_HANDLED;
+}
+
 /* Media thread: put a camera head in front of the send tail. */
 static gboolean tm_video_tx_start(gpointer user)
 {
@@ -1118,6 +1157,15 @@ static gboolean tm_video_tx_start(gpointer user)
         gst_object_unref(pv);
     }
     tm->vtx_cam = gst_bin_get_by_name(GST_BIN(head), "tmcam");
+    tm->vtx_devflip = gst_bin_get_by_name(GST_BIN(head), "tmdevflip");
+    GstElement *sendcaps = gst_bin_get_by_name(GST_BIN(head), "tmsendcaps");
+    if (sendcaps) {
+        GstPad *sp = gst_element_get_static_pad(sendcaps, "src");
+        /* the probe holds the element: the head owns it for as long as the probe can run */
+        gst_pad_add_probe(sp, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM, tm_probe_answer_caps, sendcaps, NULL);
+        gst_object_unref(sp);
+        gst_object_unref(sendcaps);
+    }
     GstElement *vf = gst_bin_get_by_name(GST_BIN(head), "tmvf");
     if (vf) {
         tm_add_probe(vf, "sink", GST_PAD_PROBE_TYPE_BUFFER, tm_probe_first_vf, tm);
@@ -1134,6 +1182,7 @@ static gboolean tm_video_tx_start(gpointer user)
         gst_element_set_state(head, GST_STATE_NULL);
         gst_bin_remove(GST_BIN(tm->pipeline), head);
         if (tm->vtx_cam) { gst_object_unref(tm->vtx_cam); tm->vtx_cam = NULL; }
+        if (tm->vtx_devflip) { gst_object_unref(tm->vtx_devflip); tm->vtx_devflip = NULL; }
         g_free(desc);
         tm_event(tm, "VIDEOERR tx-camera");
         return G_SOURCE_REMOVE;
@@ -1163,8 +1212,22 @@ static gboolean tm_video_tx_stop(gpointer user)
     if (ghost) gst_object_unref(ghost);
     gst_bin_remove(GST_BIN(tm->pipeline), head);
     if (tm->vtx_cam) { gst_object_unref(tm->vtx_cam); tm->vtx_cam = NULL; }
+    if (tm->vtx_devflip) { gst_object_unref(tm->vtx_devflip); tm->vtx_devflip = NULL; }
     tm_event(tm, "VTX 0");
     g_message("teams_media: camera off");
+    return G_SOURCE_REMOVE;
+}
+
+/* Media thread: turn what we send to how the phone is held now (TURN). A camera head made later
+ * starts turned so; the camera's own H264 (no videoflip) cannot be turned. */
+static gboolean tm_video_tx_turn(gpointer user)
+{
+    TeamsMedia *tm = user;
+    const char *dir = tv_send_direction(g_atomic_int_get(&tm->dev_turns));
+    if (tm->vtx_devflip)
+        gst_util_set_object_arg(G_OBJECT(tm->vtx_devflip), "video-direction", dir);
+    g_message("teams_media: the phone turned: what we send is turned %s%s", dir,
+              tm->vtx_devflip ? "" : " from the next camera start");
     return G_SOURCE_REMOVE;
 }
 
@@ -1713,6 +1776,7 @@ static void tm_stop(void)
     if (g_tm.stats_src) { g_source_destroy(g_tm.stats_src); g_source_unref(g_tm.stats_src); g_tm.stats_src = NULL; }
     if (g_tm.vtimer) { g_source_destroy(g_tm.vtimer); g_source_unref(g_tm.vtimer); g_tm.vtimer = NULL; }
     if (g_tm.vtx_cam) { gst_object_unref(g_tm.vtx_cam); g_tm.vtx_cam = NULL; }
+    if (g_tm.vtx_devflip) { gst_object_unref(g_tm.vtx_devflip); g_tm.vtx_devflip = NULL; }
     g_tm.vtx_head = NULL;   /* owned by the pipeline */
     if (g_tm.pipeline) { gst_object_unref(g_tm.pipeline); g_tm.pipeline = NULL; }
     /* The pipeline is down, so nothing waits on the agent any more: stop its thread first, so no
@@ -1922,6 +1986,14 @@ static int run_ipc(int is_caller)
             if (!started) { emit("ERR video-before-start\n"); continue; }
             if (on) { g_tm.vtx_w = vw; g_tm.vtx_h = vh; g_tm.vtx_kbps = vk; }
             tm_set_video(&g_tm, on);
+        } else if (g_str_has_prefix(line, "TURN ")) {
+            /* How the phone is held (the Phone app's deviceOrientation), for what we send. */
+            int turns;
+            if (!tv_parse_turn_cmd(line, &turns)) { emit("ERR bad-turn\n"); continue; }
+            if (g_atomic_int_get(&g_tm.dev_turns) != turns) {
+                g_atomic_int_set(&g_tm.dev_turns, turns);
+                tm_on_media_thread(&g_tm, tm_video_tx_turn);
+            }
         } else if (!strcmp(line, "STOP")) {
             break;
         } else {

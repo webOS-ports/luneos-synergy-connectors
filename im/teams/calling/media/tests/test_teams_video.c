@@ -173,9 +173,27 @@ static void test_video_cmd(void)
     CHECK(!tv_parse_video_cmd("VIDEO 0 176 144 208", &on, &w, &h, &k));
 }
 
+static void test_turn(void)
+{
+    int t = -1;
+    CHECK(tv_parse_turn_cmd("TURN 0", &t) && t == 0);
+    CHECK(tv_parse_turn_cmd("TURN 3", &t) && t == 3);
+    CHECK(!tv_parse_turn_cmd("TURN 4", &t));
+    CHECK(!tv_parse_turn_cmd("TURN 1 ", &t));
+    CHECK(!tv_parse_turn_cmd("TURN -1", &t));
+    CHECK(!tv_parse_turn_cmd("TURN", &t));
+    CHECK(!tv_parse_turn_cmd("TURNS 1", &t));
+    /* the front camera's picture turns the opposite way to the phone (checked on a call) */
+    CHECK(!strcmp(tv_send_direction(0), "identity"));
+    CHECK(!strcmp(tv_send_direction(1), "90l"));
+    CHECK(!strcmp(tv_send_direction(2), "180"));
+    CHECK(!strcmp(tv_send_direction(3), "90r"));
+}
+
 int main(void)
 {
     test_video_cmd();
+    test_turn();
     test_parse();
     test_rr();
     test_remb();

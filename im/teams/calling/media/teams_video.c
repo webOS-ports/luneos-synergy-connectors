@@ -219,3 +219,17 @@ int tv_parse_video_cmd(const char *line, int *on, unsigned *w, unsigned *h, unsi
     *kbps = c;
     return 1;
 }
+
+int tv_parse_turn_cmd(const char *line, int *turns)
+{
+    if (strlen(line) != 6 || strncmp(line, "TURN ", 5) || line[5] < '0' || line[5] > '3')
+        return 0;
+    *turns = line[5] - '0';
+    return 1;
+}
+
+const char *tv_send_direction(int device_turns)
+{
+    static const char *const direction[] = { "identity", "90r", "180", "90l" };
+    return direction[(4 - (device_turns & 3)) & 3];
+}

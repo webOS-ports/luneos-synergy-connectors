@@ -82,6 +82,18 @@ int tv_keyframe_overdue(int64_t now, int64_t last_packet, int64_t first_packet, 
  * *kbps, 0 when not given) for a valid line, 0 otherwise. Sizes are even, 96..1920; 32..4000 kbit/s. */
 int tv_parse_video_cmd(const char *line, int *on, unsigned *w, unsigned *h, unsigned *kbps);
 
+/* The plugin's "TURN <0..3>": how the phone is held, in the shell's quarter turns (0 top up,
+ * 1 left edge up, 2 upside down, 3 right edge up). Returns 1 and fills *turns for a valid line. */
+int tv_parse_turn_cmd(const char *line, int *turns);
+
+/* Teams carries no rotation with the video (its SDP has no urn:3gpp:video-orientation): the far
+ * side shows the picture as it comes. The videoflip direction that keeps our front camera's
+ * picture upright with the phone held device_turns quarter turns round, on top of the turn that
+ * makes it upright held upright. The front camera's picture is not mirrored, so it turns the
+ * opposite way to the phone: one quarter turn counter-clockwise for each the phone is turned
+ * (checked on a call to Android, sargo 10 Nov 2026: the other way round it came upside down). */
+const char *tv_send_direction(int device_turns);
+
 #ifdef __cplusplus
 }
 #endif
