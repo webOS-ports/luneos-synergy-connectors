@@ -65,7 +65,7 @@
                     "&#128558;": "&#128561;"
                 }
             },
-            "authContacts": ["Telegram"]
+            "authContacts": ["id0", "Telegram"]
         },
         {
             "capability": "CONTACTS",
