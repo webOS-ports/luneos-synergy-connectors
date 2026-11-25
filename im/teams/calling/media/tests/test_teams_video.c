@@ -190,10 +190,27 @@ static void test_turn(void)
     CHECK(!strcmp(tv_send_direction(3), "90r"));
 }
 
+static void test_send_size(void)
+{
+    int w, h;
+    /* a side turn swaps the size asked for */
+    CHECK(tv_send_size(640, 480, 1, &w, &h) == 0 && w == 480 && h == 640);
+    CHECK(tv_send_size(352, 288, 1, &w, &h) == 0 && w == 288 && h == 352);
+    CHECK(tv_send_size(320, 240, 1, &w, &h) == 0 && w == 240 && h == 320);
+    /* QCIF on its side is 144 wide, below the encoder's 160: kept, the picture fitted in */
+    CHECK(tv_send_size(176, 144, 1, &w, &h) == 1 && w == 176 && h == 144);
+    /* no side turn: as asked, whatever the size */
+    CHECK(tv_send_size(176, 144, 0, &w, &h) == 0 && w == 176 && h == 144);
+    CHECK(tv_send_size(640, 480, 0, &w, &h) == 0 && w == 640 && h == 480);
+    /* exactly the minimum on its side still turns */
+    CHECK(tv_send_size(160, 160, 1, &w, &h) == 0 && w == 160 && h == 160);
+}
+
 int main(void)
 {
     test_video_cmd();
     test_turn();
+    test_send_size();
     test_parse();
     test_rr();
     test_remb();

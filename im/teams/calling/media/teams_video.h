@@ -94,6 +94,15 @@ int tv_parse_turn_cmd(const char *line, int *turns);
  * (checked on a call to Android, sargo 10 Nov 2026: the other way round it came upside down). */
 const char *tv_send_direction(int device_turns);
 
+/* The size the camera's picture is encoded at, from the size asked for (w x h, landscape, as the
+ * offer's limits give it) and whether the picture is turned on its side before encoding. A side
+ * turn sends it as h x w, unless that is narrower than the hardware encoder takes
+ * (TV_ENCODER_MIN_W x TV_ENCODER_MIN_H): then w x h stays, and the upright picture is fitted
+ * into it with borders. Returns 1 when the size was kept for that reason. */
+#define TV_ENCODER_MIN_W 160
+#define TV_ENCODER_MIN_H 128
+int tv_send_size(int w, int h, int side, int *out_w, int *out_h);
+
 #ifdef __cplusplus
 }
 #endif
