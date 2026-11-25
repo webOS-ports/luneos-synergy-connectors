@@ -10,8 +10,8 @@ import (
 )
 
 // librespot process manager. The backend spawns librespot as the Spotify Connect
-// receiver "webOS" and keeps it alive; the backend's /player/* endpoints then
-// control it via the Connect Web API. Audio is decoded by librespot and piped
+// receiver "webOS (<host name>)" (defaultLibrespotName) and keeps it alive; the
+// backend's /player/* endpoints then control it via the Connect Web API. Audio is decoded by librespot and piped
 // (subprocess backend) into a gstreamer pipeline that resamples 44.1->48kHz and
 // plays through pulse with media.role=music (so Palm's audio policy routes it to
 // the speakers). This exact recipe was validated on-device.
@@ -80,9 +80,35 @@ func startLibrespot() {
 	go librespotLoop()
 }
 
+// defaultLibrespotName is this device's Connect name: "webOS" and the host
+// name, as "webOS (mindphone)". librespot takes its device id from the name
+// (device_id = sha1(name), src/main.rs), so two devices on one Spotify account
+// that both called themselves "webOS" were one device to Spotify: one shared
+// playback state, and each backend's selectLibrespotDevice could pick the
+// other's receiver. Commands then failed with "Restriction violated" (Web API)
+// or "Invalid state" (librespot). With no usable host name, a few characters
+// of the machine id tell the devices apart instead.
+func defaultLibrespotName(hostname func() (string, error), machineID func() string) string {
+	if h, err := hostname(); err == nil {
+		h = strings.TrimSpace(h)
+		if h != "" && h != "localhost" && h != "(none)" {
+			return "webOS (" + h + ")"
+		}
+	}
+	if id := strings.TrimSpace(machineID()); len(id) >= 6 {
+		return "webOS (" + id[:6] + ")"
+	}
+	return "webOS"
+}
+
+func readMachineID() string {
+	b, _ := os.ReadFile("/etc/machine-id")
+	return string(b)
+}
+
 func killStaleLibrespot() {
 	// A backend restart orphans the previous librespot; clear it so we don't get
-	// two "webOS" Connect devices.
+	// two of this device's Connect devices.
 	_ = exec.Command("sh", "-c", "for p in $(pidof librespot gst-launch-1.0); do kill -9 $p 2>/dev/null; done").Run()
 	time.Sleep(500 * time.Millisecond)
 }

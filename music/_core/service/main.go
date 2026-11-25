@@ -117,7 +117,7 @@ func main() {
 		return
 	}
 	addr := flag.String("addr", "127.0.0.1:8730", "listen address (localhost only)")
-	librespotName := flag.String("librespot-name", "webOS", "Connect device name to target for playback")
+	librespotName := flag.String("librespot-name", defaultLibrespotName(os.Hostname, readMachineID), "Connect device name to target for playback")
 	clientID := flag.String("client-id", "", "Spotify app client id (for the in-backend OAuth PKCE flow)")
 	clientIDFile := flag.String("client-id-file", "", "file to read the client id from if -client-id is empty (default: "+strings.Join(configPaths("spotify-client-id"), ", then ")+")")
 	redirect := flag.String("redirect", "http://127.0.0.1:8730/auth/callback", "OAuth redirect URL (must be registered on the Spotify app)")
