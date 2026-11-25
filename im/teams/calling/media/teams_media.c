@@ -984,6 +984,10 @@ static gchar *tm_camera_description(TeamsMedia *tm, gint cw)
     int w = tm->vtx_w ? (int)tm->vtx_w : TM_VIDEO_W, h = tm->vtx_h ? (int)tm->vtx_h : TM_VIDEO_H;
     int bps = tm->vtx_kbps ? (int)tm->vtx_kbps * 1000 : TM_VIDEO_BITRATE;
     gboolean side = cw >= 0 && (cw & 1);
+    int send_w, send_h;
+    if (tv_send_size(w, h, side, &send_w, &send_h))
+        g_message("teams_media: %dx%d on its side is below what the encoder takes, sending %dx%d "
+                  "with the picture fitted in", h, w, send_w, send_h);
     const char *env = g_getenv("TEAMS_MEDIA_CAMERA");
     tm->vtx_cw = cw < 0 ? -1 : (cw & 3);
     tm->vtx_pv_w = side ? TM_PREVIEW_H : TM_PREVIEW_W;
@@ -1007,7 +1011,7 @@ static gchar *tm_camera_description(TeamsMedia *tm, gint cw)
             "video/x-raw,format=I420,width=%d,height=%d,pixel-aspect-ratio=1/1 ! "
             "queue leaky=downstream max-size-buffers=2 ! shmsink name=tmpvshm",
             TM_VIDEO_W, TM_VIDEO_H, direction[cw & 3], tv_send_direction(g_atomic_int_get(&tm->dev_turns)),
-            side ? h : w, side ? w : h, bps,
+            send_w, send_h, bps,
             tm->vtx_pv_w, tm->vtx_pv_h);
     return g_strdup_printf(
         "droidcamsrc name=tmcam mode=2 camera-device=1 target-bitrate=%d "

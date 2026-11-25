@@ -233,3 +233,18 @@ const char *tv_send_direction(int device_turns)
     static const char *const direction[] = { "identity", "90r", "180", "90l" };
     return direction[(4 - (device_turns & 3)) & 3];
 }
+
+/* The q25's c2.mtk.avc.encoder takes nothing below 160x128 ("Supported resolution: ... min(width
+ * 160, height 128)"); the Teams Android app's offers can allow only QCIF (max-fs 99), so its side
+ * turn, 144x176, never encoded and the call sent no picture at all. */
+int tv_send_size(int w, int h, int side, int *out_w, int *out_h)
+{
+    if (side && (h < TV_ENCODER_MIN_W || w < TV_ENCODER_MIN_H)) {
+        *out_w = w;
+        *out_h = h;
+        return 1;
+    }
+    *out_w = side ? h : w;
+    *out_h = side ? w : h;
+    return 0;
+}
