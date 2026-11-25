@@ -232,11 +232,13 @@ func handleProviderRoute(w http.ResponseWriter, r *http.Request) {
 			httpErr(w, http.StatusConflict, id+" has no stream URL (plays via its own engine)")
 			return
 		}
+		// preview: the URL plays only a preview of the track, and why.
 		writeJSON(w, struct {
 			URL     string   `json:"url"`
 			Format  string   `json:"format,omitempty"`
 			Formats []string `json:"formats,omitempty"`
-		}{url, formats.format, formats.formats})
+			Preview string   `json:"preview,omitempty"`
+		}{url, formats.format, formats.formats, formats.preview})
 	case "artists", "artist", "album", "albums":
 		handleBrowseRoute(w, r, p, action)
 	case "playlists", "playlist":

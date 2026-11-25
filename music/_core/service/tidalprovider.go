@@ -200,6 +200,18 @@ func (p *tidalProvider) StreamURL(ctx context.Context, trackID string) (string, 
 	if trackID == "" {
 		return "", fmt.Errorf("no track id")
 	}
+	// Asked for now, not only when /tidalstream plays it, to learn whether Tidal
+	// sends the track or only a preview of it (an account without a subscription
+	// gets 30 seconds of every track); /tidalstream plays the same stream.
+	if p.dl != nil && p.dl.Available() {
+		spec, err := p.dl.cachedStreamSpec(ctx, trackID)
+		if err != nil {
+			return "", err
+		}
+		if spec.Preview {
+			reportPreview(ctx, tidalPreviewWhy(spec.PreviewReason))
+		}
+	}
 	// Tidal LOSSLESS is a DASH manifest of fMP4/FLAC segments, so we can't hand a
 	// single URL to gst — point it at the local proxy that reassembles the segments.
 	return "http://127.0.0.1:8730/tidalstream?id=" + url.QueryEscape(trackID), nil
@@ -215,7 +227,7 @@ func handleTidalStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tidal not configured", http.StatusServiceUnavailable)
 		return
 	}
-	spec, err := dl.streamSpec(r.Context(), r.URL.Query().Get("id"))
+	spec, err := dl.cachedStreamSpec(r.Context(), r.URL.Query().Get("id"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
