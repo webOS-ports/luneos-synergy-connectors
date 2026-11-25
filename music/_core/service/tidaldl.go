@@ -35,9 +35,11 @@ const (
 	tidalClientSecret = "" // web PKCE client is public
 	tidalRedirectURI  = "https://tidal.com/login/auth"
 	tidalTokenFile    = spotifyDataDir + "/tidal-token"
-	tidalAPIBase      = "https://api.tidal.com/v1"
 	tidalAuthTokenURL = "https://auth.tidal.com/v1/oauth2/token"
 )
+
+// tidalAPIBase is a variable so that tests can point it at a stand-in.
+var tidalAPIBase = "https://api.tidal.com/v1"
 
 // tidalToken mirrors /media/cryptofs/spotify-webos/tidal-token.
 type tidalToken struct {
@@ -53,6 +55,49 @@ type tidalDL struct {
 	mu  sync.Mutex
 	tok tidalToken
 	ok  bool
+
+	// The last track's stream: a resolve asks for it to learn whether it is a
+	// preview, and /tidalstream then plays the same one without asking again.
+	specMu   sync.Mutex
+	specID   string
+	spec     *tidalStreamSpec
+	specTime time.Time
+}
+
+// tidalSpecReuse is how long a resolved stream is played without asking again;
+// its segment URLs stay valid far longer.
+const tidalSpecReuse = time.Minute
+
+// cachedStreamSpec is streamSpec for the track asked for last within
+// tidalSpecReuse, else a new one.
+func (t *tidalDL) cachedStreamSpec(ctx context.Context, trackID string) (*tidalStreamSpec, error) {
+	t.specMu.Lock()
+	if t.spec != nil && t.specID == trackID && time.Since(t.specTime) < tidalSpecReuse {
+		spec := t.spec
+		t.specMu.Unlock()
+		return spec, nil
+	}
+	t.specMu.Unlock()
+	spec, err := t.streamSpec(ctx, trackID)
+	if err != nil {
+		return nil, err
+	}
+	t.specMu.Lock()
+	t.specID, t.spec, t.specTime = trackID, spec, time.Now()
+	t.specMu.Unlock()
+	return spec, nil
+}
+
+// tidalPreviewWhy says in words why Tidal sent a preview (playbackinfo's
+// previewReason).
+func tidalPreviewWhy(reason string) string {
+	if reason == "FULL_REQUIRES_SUBSCRIPTION" {
+		return "Tidal plays 30-second previews: this Tidal account has no active subscription"
+	}
+	if reason == "" {
+		return "Tidal sent a 30-second preview of this track"
+	}
+	return "Tidal sent a 30-second preview of this track (" + reason + ")"
 }
 
 func newTidalDL() *tidalDL {
@@ -295,6 +340,11 @@ type tidalStreamSpec struct {
 	// MP4FLAC true = URLs are DASH fMP4/FLAC segments (init first) that must be
 	// unwrapped into a native FLAC stream (gst-0.10 has no FLAC-in-MP4 decoder).
 	MP4FLAC bool
+	// Preview: Tidal sent a preview, not the track (assetPresentation PREVIEW,
+	// though FULL was asked for), and PreviewReason its previewReason, as
+	// FULL_REQUIRES_SUBSCRIPTION for an account whose subscription has ended.
+	Preview       bool
+	PreviewReason string
 }
 
 var (
@@ -315,8 +365,10 @@ func (t *tidalDL) streamSpec(ctx context.Context, trackID string) (*tidalStreamS
 		return nil, err
 	}
 	var pb struct {
-		ManifestMimeType string `json:"manifestMimeType"`
-		Manifest         string `json:"manifest"` // base64
+		ManifestMimeType  string `json:"manifestMimeType"`
+		Manifest          string `json:"manifest"` // base64
+		AssetPresentation string `json:"assetPresentation"`
+		PreviewReason     string `json:"previewReason"`
 	}
 	if err := json.Unmarshal(body, &pb); err != nil {
 		return nil, err
@@ -325,8 +377,20 @@ func (t *tidalDL) streamSpec(ctx context.Context, trackID string) (*tidalStreamS
 	if err != nil {
 		return nil, fmt.Errorf("tidal: manifest base64: %v", err)
 	}
+	spec, err := tidalSpecOf(pb.ManifestMimeType, raw)
+	if err != nil {
+		return nil, err
+	}
+	if pb.AssetPresentation == "PREVIEW" {
+		spec.Preview, spec.PreviewReason = true, pb.PreviewReason
+	}
+	return spec, nil
+}
+
+// tidalSpecOf reads a playback manifest: BTS (one URL) or DASH (segments).
+func tidalSpecOf(mime string, raw []byte) (*tidalStreamSpec, error) {
 	// BTS manifest (application/vnd.tidal.bts): JSON with a single-file urls[].
-	if strings.Contains(pb.ManifestMimeType, "bts") || (len(raw) > 0 && raw[0] == '{') {
+	if strings.Contains(mime, "bts") || (len(raw) > 0 && raw[0] == '{') {
 		var m struct {
 			URLs []string `json:"urls"`
 		}
@@ -339,10 +403,10 @@ func (t *tidalDL) streamSpec(ctx context.Context, trackID string) (*tidalStreamS
 		return &tidalStreamSpec{URLs: m.URLs, ContentType: "audio/flac"}, nil
 	}
 	// DASH MPD: an init segment + numbered fMP4/FLAC media segments.
-	if strings.Contains(pb.ManifestMimeType, "dash") || bytes.Contains(raw, []byte("<MPD")) {
+	if strings.Contains(mime, "dash") || bytes.Contains(raw, []byte("<MPD")) {
 		return parseTidalDash(string(raw))
 	}
-	return nil, fmt.Errorf("tidal: unsupported manifest %q", pb.ManifestMimeType)
+	return nil, fmt.Errorf("tidal: unsupported manifest %q", mime)
 }
 
 func parseTidalDash(mpd string) (*tidalStreamSpec, error) {

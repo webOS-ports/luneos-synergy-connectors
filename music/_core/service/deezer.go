@@ -198,6 +198,9 @@ func (d *deezerProvider) PlaylistTracks(ctx context.Context, playlistID string) 
 		})
 }
 
+// deezerPreviewWhy: Deezer without a sign-in plays its public 30-second previews.
+const deezerPreviewWhy = "Deezer plays 30-second previews until you sign in to Deezer in Accounts"
+
 func (d *deezerProvider) StreamURL(ctx context.Context, trackID string) (string, error) {
 	if trackID == "" {
 		return "", fmt.Errorf("no track id")
@@ -207,7 +210,7 @@ func (d *deezerProvider) StreamURL(ctx context.Context, trackID string) (string,
 		return "http://127.0.0.1:8730/dzstream?id=" + url.QueryEscape(trackID), nil
 	}
 	// no ARL -> 30s preview (plain MP3, no descrambling)
-	body, err := httpGetString(ctx, "https://api.deezer.com/track/"+url.PathEscape(trackID))
+	body, err := httpGetString(ctx, deezerAPIBase+"/track/"+url.PathEscape(trackID))
 	if err != nil {
 		return "", err
 	}
@@ -218,6 +221,7 @@ func (d *deezerProvider) StreamURL(ctx context.Context, trackID string) (string,
 	if t.Preview == "" {
 		return "", fmt.Errorf("deezer: no preview (full track needs a deezer-arl)")
 	}
+	reportPreview(ctx, deezerPreviewWhy)
 	return t.Preview, nil
 }
 
