@@ -101,6 +101,7 @@ func handlePlayerLoad(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	librespotResume.loaded(body.URI, body.PositionMs)
+	librespotKey.loaded(body.URI)
 	librespotCommands.answered("/player/load")
 	// report duration so the UI can show the seek bar immediately
 	dur := 0
@@ -269,7 +270,11 @@ func handlePlayerStatus(w http.ResponseWriter, r *http.Request) {
 		if uri != "" {
 			state = "playing"
 		}
-		writeJSON(w, map[string]interface{}{"is_playing": playing, "position_ms": position, "uri": uri, "state": state})
+		out := map[string]interface{}{"is_playing": playing, "position_ms": position, "uri": uri, "state": state}
+		if e := librespotKey.failure(uri); e != "" {
+			out["is_playing"], out["error"] = false, e
+		}
+		writeJSON(w, out)
 		return
 	}
 	// librespot's reported progress runs ~gstBufferLatencyMs ahead of the audible
@@ -293,6 +298,10 @@ func handlePlayerStatus(w http.ResponseWriter, r *http.Request) {
 		// quality badge is constant.
 		out["format"] = "OGG 320"
 		out["formats"] = []string{"OGG 320"}
+		// a track librespot got no key for plays silence
+		if e := librespotKey.failure(string(st.Item.URI)); e != "" {
+			out["is_playing"], out["error"] = false, e
+		}
 	} else {
 		out["state"] = "idle"
 	}

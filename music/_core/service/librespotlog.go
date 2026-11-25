@@ -10,9 +10,10 @@ package main
 // lines ("[time LEVEL module] message", env_logger's format) lose the time,
 // which the journal has.
 //
-// Reading them also tells the daemon two things: that librespot lost its
-// session or dealer connection (librespotLossLines), and that it did something
-// at all after a command (librespotActivity).
+// Reading them also tells the daemon three things: that librespot lost its
+// session or dealer connection (librespotLossLines), that it did something
+// at all after a command (librespotActivity), and that it got no key for a
+// track (librespotkey.go).
 
 import (
 	"bufio"
@@ -177,6 +178,9 @@ func (o *librespotOutput) line(raw string) {
 				break
 			}
 		}
+	}
+	if important && isKeyLine(raw) {
+		librespotKey.missed()
 	}
 	if important && o.onLoss != nil {
 		for _, l := range librespotLossLines {

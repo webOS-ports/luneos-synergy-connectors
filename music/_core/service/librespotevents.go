@@ -169,6 +169,7 @@ func readLibrespotEvents(r *os.File, deliver func(map[string]string)) {
 func noteLibrespotEvent(ev map[string]string) {
 	noteLibrespotActivity(time.Now())
 	librespotResume.event(ev)
+	librespotKey.event(ev)
 	switch e := ev["PLAYER_EVENT"]; e {
 	case "session_connected", "session_disconnected", "session_client_changed":
 		log.Printf("librespot event: %s", e)
